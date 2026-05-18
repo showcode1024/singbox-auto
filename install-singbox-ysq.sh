@@ -197,7 +197,10 @@ if [ "$ENABLE_TUIC" = "1" ]; then
     -days 3650 \
     -subj "/CN=${TUIC_SNI}"
 
+  chown -R sing-box:sing-box /etc/sing-box 2>/dev/null || true
+  chmod 755 /etc/sing-box /etc/sing-box/cert
   chmod 600 "$CERT_DIR/tuic.key"
+  chmod 644 "$CERT_DIR/tuic.crt"
 fi
 
 echo
