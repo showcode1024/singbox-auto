@@ -27,6 +27,8 @@ CONFIG_FILE="/etc/sing-box/config.json"
 CERT_DIR="/etc/sing-box/cert"
 INFO_FILE="/root/singbox-node-info.txt"
 YAML_FILE="/root/singbox-nodes.yaml"
+ENV_FILE="/etc/sing-box/ysq.env"
+STATE_FILE="/etc/sing-box/ysq-state.env"
 PANEL_FILE="/usr/local/bin/ysq"
 INSTALLER_FILE="/root/install-singbox-ysq.sh"
 
@@ -78,15 +80,15 @@ read -rp "请输入 1 / 2 / 3: " NODE_CHOICE
 
 case "$NODE_CHOICE" in
   1)
-    ENABLE_VLESS=1
+    ENABLE_VLESS_DIRECT=1
     ENABLE_TUIC=0
     ;;
   2)
-    ENABLE_VLESS=0
+    ENABLE_VLESS_DIRECT=0
     ENABLE_TUIC=1
     ;;
   3)
-    ENABLE_VLESS=1
+    ENABLE_VLESS_DIRECT=1
     ENABLE_TUIC=1
     ;;
   *)
@@ -100,7 +102,7 @@ echo "=============================="
 echo "端口设置"
 echo "=============================="
 
-if [ "$ENABLE_VLESS" = "1" ]; then
+if [ "$ENABLE_VLESS_DIRECT" = "1" ]; then
   VLESS_DIRECT_PORT="$(ask_port "请输入 VLESS 直出 TCP 端口" "$VLESS_DIRECT_PORT")"
 fi
 
@@ -147,6 +149,11 @@ else
   LANDING_PORT="0"
 fi
 
+if [ "$ENABLE_VLESS_DIRECT" = "1" ] && [ "$ENABLE_RELAY" = "1" ] && [ "$VLESS_DIRECT_PORT" = "$VLESS_RELAY_PORT" ]; then
+  echo "VLESS 直出端口和中转端口不能相同，因为它们都是 TCP。"
+  exit 1
+fi
+
 echo
 echo "正在准备环境..."
 apt update
@@ -188,42 +195,214 @@ else
   exit 1
 fi
 
-if [ "$ENABLE_TUIC" = "1" ]; then
-  echo
-  echo "正在生成 TUIC 自签证书..."
-  openssl req -x509 -newkey rsa:2048 -nodes \
-    -keyout "$CERT_DIR/tuic.key" \
-    -out "$CERT_DIR/tuic.crt" \
-    -days 3650 \
-    -subj "/CN=${TUIC_SNI}"
+cat > "$ENV_FILE" <<ENV
+UUID="$UUID"
+PRIVATE_KEY="$PRIVATE_KEY"
+PUBLIC_KEY="$PUBLIC_KEY"
+SHORT_ID="$SHORT_ID"
+TUIC_PASS="$TUIC_PASS"
+REALITY_SNI="$REALITY_SNI"
+TUIC_SNI="$TUIC_SNI"
+CONFIG_DIR="$CONFIG_DIR"
+CONFIG_FILE="$CONFIG_FILE"
+CERT_DIR="$CERT_DIR"
+INFO_FILE="$INFO_FILE"
+YAML_FILE="$YAML_FILE"
+STATE_FILE="$STATE_FILE"
+ENV
 
-  chown -R sing-box:sing-box /etc/sing-box 2>/dev/null || true
-  chmod 755 /etc/sing-box /etc/sing-box/cert
-  chmod 600 "$CERT_DIR/tuic.key"
-  chmod 644 "$CERT_DIR/tuic.crt"
-fi
+chmod 600 "$ENV_FILE"
+
+cat > "$STATE_FILE" <<STATE
+ENABLE_VLESS_DIRECT="$ENABLE_VLESS_DIRECT"
+VLESS_DIRECT_PORT="$VLESS_DIRECT_PORT"
+ENABLE_TUIC="$ENABLE_TUIC"
+TUIC_PORT="$TUIC_PORT"
+ENABLE_RELAY="$ENABLE_RELAY"
+VLESS_RELAY_PORT="$VLESS_RELAY_PORT"
+LANDING_SERVER="$LANDING_SERVER"
+LANDING_PORT="$LANDING_PORT"
+STATE
+
+chmod 600 "$STATE_FILE"
 
 echo
-echo "正在写入 sing-box 配置..."
+echo "正在安装 ysq 面板命令..."
 
-jq -n \
-  --arg uuid "$UUID" \
-  --arg private_key "$PRIVATE_KEY" \
-  --arg public_key "$PUBLIC_KEY" \
-  --arg short_id "$SHORT_ID" \
-  --arg tuic_pass "$TUIC_PASS" \
-  --arg reality_sni "$REALITY_SNI" \
-  --arg tuic_sni "$TUIC_SNI" \
-  --arg cert_path "$CERT_DIR/tuic.crt" \
-  --arg key_path "$CERT_DIR/tuic.key" \
-  --arg landing_server "$LANDING_SERVER" \
-  --arg landing_port "$LANDING_PORT" \
-  --arg vless_direct_port "$VLESS_DIRECT_PORT" \
-  --arg tuic_port "$TUIC_PORT" \
-  --arg vless_relay_port "$VLESS_RELAY_PORT" \
-  --arg enable_vless "$ENABLE_VLESS" \
-  --arg enable_tuic "$ENABLE_TUIC" \
-  --arg enable_relay "$ENABLE_RELAY" \
+cat > "$PANEL_FILE" <<'PANEL'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ENV_FILE="/etc/sing-box/ysq.env"
+STATE_FILE="/etc/sing-box/ysq-state.env"
+PANEL_FILE="/usr/local/bin/ysq"
+
+DEFAULT_VLESS_DIRECT_PORT=20001
+DEFAULT_TUIC_PORT=20002
+DEFAULT_VLESS_RELAY_PORT=20003
+
+load_all() {
+  if [ ! -f "$ENV_FILE" ]; then
+    echo "缺少环境文件：$ENV_FILE"
+    exit 1
+  fi
+
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+
+  if [ -f "$STATE_FILE" ]; then
+    # shellcheck disable=SC1090
+    source "$STATE_FILE"
+  fi
+
+  ENABLE_VLESS_DIRECT="${ENABLE_VLESS_DIRECT:-0}"
+  VLESS_DIRECT_PORT="${VLESS_DIRECT_PORT:-$DEFAULT_VLESS_DIRECT_PORT}"
+  ENABLE_TUIC="${ENABLE_TUIC:-0}"
+  TUIC_PORT="${TUIC_PORT:-$DEFAULT_TUIC_PORT}"
+  ENABLE_RELAY="${ENABLE_RELAY:-0}"
+  VLESS_RELAY_PORT="${VLESS_RELAY_PORT:-$DEFAULT_VLESS_RELAY_PORT}"
+  LANDING_SERVER="${LANDING_SERVER:-}"
+  LANDING_PORT="${LANDING_PORT:-0}"
+}
+
+save_state() {
+  cat > "$STATE_FILE" <<STATE
+ENABLE_VLESS_DIRECT="$ENABLE_VLESS_DIRECT"
+VLESS_DIRECT_PORT="$VLESS_DIRECT_PORT"
+ENABLE_TUIC="$ENABLE_TUIC"
+TUIC_PORT="$TUIC_PORT"
+ENABLE_RELAY="$ENABLE_RELAY"
+VLESS_RELAY_PORT="$VLESS_RELAY_PORT"
+LANDING_SERVER="$LANDING_SERVER"
+LANDING_PORT="$LANDING_PORT"
+STATE
+  chmod 600 "$STATE_FILE"
+}
+
+ask_port() {
+  local name="$1"
+  local default_port="$2"
+  local input_port=""
+
+  while true; do
+    printf "%s [默认 %s，直接回车使用默认]: " "$name" "$default_port" >&2
+    read -r input_port
+
+    if [ -z "$input_port" ]; then
+      echo "$default_port"
+      return
+    fi
+
+    if [[ "$input_port" =~ ^[0-9]+$ ]] && [ "$input_port" -ge 1 ] && [ "$input_port" -le 65535 ]; then
+      echo "$input_port"
+      return
+    fi
+
+    echo "端口输入错误，请输入 1-65535 之间的数字。" >&2
+  done
+}
+
+enabled_count() {
+  local count=0
+  [ "${ENABLE_VLESS_DIRECT:-0}" = "1" ] && count=$((count + 1))
+  [ "${ENABLE_TUIC:-0}" = "1" ] && count=$((count + 1))
+  [ "${ENABLE_RELAY:-0}" = "1" ] && count=$((count + 1))
+  echo "$count"
+}
+
+get_server_ip() {
+  local ip=""
+  ip="$(curl -4 -s --max-time 5 https://api.ipify.org || true)"
+  if [ -z "$ip" ]; then
+    ip="$(hostname -I | awk '{print $1}')"
+  fi
+  echo "$ip"
+}
+
+fix_permissions() {
+  mkdir -p "$CONFIG_DIR" "$CERT_DIR"
+
+  local sb_user=""
+  local sb_group=""
+
+  sb_user="$(systemctl show sing-box -p User --value 2>/dev/null || true)"
+
+  if [ -z "$sb_user" ]; then
+    sb_user="root"
+  fi
+
+  sb_group="$(id -gn "$sb_user" 2>/dev/null || echo "$sb_user")"
+
+  chown -R "$sb_user:$sb_group" "$CONFIG_DIR" 2>/dev/null || true
+
+  chmod 755 "$CONFIG_DIR" 2>/dev/null || true
+  chmod 755 "$CERT_DIR" 2>/dev/null || true
+
+  if [ -f "$CERT_DIR/tuic.key" ]; then
+    chmod 600 "$CERT_DIR/tuic.key" 2>/dev/null || chmod 644 "$CERT_DIR/tuic.key" 2>/dev/null || true
+  fi
+
+  if [ -f "$CERT_DIR/tuic.crt" ]; then
+    chmod 644 "$CERT_DIR/tuic.crt" 2>/dev/null || true
+  fi
+}
+
+ensure_tuic_cert() {
+  load_all
+
+  mkdir -p "$CERT_DIR"
+
+  if [ ! -f "$CERT_DIR/tuic.key" ] || [ ! -f "$CERT_DIR/tuic.crt" ]; then
+    echo "正在生成 TUIC 自签证书..."
+    openssl req -x509 -newkey rsa:2048 -nodes \
+      -keyout "$CERT_DIR/tuic.key" \
+      -out "$CERT_DIR/tuic.crt" \
+      -days 3650 \
+      -subj "/CN=${TUIC_SNI}"
+  fi
+
+  fix_permissions
+}
+
+check_tcp_port_conflict() {
+  local new_port="$1"
+  local skip_name="$2"
+
+  if [ "$skip_name" != "vless-direct" ] && [ "${ENABLE_VLESS_DIRECT:-0}" = "1" ] && [ "$new_port" = "$VLESS_DIRECT_PORT" ]; then
+    echo "端口冲突：TCP $new_port 已被 VLESS 直出使用。"
+    return 1
+  fi
+
+  if [ "$skip_name" != "vless-relay" ] && [ "${ENABLE_RELAY:-0}" = "1" ] && [ "$new_port" = "$VLESS_RELAY_PORT" ]; then
+    echo "端口冲突：TCP $new_port 已被 VLESS 中转使用。"
+    return 1
+  fi
+
+  return 0
+}
+
+write_config() {
+  load_all
+  mkdir -p "$CONFIG_DIR"
+
+  jq -n \
+    --arg uuid "$UUID" \
+    --arg private_key "$PRIVATE_KEY" \
+    --arg public_key "$PUBLIC_KEY" \
+    --arg short_id "$SHORT_ID" \
+    --arg tuic_pass "$TUIC_PASS" \
+    --arg reality_sni "$REALITY_SNI" \
+    --arg tuic_sni "$TUIC_SNI" \
+    --arg cert_path "$CERT_DIR/tuic.crt" \
+    --arg key_path "$CERT_DIR/tuic.key" \
+    --arg landing_server "$LANDING_SERVER" \
+    --arg landing_port "$LANDING_PORT" \
+    --arg vless_direct_port "$VLESS_DIRECT_PORT" \
+    --arg tuic_port "$TUIC_PORT" \
+    --arg vless_relay_port "$VLESS_RELAY_PORT" \
+    --arg enable_vless_direct "$ENABLE_VLESS_DIRECT" \
+    --arg enable_tuic "$ENABLE_TUIC" \
+    --arg enable_relay "$ENABLE_RELAY" \
 '
 def vless_in($tag; $port):
 {
@@ -249,7 +428,7 @@ def vless_in($tag; $port):
       "private_key": $private_key,
       "short_id": [
         $short_id
-      ],
+      ]
     }
   }
 };
@@ -313,7 +492,7 @@ def landing_out:
   },
   "inbounds":
     (
-      (if $enable_vless == "1" then [vless_in("vless-direct"; $vless_direct_port)] else [] end)
+      (if $enable_vless_direct == "1" then [vless_in("vless-direct"; $vless_direct_port)] else [] end)
       +
       (if $enable_relay == "1" then [vless_in("vless-relay-to-landing"; $vless_relay_port)] else [] end)
       +
@@ -345,12 +524,12 @@ def landing_out:
           ]
         else [] end)
         +
-        (if ($enable_vless == "1" or $enable_tuic == "1") then
+        (if ($enable_vless_direct == "1" or $enable_tuic == "1") then
           [
             {
               "inbound":
                 (
-                  (if $enable_vless == "1" then ["vless-direct"] else [] end)
+                  (if $enable_vless_direct == "1" then ["vless-direct"] else [] end)
                   +
                   (if $enable_tuic == "1" then ["tuic-direct"] else [] end)
                 ),
@@ -364,34 +543,28 @@ def landing_out:
   }
 }
 ' > "$CONFIG_FILE"
+}
 
-echo
-echo "正在检查配置..."
-sing-box check -c "$CONFIG_FILE"
+generate_outputs() {
+  load_all
 
-echo
-echo "正在启动 sing-box..."
-systemctl enable sing-box >/dev/null 2>&1 || true
-systemctl restart sing-box
+  local server_ip
+  server_ip="$(get_server_ip)"
 
-SERVER_IP="$(curl -4 -s --max-time 5 https://api.ipify.org || true)"
-if [ -z "$SERVER_IP" ]; then
-  SERVER_IP="$(hostname -I | awk '{print $1}')"
-fi
+  local vless_direct_link=""
+  local vless_relay_link=""
+  local tuic_link=""
 
-VLESS_DIRECT_LINK="vless://${UUID}@${SERVER_IP}:${VLESS_DIRECT_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#HK-VLESS-DIRECT"
-VLESS_RELAY_LINK="vless://${UUID}@${SERVER_IP}:${VLESS_RELAY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#HK-VLESS-RELAY"
-TUIC_LINK="tuic://${UUID}:${TUIC_PASS}@${SERVER_IP}:${TUIC_PORT}?congestion_control=bbr&alpn=h3&sni=${TUIC_SNI}&allow_insecure=1#HK-TUIC"
+  vless_direct_link="vless://${UUID}@${server_ip}:${VLESS_DIRECT_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#HK-VLESS-DIRECT"
+  vless_relay_link="vless://${UUID}@${server_ip}:${VLESS_RELAY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#HK-VLESS-RELAY"
+  tuic_link="tuic://${UUID}:${TUIC_PASS}@${server_ip}:${TUIC_PORT}?congestion_control=bbr&alpn=h3&sni=${TUIC_SNI}&allow_insecure=1#HK-TUIC"
 
-echo
-echo "正在生成节点信息..."
-
-cat > "$INFO_FILE" <<INFO
+  cat > "$INFO_FILE" <<INFO
 ==============================
 ysq sing-box 节点信息
 ==============================
 
-服务器地址: ${SERVER_IP}
+服务器地址: ${server_ip}
 
 UUID: ${UUID}
 REALITY PrivateKey: ${PRIVATE_KEY}
@@ -400,13 +573,13 @@ ShortID: ${SHORT_ID}
 
 INFO
 
-if [ "$ENABLE_VLESS" = "1" ]; then
-cat >> "$INFO_FILE" <<INFO
+  if [ "$ENABLE_VLESS_DIRECT" = "1" ]; then
+    cat >> "$INFO_FILE" <<INFO
 ==============================
 VLESS 直出节点
 ==============================
 名称: HK-VLESS-DIRECT
-地址: ${SERVER_IP}
+地址: ${server_ip}
 端口: ${VLESS_DIRECT_PORT}
 UUID: ${UUID}
 SNI: ${REALITY_SNI}
@@ -416,18 +589,18 @@ Flow: xtls-rprx-vision
 Fingerprint: chrome
 
 直链:
-${VLESS_DIRECT_LINK}
+${vless_direct_link}
 
 INFO
-fi
+  fi
 
-if [ "$ENABLE_RELAY" = "1" ]; then
-cat >> "$INFO_FILE" <<INFO
+  if [ "$ENABLE_RELAY" = "1" ]; then
+    cat >> "$INFO_FILE" <<INFO
 ==============================
 VLESS 中转节点
 ==============================
 名称: HK-VLESS-RELAY
-地址: ${SERVER_IP}
+地址: ${server_ip}
 端口: ${VLESS_RELAY_PORT}
 UUID: ${UUID}
 SNI: ${REALITY_SNI}
@@ -437,16 +610,14 @@ Flow: xtls-rprx-vision
 Fingerprint: chrome
 
 直链:
-${VLESS_RELAY_LINK}
+${vless_relay_link}
 
 中转落地:
 ${LANDING_SERVER}:${LANDING_PORT}
 
 注意：
 落地 VPS 上必须有对应的 VLESS-REALITY 入站。
-落地入站要和香港出站对应。
-
-落地入站使用：
+如果你使用同一套参数，落地入站应使用：
 UUID: ${UUID}
 PrivateKey: ${PRIVATE_KEY}
 ShortID: ${SHORT_ID}
@@ -457,15 +628,15 @@ PublicKey: ${PUBLIC_KEY}
 ShortID: ${SHORT_ID}
 
 INFO
-fi
+  fi
 
-if [ "$ENABLE_TUIC" = "1" ]; then
-cat >> "$INFO_FILE" <<INFO
+  if [ "$ENABLE_TUIC" = "1" ]; then
+    cat >> "$INFO_FILE" <<INFO
 ==============================
 TUIC 节点
 ==============================
 名称: HK-TUIC
-地址: ${SERVER_IP}
+地址: ${server_ip}
 端口: ${TUIC_PORT}
 UUID: ${UUID}
 Password: ${TUIC_PASS}
@@ -475,30 +646,27 @@ skip-cert-verify: true
 congestion-controller: bbr
 
 直链:
-${TUIC_LINK}
+${tuic_link}
 
 INFO
-fi
+  fi
 
-cat >> "$INFO_FILE" <<INFO
+  cat >> "$INFO_FILE" <<INFO
 ==============================
 端口说明
 ==============================
-VLESS 直出: TCP ${VLESS_DIRECT_PORT}
-VLESS 中转: TCP ${VLESS_RELAY_PORT}
-TUIC: UDP ${TUIC_PORT}
+VLESS 直出: TCP ${VLESS_DIRECT_PORT}，状态：${ENABLE_VLESS_DIRECT}
+VLESS 中转: TCP ${VLESS_RELAY_PORT}，状态：${ENABLE_RELAY}
+TUIC: UDP ${TUIC_PORT}，状态：${ENABLE_TUIC}
 
 配置文件: ${CONFIG_FILE}
 节点信息: ${INFO_FILE}
 YAML配置: ${YAML_FILE}
 
-以后输入 ysq 可以打开管理面板。
+输入 ysq 可以打开管理面板。
 INFO
 
-echo
-echo "正在生成 Clash / Mihomo YAML..."
-
-cat > "$YAML_FILE" <<YAML
+  cat > "$YAML_FILE" <<YAML
 mixed-port: 7890
 allow-lan: false
 mode: rule
@@ -520,13 +688,13 @@ dns:
 proxies:
 YAML
 
-PROXY_NAMES=()
+  local proxy_names=()
 
-if [ "$ENABLE_VLESS" = "1" ]; then
-cat >> "$YAML_FILE" <<YAML
+  if [ "$ENABLE_VLESS_DIRECT" = "1" ]; then
+    cat >> "$YAML_FILE" <<YAML
   - name: HK-VLESS-DIRECT
     type: vless
-    server: ${SERVER_IP}
+    server: ${server_ip}
     port: ${VLESS_DIRECT_PORT}
     uuid: ${UUID}
     network: tcp
@@ -539,14 +707,14 @@ cat >> "$YAML_FILE" <<YAML
       public-key: ${PUBLIC_KEY}
       short-id: ${SHORT_ID}
 YAML
-PROXY_NAMES+=("HK-VLESS-DIRECT")
-fi
+    proxy_names+=("HK-VLESS-DIRECT")
+  fi
 
-if [ "$ENABLE_RELAY" = "1" ]; then
-cat >> "$YAML_FILE" <<YAML
+  if [ "$ENABLE_RELAY" = "1" ]; then
+    cat >> "$YAML_FILE" <<YAML
   - name: HK-VLESS-RELAY
     type: vless
-    server: ${SERVER_IP}
+    server: ${server_ip}
     port: ${VLESS_RELAY_PORT}
     uuid: ${UUID}
     network: tcp
@@ -559,14 +727,14 @@ cat >> "$YAML_FILE" <<YAML
       public-key: ${PUBLIC_KEY}
       short-id: ${SHORT_ID}
 YAML
-PROXY_NAMES+=("HK-VLESS-RELAY")
-fi
+    proxy_names+=("HK-VLESS-RELAY")
+  fi
 
-if [ "$ENABLE_TUIC" = "1" ]; then
-cat >> "$YAML_FILE" <<YAML
+  if [ "$ENABLE_TUIC" = "1" ]; then
+    cat >> "$YAML_FILE" <<YAML
   - name: HK-TUIC
     type: tuic
-    server: ${SERVER_IP}
+    server: ${server_ip}
     port: ${TUIC_PORT}
     uuid: ${UUID}
     password: ${TUIC_PASS}
@@ -577,10 +745,10 @@ cat >> "$YAML_FILE" <<YAML
     congestion-controller: bbr
     udp-relay-mode: native
 YAML
-PROXY_NAMES+=("HK-TUIC")
-fi
+    proxy_names+=("HK-TUIC")
+  fi
 
-cat >> "$YAML_FILE" <<YAML
+  cat >> "$YAML_FILE" <<YAML
 
 proxy-groups:
   - name: PROXY
@@ -588,33 +756,65 @@ proxy-groups:
     proxies:
 YAML
 
-for name in "${PROXY_NAMES[@]}"; do
-  echo "      - ${name}" >> "$YAML_FILE"
-done
+  for name in "${proxy_names[@]}"; do
+    echo "      - ${name}" >> "$YAML_FILE"
+  done
 
-cat >> "$YAML_FILE" <<YAML
+  cat >> "$YAML_FILE" <<YAML
       - DIRECT
 
 rules:
   - GEOIP,CN,DIRECT
   - MATCH,PROXY
 YAML
+}
 
-echo
-echo "正在安装 ysq 面板命令..."
+check_config() {
+  if sing-box check -D /var/lib/sing-box -C /etc/sing-box; then
+    return 0
+  fi
 
-cat > "$PANEL_FILE" <<'PANEL'
-#!/usr/bin/env bash
+  echo
+  echo "配置检查失败。"
+  return 1
+}
 
-INFO_FILE="/root/singbox-node-info.txt"
-YAML_FILE="/root/singbox-nodes.yaml"
-CONFIG_FILE="/etc/sing-box/config.json"
+apply_changes() {
+  load_all
+
+  if [ "$(enabled_count)" -lt 1 ]; then
+    echo "至少要保留一个节点，不能全部删除。"
+    return 1
+  fi
+
+  if [ "$ENABLE_TUIC" = "1" ]; then
+    ensure_tuic_cert
+  else
+    fix_permissions
+  fi
+
+  cp "$CONFIG_FILE" "${CONFIG_FILE}.bak.$(date +%s)" 2>/dev/null || true
+
+  write_config
+
+  if ! check_config; then
+    echo "新配置有问题，未重启 sing-box。"
+    return 1
+  fi
+
+  systemctl restart sing-box
+  generate_outputs
+
+  echo
+  echo "操作完成，sing-box 已重启。"
+}
 
 show_ports() {
   if command -v jq >/dev/null 2>&1 && [ -f "$CONFIG_FILE" ]; then
-    PORTS="$(jq -r '.inbounds[].listen_port' "$CONFIG_FILE" 2>/dev/null | paste -sd'|' -)"
-    if [ -n "$PORTS" ]; then
-      ss -lntup | grep -E ":(${PORTS})\\b" || true
+    local ports
+    ports="$(jq -r '.inbounds[].listen_port' "$CONFIG_FILE" 2>/dev/null | paste -sd'|' -)"
+    if [ -n "$ports" ]; then
+      ss -lntup | grep -E ":(${ports})\\b" || true
       return
     fi
   fi
@@ -622,110 +822,418 @@ show_ports() {
   ss -lntup | grep sing-box || true
 }
 
-while true; do
-  clear
-  echo "=============================="
-  echo " ysq sing-box 管理面板"
-  echo "=============================="
-  echo "1) 查看节点直链"
-  echo "2) 查看 Clash / Mihomo YAML"
-  echo "3) 查看 sing-box 状态"
-  echo "4) 重启 sing-box"
-  echo "5) 彻底删除 sing-box 和脚本"
-  echo "0) 退出"
-  echo "=============================="
-  read -rp "请输入选项: " choice
+show_current_summary() {
+  load_all
+  echo "当前节点状态："
+  echo "VLESS 直出: ${ENABLE_VLESS_DIRECT}，端口: ${VLESS_DIRECT_PORT}"
+  echo "TUIC: ${ENABLE_TUIC}，端口: ${TUIC_PORT}"
+  echo "VLESS 中转: ${ENABLE_RELAY}，端口: ${VLESS_RELAY_PORT}"
+  if [ "$ENABLE_RELAY" = "1" ]; then
+    echo "落地: ${LANDING_SERVER}:${LANDING_PORT}"
+  fi
+}
 
-  case "$choice" in
-    1)
-      clear
-      if [ -f "$INFO_FILE" ]; then
-        cat "$INFO_FILE"
-      else
-        echo "未找到节点信息文件：$INFO_FILE"
-      fi
-      echo
-      read -rp "按回车返回面板..."
-      ;;
-    2)
-      clear
-      if [ -f "$YAML_FILE" ]; then
-        cat "$YAML_FILE"
-      else
-        echo "未找到 YAML 文件：$YAML_FILE"
-      fi
-      echo
-      read -rp "按回车返回面板..."
-      ;;
-    3)
-      clear
-      systemctl status sing-box --no-pager || true
-      echo
-      echo "当前监听端口："
-      show_ports
-      echo
-      read -rp "按回车返回面板..."
-      ;;
-    4)
-      clear
-      systemctl restart sing-box
-      echo "sing-box 已重启。"
-      echo
-      systemctl status sing-box --no-pager || true
-      echo
-      read -rp "按回车返回面板..."
-      ;;
-    5)
-      clear
-      echo "危险操作：这会彻底删除 sing-box、配置、证书、节点信息、YAML、ysq 面板和安装脚本。"
-      read -rp "确认删除请输入 YES: " confirm
-      if [ "$confirm" = "YES" ]; then
-        echo "正在停止 sing-box..."
-        systemctl stop sing-box 2>/dev/null || true
-        systemctl disable sing-box 2>/dev/null || true
+add_vless_direct() {
+  load_all
 
-        echo "正在卸载 sing-box..."
-        apt purge -y sing-box 2>/dev/null || true
-        apt remove -y sing-box 2>/dev/null || true
+  if [ "$ENABLE_VLESS_DIRECT" = "1" ]; then
+    echo "VLESS 直出已经存在。"
+    read -rp "是否修改 VLESS 直出端口？输入 y 修改，其他键取消: " yn
+    if [ "$yn" != "y" ] && [ "$yn" != "Y" ]; then
+      return
+    fi
+  fi
 
-        echo "正在删除残留文件..."
-        rm -f /usr/local/bin/sing-box
-        rm -f /usr/bin/sing-box
-        rm -f /etc/systemd/system/sing-box.service
-        rm -rf /etc/sing-box
-        rm -rf /var/lib/sing-box
-        rm -rf /var/log/sing-box
+  local port
+  port="$(ask_port "请输入 VLESS 直出 TCP 端口" "$VLESS_DIRECT_PORT")"
 
-        rm -f /root/singbox-node-info.txt
-        rm -f /root/singbox-nodes.yaml
-        rm -f /root/install-singbox-ysq.sh
-        rm -f /root/install-singbox.sh
-        rm -f /root/singbox-install.sh
-        rm -f /usr/local/bin/ysq
+  if ! check_tcp_port_conflict "$port" "vless-direct"; then
+    return
+  fi
 
-        systemctl daemon-reload 2>/dev/null || true
+  ENABLE_VLESS_DIRECT=1
+  VLESS_DIRECT_PORT="$port"
+  save_state
+  apply_changes
+}
 
-        echo
-        echo "已彻底删除。"
-        echo "ysq 命令也已删除。"
-        exit 0
-      else
-        echo "已取消删除。"
+add_tuic() {
+  load_all
+
+  if [ "$ENABLE_TUIC" = "1" ]; then
+    echo "TUIC 已经存在。"
+    read -rp "是否修改 TUIC 端口？输入 y 修改，其他键取消: " yn
+    if [ "$yn" != "y" ] && [ "$yn" != "Y" ]; then
+      return
+    fi
+  fi
+
+  local port
+  port="$(ask_port "请输入 TUIC UDP 端口" "$TUIC_PORT")"
+
+  ENABLE_TUIC=1
+  TUIC_PORT="$port"
+  save_state
+  ensure_tuic_cert
+  apply_changes
+}
+
+add_relay() {
+  load_all
+
+  if [ "$ENABLE_RELAY" = "1" ]; then
+    echo "VLESS 中转已经存在。"
+    read -rp "是否修改中转端口或落地信息？输入 y 修改，其他键取消: " yn
+    if [ "$yn" != "y" ] && [ "$yn" != "Y" ]; then
+      return
+    fi
+  fi
+
+  local relay_port
+  relay_port="$(ask_port "请输入 VLESS 中转入口 TCP 端口" "$VLESS_RELAY_PORT")"
+
+  if ! check_tcp_port_conflict "$relay_port" "vless-relay"; then
+    return
+  fi
+
+  local landing_server
+  local landing_port
+
+  echo "注意：落地地址不能填 0.0.0.0，必须填真实落地 VPS IP 或域名。"
+  read -rp "请输入落地节点 IP 或域名: " landing_server
+
+  if [ -z "$landing_server" ] || [ "$landing_server" = "0.0.0.0" ]; then
+    echo "落地地址不能为空，也不能是 0.0.0.0"
+    return
+  fi
+
+  landing_port="$(ask_port "请输入落地节点 VLESS 端口" "$VLESS_DIRECT_PORT")"
+
+  ENABLE_RELAY=1
+  VLESS_RELAY_PORT="$relay_port"
+  LANDING_SERVER="$landing_server"
+  LANDING_PORT="$landing_port"
+
+  save_state
+  apply_changes
+}
+
+delete_vless_direct() {
+  load_all
+
+  if [ "$ENABLE_VLESS_DIRECT" != "1" ]; then
+    echo "VLESS 直出不存在。"
+    return
+  fi
+
+  if [ "$(enabled_count)" -le 1 ]; then
+    echo "不能删除最后一个节点。"
+    return
+  fi
+
+  read -rp "确认删除 VLESS 直出？输入 YES 确认: " confirm
+  if [ "$confirm" = "YES" ]; then
+    ENABLE_VLESS_DIRECT=0
+    save_state
+    apply_changes
+  else
+    echo "已取消。"
+  fi
+}
+
+delete_tuic() {
+  load_all
+
+  if [ "$ENABLE_TUIC" != "1" ]; then
+    echo "TUIC 不存在。"
+    return
+  fi
+
+  if [ "$(enabled_count)" -le 1 ]; then
+    echo "不能删除最后一个节点。"
+    return
+  fi
+
+  read -rp "确认删除 TUIC？输入 YES 确认: " confirm
+  if [ "$confirm" = "YES" ]; then
+    ENABLE_TUIC=0
+    save_state
+    apply_changes
+  else
+    echo "已取消。"
+  fi
+}
+
+delete_relay() {
+  load_all
+
+  if [ "$ENABLE_RELAY" != "1" ]; then
+    echo "VLESS 中转不存在。"
+    return
+  fi
+
+  if [ "$(enabled_count)" -le 1 ]; then
+    echo "不能删除最后一个节点。"
+    return
+  fi
+
+  read -rp "确认删除 VLESS 中转？输入 YES 确认: " confirm
+  if [ "$confirm" = "YES" ]; then
+    ENABLE_RELAY=0
+    LANDING_SERVER=""
+    LANDING_PORT="0"
+    save_state
+    apply_changes
+  else
+    echo "已取消。"
+  fi
+}
+
+add_menu() {
+  while true; do
+    clear
+    echo "=============================="
+    echo " 添加 / 修改 节点"
+    echo "=============================="
+    show_current_summary
+    echo "=============================="
+    echo "1) 添加/修改 VLESS 直出"
+    echo "2) 添加/修改 TUIC"
+    echo "3) 添加/修改 VLESS 中转"
+    echo "0) 返回"
+    echo "=============================="
+    read -rp "请输入选项: " choice
+
+    case "$choice" in
+      1)
+        clear
+        add_vless_direct
+        read -rp "按回车继续..."
+        ;;
+      2)
+        clear
+        add_tuic
+        read -rp "按回车继续..."
+        ;;
+      3)
+        clear
+        add_relay
+        read -rp "按回车继续..."
+        ;;
+      0)
+        return
+        ;;
+      *)
+        echo "输入错误。"
         sleep 1
-      fi
-      ;;
-    0)
-      exit 0
-      ;;
-    *)
-      echo "输入错误。"
-      sleep 1
-      ;;
-  esac
-done
+        ;;
+    esac
+  done
+}
+
+delete_menu() {
+  while true; do
+    clear
+    echo "=============================="
+    echo " 删除节点"
+    echo "=============================="
+    show_current_summary
+    echo "=============================="
+    echo "1) 删除 VLESS 直出"
+    echo "2) 删除 TUIC"
+    echo "3) 删除 VLESS 中转"
+    echo "0) 返回"
+    echo "=============================="
+    read -rp "请输入选项: " choice
+
+    case "$choice" in
+      1)
+        clear
+        delete_vless_direct
+        read -rp "按回车继续..."
+        ;;
+      2)
+        clear
+        delete_tuic
+        read -rp "按回车继续..."
+        ;;
+      3)
+        clear
+        delete_relay
+        read -rp "按回车继续..."
+        ;;
+      0)
+        return
+        ;;
+      *)
+        echo "输入错误。"
+        sleep 1
+        ;;
+    esac
+  done
+}
+
+uninstall_all() {
+  clear
+  echo "危险操作：这会彻底删除 sing-box、配置、证书、节点信息、YAML、ysq 面板和安装脚本。"
+  read -rp "确认删除请输入 YES: " confirm
+
+  if [ "$confirm" = "YES" ]; then
+    echo "正在停止 sing-box..."
+    systemctl stop sing-box 2>/dev/null || true
+    systemctl disable sing-box 2>/dev/null || true
+
+    echo "正在卸载 sing-box..."
+    apt purge -y sing-box 2>/dev/null || true
+    apt remove -y sing-box 2>/dev/null || true
+
+    echo "正在删除残留文件..."
+    rm -f /usr/local/bin/sing-box
+    rm -f /usr/bin/sing-box
+    rm -f /etc/systemd/system/sing-box.service
+    rm -rf /etc/sing-box
+    rm -rf /var/lib/sing-box
+    rm -rf /var/log/sing-box
+
+    rm -f /root/singbox-node-info.txt
+    rm -f /root/singbox-nodes.yaml
+    rm -f /root/install-singbox-ysq.sh
+    rm -f /root/install-singbox.sh
+    rm -f /root/singbox-install.sh
+    rm -f "$PANEL_FILE"
+
+    systemctl daemon-reload 2>/dev/null || true
+
+    echo
+    echo "已彻底删除。"
+    echo "ysq 命令也已删除。"
+    exit 0
+  else
+    echo "已取消删除。"
+    sleep 1
+  fi
+}
+
+main_menu() {
+  load_all
+
+  while true; do
+    clear
+    echo "=============================="
+    echo " ysq sing-box 管理面板"
+    echo "=============================="
+    show_current_summary
+    echo "=============================="
+    echo "1) 查看节点直链"
+    echo "2) 查看 Clash / Mihomo YAML"
+    echo "3) 查看 sing-box 状态"
+    echo "4) 重启 sing-box"
+    echo "5) 添加/修改节点"
+    echo "6) 删除节点"
+    echo "7) 查看 sing-box 配置文件"
+    echo "8) 彻底删除 sing-box 和脚本"
+    echo "0) 退出"
+    echo "=============================="
+    read -rp "请输入选项: " choice
+
+    case "$choice" in
+      1)
+        clear
+        if [ -f "$INFO_FILE" ]; then
+          cat "$INFO_FILE"
+        else
+          echo "未找到节点信息文件：$INFO_FILE"
+        fi
+        echo
+        read -rp "按回车返回面板..."
+        ;;
+      2)
+        clear
+        if [ -f "$YAML_FILE" ]; then
+          cat "$YAML_FILE"
+        else
+          echo "未找到 YAML 文件：$YAML_FILE"
+        fi
+        echo
+        read -rp "按回车返回面板..."
+        ;;
+      3)
+        clear
+        systemctl status sing-box --no-pager || true
+        echo
+        echo "当前监听端口："
+        show_ports
+        echo
+        read -rp "按回车返回面板..."
+        ;;
+      4)
+        clear
+        systemctl restart sing-box
+        generate_outputs
+        echo "sing-box 已重启。"
+        echo
+        systemctl status sing-box --no-pager || true
+        echo
+        read -rp "按回车返回面板..."
+        ;;
+      5)
+        add_menu
+        ;;
+      6)
+        delete_menu
+        ;;
+      7)
+        clear
+        if [ -f "$CONFIG_FILE" ]; then
+          jq . "$CONFIG_FILE" 2>/dev/null || cat "$CONFIG_FILE"
+        else
+          echo "未找到配置文件：$CONFIG_FILE"
+        fi
+        echo
+        read -rp "按回车返回面板..."
+        ;;
+      8)
+        uninstall_all
+        ;;
+      0)
+        exit 0
+        ;;
+      *)
+        echo "输入错误。"
+        sleep 1
+        ;;
+    esac
+  done
+}
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "请使用 root 运行 ysq。"
+  exit 1
+fi
+
+case "${1:-}" in
+  rebuild)
+    load_all
+    if [ "$ENABLE_TUIC" = "1" ]; then
+      ensure_tuic_cert
+    fi
+    save_state
+    write_config
+    check_config
+    systemctl restart sing-box
+    generate_outputs
+    ;;
+  *)
+    main_menu
+    ;;
+esac
 PANEL
 
 chmod +x "$PANEL_FILE"
+
+echo
+echo "正在生成初始配置..."
+"$PANEL_FILE" rebuild
 
 cp "$0" "$INSTALLER_FILE" 2>/dev/null || true
 chmod +x "$INSTALLER_FILE" 2>/dev/null || true
@@ -760,7 +1268,7 @@ echo
 echo "ysq"
 echo
 echo "防火墙放行参考："
-if [ "$ENABLE_VLESS" = "1" ]; then
+if [ "$ENABLE_VLESS_DIRECT" = "1" ]; then
   echo "TCP ${VLESS_DIRECT_PORT}"
 fi
 if [ "$ENABLE_RELAY" = "1" ]; then
