@@ -439,7 +439,7 @@ ensure_tuic_cert() {
 
   if [ ! -f "$CERT_DIR/tuic.key" ] || [ ! -f "$CERT_DIR/tuic.crt" ]; then
     echo "正在生成 TUIC 自签证书..."
-    openssl req -x509 -newkey rsa:2048 -nodes \
+    openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
       -keyout "$CERT_DIR/tuic.key" \
       -out "$CERT_DIR/tuic.crt" \
       -days 3650 \
