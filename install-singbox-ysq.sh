@@ -1,4 +1,3 @@
-cat > install-singbox-ysq.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -21,6 +20,7 @@ DEFAULT_TUIC_PASS="884158a048b01725"
 
 REALITY_SNI="www.microsoft.com"
 TUIC_SNI="www.bing.com"
+DEFAULT_NODE_PREFIX="🌐UN"
 
 CONFIG_DIR="/etc/sing-box"
 CONFIG_FILE="/etc/sing-box/config.json"
@@ -55,6 +55,72 @@ ask_port() {
   done
 }
 
+detect_country_code() {
+  local code=""
+
+  code="$(curl -4 -fsSL --max-time 6 https://ipinfo.io/country 2>/dev/null || true)"
+  code="$(printf '%s' "$code" | tr -d '\r\n ' | tr '[:lower:]' '[:upper:]')"
+
+  if ! [[ "$code" =~ ^[A-Z]{2}$ ]]; then
+    code="$(curl -4 -fsSL --max-time 6 https://ifconfig.co/country-iso 2>/dev/null || true)"
+    code="$(printf '%s' "$code" | tr -d '\r\n ' | tr '[:lower:]' '[:upper:]')"
+  fi
+
+  if ! [[ "$code" =~ ^[A-Z]{2}$ ]]; then
+    code="$(curl -4 -fsSL --max-time 6 https://ipapi.co/country_code 2>/dev/null || true)"
+    code="$(printf '%s' "$code" | tr -d '\r\n ' | tr '[:lower:]' '[:upper:]')"
+  fi
+
+  if [[ "$code" =~ ^[A-Z]{2}$ ]]; then
+    echo "$code"
+  else
+    echo "UN"
+  fi
+}
+
+country_flag() {
+  local code="$1"
+
+  case "$code" in
+    SG) echo "🇸🇬" ;;
+    HK) echo "🇭🇰" ;;
+    TW) echo "🇹🇼" ;;
+    JP) echo "🇯🇵" ;;
+    KR) echo "🇰🇷" ;;
+    US) echo "🇺🇸" ;;
+    GB|UK) echo "🇬🇧" ;;
+    DE) echo "🇩🇪" ;;
+    FR) echo "🇫🇷" ;;
+    NL) echo "🇳🇱" ;;
+    CA) echo "🇨🇦" ;;
+    AU) echo "🇦🇺" ;;
+    MY) echo "🇲🇾" ;;
+    TH) echo "🇹🇭" ;;
+    VN) echo "🇻🇳" ;;
+    PH) echo "🇵🇭" ;;
+    ID) echo "🇮🇩" ;;
+    IN) echo "🇮🇳" ;;
+    RU) echo "🇷🇺" ;;
+    TR) echo "🇹🇷" ;;
+    BR) echo "🇧🇷" ;;
+    MX) echo "🇲🇽" ;;
+    AE) echo "🇦🇪" ;;
+    SA) echo "🇸🇦" ;;
+    ZA) echo "🇿🇦" ;;
+    *) echo "🌐" ;;
+  esac
+}
+
+auto_node_prefix() {
+  local code=""
+  local flag=""
+
+  code="$(detect_country_code)"
+  flag="$(country_flag "$code")"
+
+  echo "${flag}${code}"
+}
+
 if [ "$(id -u)" -ne 0 ]; then
   echo "请使用 root 运行：sudo bash install-singbox-ysq.sh"
   exit 1
@@ -64,6 +130,15 @@ echo "=============================="
 echo " ysq sing-box 一键安装脚本"
 echo " VLESS / TUIC / VLESS中转"
 echo "=============================="
+echo
+
+echo "=============================="
+echo "节点命名设置"
+echo "=============================="
+echo "正在通过公网 IP 自动识别节点地区..."
+NODE_PREFIX="$(auto_node_prefix)"
+echo "自动识别节点名前缀：${NODE_PREFIX}"
+echo "生成示例：${NODE_PREFIX}-vless / ${NODE_PREFIX}-tuic5 / ${NODE_PREFIX}-vless-relay"
 echo
 
 echo "请选择是否生成新的 UUID / REALITY 密钥 / ShortID："
@@ -129,7 +204,6 @@ if [ "$RELAY_CHOICE" = "1" ]; then
   VLESS_RELAY_PORT="$(ask_port "请输入 VLESS 中转入口 TCP 端口" "$VLESS_RELAY_PORT")"
 
   echo
-  echo "注意：落地地址不能填 0.0.0.0，必须填真实落地 VPS IP 或域名。"
   read -rp "请输入落地节点 IP 或域名: " LANDING_SERVER
 
   if [ "$LANDING_SERVER" = "0.0.0.0" ]; then
@@ -203,6 +277,7 @@ SHORT_ID="$SHORT_ID"
 TUIC_PASS="$TUIC_PASS"
 REALITY_SNI="$REALITY_SNI"
 TUIC_SNI="$TUIC_SNI"
+NODE_PREFIX="$NODE_PREFIX"
 CONFIG_DIR="$CONFIG_DIR"
 CONFIG_FILE="$CONFIG_FILE"
 CERT_DIR="$CERT_DIR"
@@ -240,6 +315,7 @@ PANEL_FILE="/usr/local/bin/ysq"
 DEFAULT_VLESS_DIRECT_PORT=20001
 DEFAULT_TUIC_PORT=20002
 DEFAULT_VLESS_RELAY_PORT=20003
+DEFAULT_NODE_PREFIX="🌐UN"
 
 load_all() {
   if [ ! -f "$ENV_FILE" ]; then
@@ -263,6 +339,11 @@ load_all() {
   VLESS_RELAY_PORT="${VLESS_RELAY_PORT:-$DEFAULT_VLESS_RELAY_PORT}"
   LANDING_SERVER="${LANDING_SERVER:-}"
   LANDING_PORT="${LANDING_PORT:-0}"
+  NODE_PREFIX="${NODE_PREFIX:-$DEFAULT_NODE_PREFIX}"
+
+  VLESS_DIRECT_NAME="${NODE_PREFIX}-vless"
+  TUIC_NAME="${NODE_PREFIX}-tuic5"
+  VLESS_RELAY_NAME="${NODE_PREFIX}-vless-relay"
 }
 
 save_state() {
@@ -545,6 +626,10 @@ def landing_out:
 ' > "$CONFIG_FILE"
 }
 
+uri_encode() {
+  jq -nr --arg v "$1" '$v|@uri'
+}
+
 generate_outputs() {
   load_all
 
@@ -555,9 +640,21 @@ generate_outputs() {
   local vless_relay_link=""
   local tuic_link=""
 
-  vless_direct_link="vless://${UUID}@${server_ip}:${VLESS_DIRECT_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#HK-VLESS-DIRECT"
-  vless_relay_link="vless://${UUID}@${server_ip}:${VLESS_RELAY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#HK-VLESS-RELAY"
-  tuic_link="tuic://${UUID}:${TUIC_PASS}@${server_ip}:${TUIC_PORT}?congestion_control=bbr&alpn=h3&sni=${TUIC_SNI}&allow_insecure=1#HK-TUIC"
+  local vless_direct_name="$VLESS_DIRECT_NAME"
+  local vless_relay_name="$VLESS_RELAY_NAME"
+  local tuic_name="$TUIC_NAME"
+
+  local vless_direct_name_enc=""
+  local vless_relay_name_enc=""
+  local tuic_name_enc=""
+
+  vless_direct_name_enc="$(uri_encode "$vless_direct_name")"
+  vless_relay_name_enc="$(uri_encode "$vless_relay_name")"
+  tuic_name_enc="$(uri_encode "$tuic_name")"
+
+  vless_direct_link="vless://${UUID}@${server_ip}:${VLESS_DIRECT_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#${vless_direct_name_enc}"
+  vless_relay_link="vless://${UUID}@${server_ip}:${VLESS_RELAY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#${vless_relay_name_enc}"
+  tuic_link="tuic://${UUID}:${TUIC_PASS}@${server_ip}:${TUIC_PORT}?congestion_control=bbr&alpn=h3&sni=${TUIC_SNI}&allow_insecure=1#${tuic_name_enc}"
 
   cat > "$INFO_FILE" <<INFO
 ==============================
@@ -565,6 +662,7 @@ ysq sing-box 节点信息
 ==============================
 
 服务器地址: ${server_ip}
+节点名前缀: ${NODE_PREFIX}
 
 UUID: ${UUID}
 REALITY PrivateKey: ${PRIVATE_KEY}
@@ -578,7 +676,7 @@ INFO
 ==============================
 VLESS 直出节点
 ==============================
-名称: HK-VLESS-DIRECT
+名称: ${vless_direct_name}
 地址: ${server_ip}
 端口: ${VLESS_DIRECT_PORT}
 UUID: ${UUID}
@@ -599,7 +697,7 @@ INFO
 ==============================
 VLESS 中转节点
 ==============================
-名称: HK-VLESS-RELAY
+名称: ${vless_relay_name}
 地址: ${server_ip}
 端口: ${VLESS_RELAY_PORT}
 UUID: ${UUID}
@@ -623,7 +721,7 @@ PrivateKey: ${PRIVATE_KEY}
 ShortID: ${SHORT_ID}
 SNI: ${REALITY_SNI}
 
-香港 outbound 使用：
+中转 outbound 使用：
 PublicKey: ${PUBLIC_KEY}
 ShortID: ${SHORT_ID}
 
@@ -635,7 +733,7 @@ INFO
 ==============================
 TUIC 节点
 ==============================
-名称: HK-TUIC
+名称: ${tuic_name}
 地址: ${server_ip}
 端口: ${TUIC_PORT}
 UUID: ${UUID}
@@ -692,7 +790,7 @@ YAML
 
   if [ "$ENABLE_VLESS_DIRECT" = "1" ]; then
     cat >> "$YAML_FILE" <<YAML
-  - name: HK-VLESS-DIRECT
+  - name: "${vless_direct_name}"
     type: vless
     server: ${server_ip}
     port: ${VLESS_DIRECT_PORT}
@@ -707,12 +805,12 @@ YAML
       public-key: ${PUBLIC_KEY}
       short-id: ${SHORT_ID}
 YAML
-    proxy_names+=("HK-VLESS-DIRECT")
+    proxy_names+=("$vless_direct_name")
   fi
 
   if [ "$ENABLE_RELAY" = "1" ]; then
     cat >> "$YAML_FILE" <<YAML
-  - name: HK-VLESS-RELAY
+  - name: "${vless_relay_name}"
     type: vless
     server: ${server_ip}
     port: ${VLESS_RELAY_PORT}
@@ -727,12 +825,12 @@ YAML
       public-key: ${PUBLIC_KEY}
       short-id: ${SHORT_ID}
 YAML
-    proxy_names+=("HK-VLESS-RELAY")
+    proxy_names+=("$vless_relay_name")
   fi
 
   if [ "$ENABLE_TUIC" = "1" ]; then
     cat >> "$YAML_FILE" <<YAML
-  - name: HK-TUIC
+  - name: "${tuic_name}"
     type: tuic
     server: ${server_ip}
     port: ${TUIC_PORT}
@@ -745,7 +843,7 @@ YAML
     congestion-controller: bbr
     udp-relay-mode: native
 YAML
-    proxy_names+=("HK-TUIC")
+    proxy_names+=("$tuic_name")
   fi
 
   cat >> "$YAML_FILE" <<YAML
@@ -757,7 +855,7 @@ proxy-groups:
 YAML
 
   for name in "${proxy_names[@]}"; do
-    echo "      - ${name}" >> "$YAML_FILE"
+    echo "      - \"${name}\"" >> "$YAML_FILE"
   done
 
   cat >> "$YAML_FILE" <<YAML
@@ -825,9 +923,10 @@ show_ports() {
 show_current_summary() {
   load_all
   echo "当前节点状态："
-  echo "VLESS 直出: ${ENABLE_VLESS_DIRECT}，端口: ${VLESS_DIRECT_PORT}"
-  echo "TUIC: ${ENABLE_TUIC}，端口: ${TUIC_PORT}"
-  echo "VLESS 中转: ${ENABLE_RELAY}，端口: ${VLESS_RELAY_PORT}"
+  echo "节点名前缀: ${NODE_PREFIX}"
+  echo "VLESS 直出: ${ENABLE_VLESS_DIRECT}，端口: ${VLESS_DIRECT_PORT}，名称: ${VLESS_DIRECT_NAME}"
+  echo "TUIC: ${ENABLE_TUIC}，端口: ${TUIC_PORT}，名称: ${TUIC_NAME}"
+  echo "VLESS 中转: ${ENABLE_RELAY}，端口: ${VLESS_RELAY_PORT}，名称: ${VLESS_RELAY_NAME}"
   if [ "$ENABLE_RELAY" = "1" ]; then
     echo "落地: ${LANDING_SERVER}:${LANDING_PORT}"
   fi
@@ -899,7 +998,6 @@ add_relay() {
   local landing_server
   local landing_port
 
-  echo "注意：落地地址不能填 0.0.0.0，必须填真实落地 VPS IP 或域名。"
   read -rp "请输入落地节点 IP 或域名: " landing_server
 
   if [ -z "$landing_server" ] || [ "$landing_server" = "0.0.0.0" ]; then
@@ -931,8 +1029,8 @@ delete_vless_direct() {
     return
   fi
 
-  read -rp "确认删除 VLESS 直出？输入 YES 确认: " confirm
-  if [ "$confirm" = "YES" ]; then
+  read -rp "确认删除 VLESS 直出？输入 y 确认: " confirm
+  if [ "$confirm" = "y" ]; then
     ENABLE_VLESS_DIRECT=0
     save_state
     apply_changes
@@ -954,8 +1052,8 @@ delete_tuic() {
     return
   fi
 
-  read -rp "确认删除 TUIC？输入 YES 确认: " confirm
-  if [ "$confirm" = "YES" ]; then
+  read -rp "确认删除 TUIC？输入 y 确认: " confirm
+  if [ "$confirm" = "y" ]; then
     ENABLE_TUIC=0
     save_state
     apply_changes
@@ -977,8 +1075,8 @@ delete_relay() {
     return
   fi
 
-  read -rp "确认删除 VLESS 中转？输入 YES 确认: " confirm
-  if [ "$confirm" = "YES" ]; then
+  read -rp "确认删除 VLESS 中转？输入 y 确认: " confirm
+  if [ "$confirm" = "y" ]; then
     ENABLE_RELAY=0
     LANDING_SERVER=""
     LANDING_PORT="0"
@@ -1076,9 +1174,9 @@ delete_menu() {
 uninstall_all() {
   clear
   echo "危险操作：这会彻底删除 sing-box、配置、证书、节点信息、YAML、ysq 面板和安装脚本。"
-  read -rp "确认删除请输入 YES: " confirm
+  read -rp "确认删除请输入 y: " confirm
 
-  if [ "$confirm" = "YES" ]; then
+  if [ "$confirm" = "y" ]; then
     echo "正在停止 sing-box..."
     systemctl stop sing-box 2>/dev/null || true
     systemctl disable sing-box 2>/dev/null || true
@@ -1125,7 +1223,7 @@ main_menu() {
     show_current_summary
     echo "=============================="
     echo "1) 查看节点直链"
-    echo "2) 查看 Clash / Mihomo YAML"
+    echo "2) 查看 Clash YAML"
     echo "3) 查看 sing-box 状态"
     echo "4) 重启 sing-box"
     echo "5) 添加/修改节点"
@@ -1247,7 +1345,7 @@ cat "$INFO_FILE"
 
 echo
 echo "=============================="
-echo "Clash / Mihomo YAML"
+echo "Clash YAML"
 echo "=============================="
 cat "$YAML_FILE"
 
@@ -1266,15 +1364,3 @@ echo
 echo "以后输入下面命令打开面板："
 echo
 echo "ysq"
-echo
-echo "防火墙放行参考："
-if [ "$ENABLE_VLESS_DIRECT" = "1" ]; then
-  echo "TCP ${VLESS_DIRECT_PORT}"
-fi
-if [ "$ENABLE_RELAY" = "1" ]; then
-  echo "TCP ${VLESS_RELAY_PORT}"
-fi
-if [ "$ENABLE_TUIC" = "1" ]; then
-  echo "UDP ${TUIC_PORT}"
-fi
-EOF
