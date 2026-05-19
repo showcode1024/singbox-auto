@@ -132,14 +132,10 @@ echo " VLESS / TUIC / VLESS中转"
 echo "=============================="
 echo
 
-echo "=============================="
-echo "节点命名设置"
-echo "=============================="
-echo "正在通过公网 IP 自动识别节点地区..."
 NODE_PREFIX="$(auto_node_prefix)"
-echo "自动识别节点名前缀：${NODE_PREFIX}"
-echo "生成示例：${NODE_PREFIX}-vless / ${NODE_PREFIX}-tuic5 / ${NODE_PREFIX}-vless-relay"
-echo
+echo "ip:${server_ip}"
+echo "服务器所在地：${NODE_PREFIX}"
+echo 
 
 echo "请选择是否生成新的 UUID / REALITY 密钥 / ShortID："
 echo "1) 生成新的"
@@ -1364,3 +1360,4 @@ echo
 echo "以后输入下面命令打开面板："
 echo
 echo "ysq"
+
