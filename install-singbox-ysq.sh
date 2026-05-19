@@ -141,7 +141,7 @@ echo "=============================="
 echo
 
 NODE_PREFIX="$(auto_node_prefix)"
-echo "ip:$(get_server_ip)"
+echo "ipv4:$(get_server_ip)"
 echo "服务器所在地：${NODE_PREFIX}"
 echo 
 
@@ -754,12 +754,6 @@ INFO
   fi
 
   cat >> "$INFO_FILE" <<INFO
-==============================
-端口说明
-==============================
-VLESS 直出: TCP ${VLESS_DIRECT_PORT}，状态：${ENABLE_VLESS_DIRECT}
-VLESS 中转: TCP ${VLESS_RELAY_PORT}，状态：${ENABLE_RELAY}
-TUIC: UDP ${TUIC_PORT}，状态：${ENABLE_TUIC}
 
 配置文件: ${CONFIG_FILE}
 节点信息: ${INFO_FILE}
@@ -1368,4 +1362,3 @@ echo
 echo "以后输入下面命令打开面板："
 echo
 echo "ysq"
-
