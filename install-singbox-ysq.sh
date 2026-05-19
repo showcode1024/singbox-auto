@@ -77,14 +77,6 @@ detect_country_code() {
     echo "UN"
   fi
 }
-get_server_ip() {
-  local ip=""
-  ip="$(curl -4 -s --max-time 5 https://api.ipify.org || true)"
-  if [ -z "$ip" ]; then
-    ip="$(hostname -I | awk '{print $1}')"
-  fi
-  echo "$ip"
-}
 
 country_flag() {
   local code="$1"
@@ -141,9 +133,8 @@ echo "=============================="
 echo
 
 NODE_PREFIX="$(auto_node_prefix)"
-echo "ipv4:$(get_server_ip)"
-echo "服务器所在地：${NODE_PREFIX}"
-echo 
+echo "ip所在地：${NODE_PREFIX}"
+echo
 
 echo "请选择是否生成新的 UUID / REALITY 密钥 / ShortID："
 echo "1) 生成新的"
@@ -208,6 +199,7 @@ if [ "$RELAY_CHOICE" = "1" ]; then
   VLESS_RELAY_PORT="$(ask_port "请输入 VLESS 中转入口 TCP 端口" "$VLESS_RELAY_PORT")"
 
   echo
+  echo "注意：落地地址不能填 0.0.0.0，必须填真实落地 VPS IP 或域名。"
   read -rp "请输入落地节点 IP 或域名: " LANDING_SERVER
 
   if [ "$LANDING_SERVER" = "0.0.0.0" ]; then
@@ -439,7 +431,7 @@ ensure_tuic_cert() {
 
   if [ ! -f "$CERT_DIR/tuic.key" ] || [ ! -f "$CERT_DIR/tuic.crt" ]; then
     echo "正在生成 TUIC 自签证书..."
-    openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+    openssl req -x509 -newkey rsa:2048 -nodes \
       -keyout "$CERT_DIR/tuic.key" \
       -out "$CERT_DIR/tuic.crt" \
       -days 3650 \
@@ -754,6 +746,12 @@ INFO
   fi
 
   cat >> "$INFO_FILE" <<INFO
+==============================
+端口说明
+==============================
+VLESS 直出: TCP ${VLESS_DIRECT_PORT}，状态：${ENABLE_VLESS_DIRECT}
+VLESS 中转: TCP ${VLESS_RELAY_PORT}，状态：${ENABLE_RELAY}
+TUIC: UDP ${TUIC_PORT}，状态：${ENABLE_TUIC}
 
 配置文件: ${CONFIG_FILE}
 节点信息: ${INFO_FILE}
@@ -996,6 +994,7 @@ add_relay() {
   local landing_server
   local landing_port
 
+  echo "注意：落地地址不能填 0.0.0.0，必须填真实落地 VPS IP 或域名。"
   read -rp "请输入落地节点 IP 或域名: " landing_server
 
   if [ -z "$landing_server" ] || [ "$landing_server" = "0.0.0.0" ]; then
@@ -1027,8 +1026,8 @@ delete_vless_direct() {
     return
   fi
 
-  read -rp "确认删除 VLESS 直出？输入 y 确认: " confirm
-  if [ "$confirm" = "y" ]; then
+  read -rp "确认删除 VLESS 直出？输入 YES 确认: " confirm
+  if [ "$confirm" = "YES" ]; then
     ENABLE_VLESS_DIRECT=0
     save_state
     apply_changes
@@ -1050,8 +1049,8 @@ delete_tuic() {
     return
   fi
 
-  read -rp "确认删除 TUIC？输入 y 确认: " confirm
-  if [ "$confirm" = "y" ]; then
+  read -rp "确认删除 TUIC？输入 YES 确认: " confirm
+  if [ "$confirm" = "YES" ]; then
     ENABLE_TUIC=0
     save_state
     apply_changes
@@ -1073,8 +1072,8 @@ delete_relay() {
     return
   fi
 
-  read -rp "确认删除 VLESS 中转？输入 y 确认: " confirm
-  if [ "$confirm" = "y" ]; then
+  read -rp "确认删除 VLESS 中转？输入 YES 确认: " confirm
+  if [ "$confirm" = "YES" ]; then
     ENABLE_RELAY=0
     LANDING_SERVER=""
     LANDING_PORT="0"
@@ -1172,9 +1171,9 @@ delete_menu() {
 uninstall_all() {
   clear
   echo "危险操作：这会彻底删除 sing-box、配置、证书、节点信息、YAML、ysq 面板和安装脚本。"
-  read -rp "确认删除请输入 y: " confirm
+  read -rp "确认删除请输入 YES: " confirm
 
-  if [ "$confirm" = "y" ]; then
+  if [ "$confirm" = "YES" ]; then
     echo "正在停止 sing-box..."
     systemctl stop sing-box 2>/dev/null || true
     systemctl disable sing-box 2>/dev/null || true
@@ -1221,7 +1220,7 @@ main_menu() {
     show_current_summary
     echo "=============================="
     echo "1) 查看节点直链"
-    echo "2) 查看 Clash YAML"
+    echo "2) 查看 Clash / Mihomo YAML"
     echo "3) 查看 sing-box 状态"
     echo "4) 重启 sing-box"
     echo "5) 添加/修改节点"
@@ -1343,7 +1342,7 @@ cat "$INFO_FILE"
 
 echo
 echo "=============================="
-echo "Clash YAML"
+echo "Clash / Mihomo YAML"
 echo "=============================="
 cat "$YAML_FILE"
 
@@ -1362,3 +1361,14 @@ echo
 echo "以后输入下面命令打开面板："
 echo
 echo "ysq"
+echo
+echo "防火墙放行参考："
+if [ "$ENABLE_VLESS_DIRECT" = "1" ]; then
+  echo "TCP ${VLESS_DIRECT_PORT}"
+fi
+if [ "$ENABLE_RELAY" = "1" ]; then
+  echo "TCP ${VLESS_RELAY_PORT}"
+fi
+if [ "$ENABLE_TUIC" = "1" ]; then
+  echo "UDP ${TUIC_PORT}"
+fi
