@@ -77,6 +77,14 @@ detect_country_code() {
     echo "UN"
   fi
 }
+get_server_ip() {
+  local ip=""
+  ip="$(curl -4 -s --max-time 5 https://api.ipify.org || true)"
+  if [ -z "$ip" ]; then
+    ip="$(hostname -I | awk '{print $1}')"
+  fi
+  echo "$ip"
+}
 
 country_flag() {
   local code="$1"
@@ -133,7 +141,7 @@ echo "=============================="
 echo
 
 NODE_PREFIX="$(auto_node_prefix)"
-echo "ip:${server_ip}"
+echo "ip:$(get_server_ip)"
 echo "服务器所在地：${NODE_PREFIX}"
 echo 
 
