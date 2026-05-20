@@ -36,7 +36,7 @@ TUIC_SNI="www.bing.com"
 
 CONFIG_DIR="/etc/sing-box"
 CONFIG_FILE="/etc/sing-box/config.json"
-STATE_FILE="/etc/sing-box/ysq-state.json"
+STATE_FILE="/etc/sing-box/ysq-state.db"
 CERT_DIR="/etc/sing-box/cert"
 CERT_FILE="/etc/sing-box/cert/tuic.crt"
 KEY_FILE="/etc/sing-box/cert/tuic.key"
