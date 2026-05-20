@@ -9,7 +9,7 @@
 使用 root 用户执行：
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/showcode1024/singbox-auto/main/install-singbox-ysq.sh)
+curl -Ls -o install-singbox-ysq.sh https://raw.githubusercontent.com/showcode1024/singbox-auto/main/install-singbox-ysq.sh && bash install-singbox-ysq.sh
 ```
 
 如果当前系统没有 `curl`，可以先安装：
