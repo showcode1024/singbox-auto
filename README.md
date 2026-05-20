@@ -1,8 +1,23 @@
-# singbox-auto
+# singbox-auto v1
 
 一个基于 **sing-box** 的自用节点一键安装与管理脚本，支持快速生成 **VLESS Reality**、**TUIC v5** 节点，并支持通过面板随时添加、删除、修改节点端口。
 
 脚本适合用于个人 VPS 节点部署、双机中转、落地机转发等场景。
+
+## 一键安装
+
+使用 root 用户执行：
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/showcode1024/singbox-auto/main/install-singbox-ysq.sh)
+```
+
+如果当前系统没有 `curl`，可以先安装：
+
+```bash
+apt update
+apt install -y curl
+```
 
 > 仅供学习、研究和合法网络加速用途，请遵守所在地区法律法规。
 
@@ -78,23 +93,6 @@
 
 ```text
 客户端 -> 当前 VPS(TUIC v5入口) -> 落地 VPS(VLESS Reality) -> 外网
-```
-
----
-
-## 一键安装
-
-使用 root 用户执行：
-
-```bash
-bash <(curl -Ls https://raw.githubusercontent.com/showcode1024/singbox-auto/main/install-singbox-ysq.sh)
-```
-
-如果当前系统没有 `curl`，可以先安装：
-
-```bash
-apt update
-apt install -y curl
 ```
 
 ---
