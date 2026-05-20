@@ -1181,29 +1181,14 @@ PANEL
 }
 
 save_self() {
-  # 1. 尝试直接复制（适用于用户 wget 下载后 bash 运行的场景）
-  if [ -f "$0" ] && [[ "$0" != *"bash"* ]] && [[ "$0" != *"sh"* ]]; then
+  if [ -f "$0" ]; then
     cp "$0" "$INSTALLER_FILE" 2>/dev/null || true
     chmod +x "$INSTALLER_FILE" 2>/dev/null || true
   fi
 
-  # 2. 如果文件没成功生成，大概率是因为使用了 curl | bash 执行
-  if [ ! -x "$INSTALLER_FILE" ]; then
-    info "检测到管道运行模式，正在从远程获取管理脚本..."
-    
-    # 替换为你实际托管这个脚本的 Github RAW 链接或你自己的域名
-    local SCRIPT_URL="https://raw.githubusercontent.com/你的用户名/你的仓库/main/你的脚本.sh"
-    
-    if curl -fsSL "$SCRIPT_URL" -o "$INSTALLER_FILE" 2>/dev/null; then
-      chmod +x "$INSTALLER_FILE" 2>/dev/null || true
-      ok "管理脚本已成功保存到 ${INSTALLER_FILE}"
-    fi
-  fi
-
-  # 3. 最终确认
   if [ ! -x "$INSTALLER_FILE" ]; then
     warn "未能自动保存安装脚本到 ${INSTALLER_FILE}。"
-    warn "ysq 面板需要此文件，请手动下载并放到 ${INSTALLER_FILE}，然后赋予执行权限。"
+    warn "ysq 面板需要这个文件，请手动把本脚本复制到 ${INSTALLER_FILE}。"
   fi
 }
 
