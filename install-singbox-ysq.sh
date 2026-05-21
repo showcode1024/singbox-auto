@@ -88,9 +88,11 @@ detect_pkg_manager() {
 detect_service_manager() {
   if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
     SERVICE_MANAGER="systemd"
-  elif command -v rc-service >/dev/null 2>&1; then
+  elif command -v rc-service >/dev/null 2>&1 && rc-status >/dev/null 2>&1; then
     SERVICE_MANAGER="openrc"
   else
+    # Docker / LXC / 精简 Alpine 里可能有 rc-service 命令，但 OpenRC 没真正运行。
+    # 这种情况下不要强行用 rc-service，改用 nohup 后台兜底。
     SERVICE_MANAGER="none"
   fi
 }
@@ -190,6 +192,140 @@ normalize_arch() {
     armv7l|armv7) echo "armv7" ;;
     *) die "暂不支持当前 CPU 架构：$(uname -m)" ;;
   esac
+}
+
+normalize_apk_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64) echo "x86_64" ;;
+    aarch64|arm64) echo "aarch64" ;;
+    armv7l|armv7) echo "armv7" ;;
+    *) die "暂不支持当前 CPU 架构：$(uname -m)" ;;
+  esac
+}
+
+ensure_alpine_glibc_compat() {
+  [ "${PKG_MANAGER:-}" = "apk" ] || return 0
+
+  # 官方 tar.gz 里的 sing-box 在部分版本/架构上会依赖 glibc loader：
+  # /lib64/ld-linux-x86-64.so.2。Alpine 默认是 musl，所以需要兼容层。
+  apk add --no-cache gcompat libc6-compat libstdc++ libgcc file 2>/dev/null || true
+
+  case "$(uname -m)" in
+    x86_64|amd64)
+      mkdir -p /lib64
+      if [ -e /lib/ld-linux-x86-64.so.2 ]; then
+        ln -sf /lib/ld-linux-x86-64.so.2 /lib64/ld-linux-x86-64.so.2
+      elif [ -e /usr/glibc-compat/lib/ld-linux-x86-64.so.2 ]; then
+        ln -sf /usr/glibc-compat/lib/ld-linux-x86-64.so.2 /lib64/ld-linux-x86-64.so.2
+      fi
+      ;;
+  esac
+}
+
+singbox_bin_works() {
+  local bin
+  bin="${1:-$(command -v sing-box 2>/dev/null || true)}"
+  [ -n "$bin" ] || return 1
+  [ -x "$bin" ] || return 1
+  "$bin" version >/dev/null 2>&1
+}
+
+remove_broken_singbox_bins() {
+  local bin
+  bin="$(command -v sing-box 2>/dev/null || true)"
+  if [ -n "$bin" ] && ! singbox_bin_works "$bin"; then
+    warn "检测到 sing-box 可执行文件存在但无法运行：$bin"
+    file "$bin" 2>/dev/null || true
+    rm -f "$bin"
+  fi
+
+  for bin in /usr/local/bin/sing-box /usr/bin/sing-box; do
+    if [ -e "$bin" ] && ! singbox_bin_works "$bin"; then
+      warn "删除无法运行的 sing-box：$bin"
+      file "$bin" 2>/dev/null || true
+      rm -f "$bin"
+    fi
+  done
+
+  hash -r 2>/dev/null || true
+}
+
+install_singbox_alpine_apk() {
+  local arch version url tmp_dir apk_file extracted_bin tgz_arch tgz_file found_bin
+
+  arch="$(normalize_apk_arch)"
+  tmp_dir="$(mktemp -d)"
+
+  info "Alpine 系统安装 sing-box..."
+  version="$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r '.tag_name' | sed 's/^v//' 2>/dev/null || true)"
+  [ -n "$version" ] && [ "$version" != "null" ] || die "无法获取 sing-box 最新版本号。"
+
+  # 1) 优先尝试官方 Alpine .apk 包。
+  url="https://github.com/SagerNet/sing-box/releases/download/v${version}/sing-box_${version}_linux_${arch}.apk"
+  apk_file="${tmp_dir}/sing-box.apk"
+  info "正在下载 Alpine .apk 包：sing-box ${version} / ${arch}"
+  curl -fL --connect-timeout 10 --retry 3 -o "$apk_file" "$url"
+
+  if apk add --allow-untrusted "$apk_file"; then
+    hash -r 2>/dev/null || true
+    if command -v sing-box >/dev/null 2>&1 && singbox_bin_works "$(command -v sing-box)"; then
+      rm -rf "$tmp_dir"
+      return 0
+    fi
+    warn ".apk 安装完成，但 sing-box 无法运行，继续使用备用安装。"
+  else
+    warn "apk add 本地包失败，尝试直接解包 .apk。"
+  fi
+
+  # 2) 有些 Alpine 环境不能 apk add 本地包，尝试把 apk 当 tar 包解开。
+  if tar -xzf "$apk_file" -C "$tmp_dir" 2>/dev/null || tar -xf "$apk_file" -C "$tmp_dir" 2>/dev/null; then
+    extracted_bin="$(find "$tmp_dir" \( -type f -path '*/bin/sing-box' -o -type f -name sing-box \) | head -n 1)"
+    if [ -n "$extracted_bin" ]; then
+      install -m 755 "$extracted_bin" /usr/bin/sing-box
+      ln -sf /usr/bin/sing-box /usr/local/bin/sing-box
+      hash -r 2>/dev/null || true
+      if singbox_bin_works /usr/bin/sing-box; then
+        rm -rf "$tmp_dir"
+        return 0
+      fi
+      warn "从 .apk 解出的 sing-box 仍无法运行，继续使用 tar.gz 备用安装。"
+    else
+      warn ".apk 解包后没有找到 sing-box 二进制，继续使用 tar.gz 备用安装。"
+    fi
+  else
+    warn ".apk 无法解包，继续使用 tar.gz 备用安装。"
+  fi
+
+  # 3) 最后兜底：使用 GitHub tar.gz。该包在 Alpine 上可能需要 gcompat/glibc loader 兼容层。
+  ensure_alpine_glibc_compat
+  tgz_arch="$(normalize_arch)"
+  tgz_file="${tmp_dir}/sing-box.tar.gz"
+  url="https://github.com/SagerNet/sing-box/releases/download/v${version}/sing-box-${version}-linux-${tgz_arch}.tar.gz"
+  info "正在下载 tar.gz 备用包：sing-box ${version} / linux-${tgz_arch}"
+  curl -fL --connect-timeout 10 --retry 3 -o "$tgz_file" "$url"
+  tar -xzf "$tgz_file" -C "$tmp_dir"
+
+  found_bin="$(find "$tmp_dir" -type f -name sing-box | head -n 1)"
+  [ -n "$found_bin" ] || { rm -rf "$tmp_dir"; die "tar.gz 包里未找到 sing-box 可执行文件。"; }
+
+  install -m 755 "$found_bin" /usr/bin/sing-box
+  ln -sf /usr/bin/sing-box /usr/local/bin/sing-box
+
+  # tar.gz 包可能附带 libcronet.so，复制到系统库目录，避免运行时缺库。
+  find "$tmp_dir" -type f -name libcronet.so -exec cp -f {} /usr/lib/libcronet.so \; 2>/dev/null || true
+  chmod 755 /usr/lib/libcronet.so 2>/dev/null || true
+
+  hash -r 2>/dev/null || true
+
+  if ! singbox_bin_works /usr/bin/sing-box; then
+    err "tar.gz 备用安装后 sing-box 仍无法运行。"
+    file /usr/bin/sing-box 2>/dev/null || true
+    ldd /usr/bin/sing-box 2>/dev/null || true
+    rm -rf "$tmp_dir"
+    die "Alpine 上 sing-box 安装失败。"
+  fi
+
+  rm -rf "$tmp_dir"
 }
 
 install_singbox_manual() {
@@ -618,8 +754,9 @@ install_deps() {
       ;;
     apk)
       pkg_update
-      pkg_install bash curl openssl jq ca-certificates iproute2 tar gzip openrc
+      pkg_install bash curl openssl jq ca-certificates iproute2 tar gzip file gcompat libc6-compat libstdc++ libgcc
       update-ca-certificates 2>/dev/null || true
+      ensure_alpine_glibc_compat
       ;;
   esac
 
@@ -631,19 +768,34 @@ install_singbox() {
 
   detect_runtime
   ensure_singbox_user
+  remove_broken_singbox_bins
 
-  if command -v sing-box >/dev/null 2>&1; then
+  if command -v sing-box >/dev/null 2>&1 && singbox_bin_works "$(command -v sing-box)"; then
     ok "检测到 sing-box 已安装：$(sing-box version | head -n 1)"
   else
     info "正在安装 sing-box..."
-    if curl -fsSL https://sing-box.app/install.sh | sh; then
+
+    if [ "$PKG_MANAGER" = "apk" ]; then
+      # Alpine 是 musl libc，不能随便使用通用 tar.gz 里的二进制。
+      # 这里优先使用官方 Alpine .apk 包，并用绝对路径安装，避免本地包 IO ERROR。
+      install_singbox_alpine_apk
+    elif curl -fsSL https://sing-box.app/install.sh | sh; then
       hash -r 2>/dev/null || true
     else
       warn "官方 install.sh 安装失败，尝试 GitHub Release 备用安装。"
       install_singbox_manual
     fi
 
-    command -v sing-box >/dev/null 2>&1 || die "sing-box 安装失败，未找到可执行文件。"
+    if ! command -v sing-box >/dev/null 2>&1; then
+      die "sing-box 安装失败，未找到可执行文件。"
+    fi
+
+    if ! singbox_bin_works "$(command -v sing-box)"; then
+      err "sing-box 已安装但无法运行：$(command -v sing-box)"
+      file "$(command -v sing-box)" 2>/dev/null || true
+      die "当前系统无法执行该 sing-box 二进制文件，请检查 CPU 架构或 libc 兼容性。"
+    fi
+
     ok "sing-box 安装完成：$(sing-box version | head -n 1)"
   fi
 
