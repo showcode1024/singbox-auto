@@ -11,6 +11,7 @@ set -euo pipefail
 #   - 面板随时添加 / 删除 / 修改节点端口
 #   - 根据服务器公网 IP 所在地自动命名节点
 #   - 生成节点直链和 Clash YAML 文件
+#   - 支持 Debian / Ubuntu / CentOS / Rocky / AlmaLinux / Alpine
 # ============================================================
 
 # -------------------------
@@ -44,6 +45,322 @@ INFO_FILE="/root/singbox-node-info.txt"
 YAML_FILE="/root/singbox-nodes.yaml"
 PANEL_FILE="/usr/local/bin/ysq"
 INSTALLER_FILE="/root/install-singbox-ysq.sh"
+
+
+# -------------------------
+# 系统 / 包管理器 / 服务管理器
+# -------------------------
+OS_ID=""
+OS_LIKE=""
+OS_NAME=""
+PKG_MANAGER=""
+SERVICE_MANAGER=""
+SING_BOX_BIN=""
+
+load_os_release() {
+  if [ -r /etc/os-release ]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    OS_ID="${ID:-}"
+    OS_LIKE="${ID_LIKE:-}"
+    OS_NAME="${PRETTY_NAME:-${NAME:-Linux}}"
+  else
+    OS_ID="unknown"
+    OS_LIKE=""
+    OS_NAME="Linux"
+  fi
+}
+
+detect_pkg_manager() {
+  if command -v apt >/dev/null 2>&1; then
+    PKG_MANAGER="apt"
+  elif command -v dnf >/dev/null 2>&1; then
+    PKG_MANAGER="dnf"
+  elif command -v yum >/dev/null 2>&1; then
+    PKG_MANAGER="yum"
+  elif command -v apk >/dev/null 2>&1; then
+    PKG_MANAGER="apk"
+  else
+    die "未识别到支持的包管理器。当前支持：apt / dnf / yum / apk。"
+  fi
+}
+
+detect_service_manager() {
+  if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    SERVICE_MANAGER="systemd"
+  elif command -v rc-service >/dev/null 2>&1; then
+    SERVICE_MANAGER="openrc"
+  else
+    SERVICE_MANAGER="none"
+  fi
+}
+
+detect_runtime() {
+  load_os_release
+  detect_pkg_manager
+  detect_service_manager
+}
+
+pkg_update() {
+  case "$PKG_MANAGER" in
+    apt)
+      export DEBIAN_FRONTEND=noninteractive
+      apt update
+      ;;
+    dnf)
+      dnf makecache -y || true
+      ;;
+    yum)
+      yum makecache -y || true
+      ;;
+    apk)
+      apk update
+      ;;
+  esac
+}
+
+pkg_install() {
+  case "$PKG_MANAGER" in
+    apt)
+      export DEBIAN_FRONTEND=noninteractive
+      apt install -y "$@"
+      ;;
+    dnf)
+      dnf install -y "$@"
+      ;;
+    yum)
+      yum install -y "$@"
+      ;;
+    apk)
+      apk add --no-cache "$@"
+      ;;
+  esac
+}
+
+pkg_remove_singbox() {
+  case "$PKG_MANAGER" in
+    apt)
+      apt purge -y sing-box 2>/dev/null || true
+      apt remove -y sing-box 2>/dev/null || true
+      ;;
+    dnf)
+      dnf remove -y sing-box 2>/dev/null || true
+      ;;
+    yum)
+      yum remove -y sing-box 2>/dev/null || true
+      ;;
+    apk)
+      apk del sing-box 2>/dev/null || true
+      ;;
+  esac
+}
+
+nologin_shell() {
+  if [ -x /usr/sbin/nologin ]; then
+    echo "/usr/sbin/nologin"
+  elif [ -x /sbin/nologin ]; then
+    echo "/sbin/nologin"
+  else
+    echo "/bin/false"
+  fi
+}
+
+ensure_singbox_user() {
+  local shell_path
+  id sing-box >/dev/null 2>&1 && return 0
+
+  shell_path="$(nologin_shell)"
+
+  if command -v useradd >/dev/null 2>&1; then
+    useradd --system --no-create-home --shell "$shell_path" sing-box 2>/dev/null \
+      || useradd -r -M -s "$shell_path" sing-box 2>/dev/null \
+      || true
+  elif command -v adduser >/dev/null 2>&1; then
+    addgroup -S sing-box 2>/dev/null || true
+    adduser -S -D -H -s "$shell_path" -G sing-box sing-box 2>/dev/null || true
+  fi
+
+  id sing-box >/dev/null 2>&1 || die "无法创建 sing-box 系统用户。"
+}
+
+normalize_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64) echo "amd64" ;;
+    aarch64|arm64) echo "arm64" ;;
+    armv7l|armv7) echo "armv7" ;;
+    *) die "暂不支持当前 CPU 架构：$(uname -m)" ;;
+  esac
+}
+
+install_singbox_manual() {
+  local arch version url tmp_dir tar_file found_bin
+
+  arch="$(normalize_arch)"
+  tmp_dir="$(mktemp -d)"
+
+  info "正在使用 GitHub Release 备用方式安装 sing-box..."
+  version="$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r '.tag_name' | sed 's/^v//' 2>/dev/null || true)"
+  [ -n "$version" ] && [ "$version" != "null" ] || die "无法获取 sing-box 最新版本号。"
+
+  url="https://github.com/SagerNet/sing-box/releases/download/v${version}/sing-box-${version}-linux-${arch}.tar.gz"
+  tar_file="${tmp_dir}/sing-box.tar.gz"
+
+  curl -fL --connect-timeout 10 --retry 3 -o "$tar_file" "$url"
+  tar -xzf "$tar_file" -C "$tmp_dir"
+
+  found_bin="$(find "$tmp_dir" -type f -name sing-box -perm -111 | head -n 1)"
+  [ -n "$found_bin" ] || die "下载包里未找到 sing-box 可执行文件。"
+
+  install -m 755 "$found_bin" /usr/local/bin/sing-box
+  rm -rf "$tmp_dir"
+  hash -r 2>/dev/null || true
+}
+
+ensure_singbox_service() {
+  ensure_singbox_user
+  SING_BOX_BIN="$(command -v sing-box 2>/dev/null || true)"
+  [ -n "$SING_BOX_BIN" ] || die "未找到 sing-box 可执行文件。"
+
+  mkdir -p /var/lib/sing-box /var/log/sing-box
+  chown -R sing-box:sing-box /var/lib/sing-box /var/log/sing-box 2>/dev/null || true
+
+  case "$SERVICE_MANAGER" in
+    systemd)
+      cat > /etc/systemd/system/sing-box.service <<EOF
+[Unit]
+Description=sing-box service
+Documentation=https://sing-box.sagernet.org
+After=network.target nss-lookup.target
+Wants=network.target
+
+[Service]
+User=sing-box
+Group=sing-box
+Type=simple
+ExecStart=${SING_BOX_BIN} -D /var/lib/sing-box -C /etc/sing-box run
+Restart=on-failure
+RestartSec=10s
+LimitNOFILE=infinity
+
+[Install]
+WantedBy=multi-user.target
+EOF
+      systemctl daemon-reload 2>/dev/null || true
+      ;;
+    openrc)
+      cat > /etc/init.d/sing-box <<EOF
+#!/sbin/openrc-run
+
+description="sing-box service"
+command="${SING_BOX_BIN}"
+command_args="-D /var/lib/sing-box -C /etc/sing-box run"
+command_user="sing-box:sing-box"
+command_background="yes"
+pidfile="/run/sing-box.pid"
+output_log="/var/log/sing-box/sing-box.log"
+error_log="/var/log/sing-box/sing-box.err"
+
+start_pre() {
+  checkpath -d -m 0755 -o sing-box:sing-box /var/lib/sing-box
+  checkpath -d -m 0755 -o sing-box:sing-box /var/log/sing-box
+}
+
+depend() {
+  need net
+  after firewall
+}
+EOF
+      chmod +x /etc/init.d/sing-box
+      ;;
+    none)
+      warn "未检测到 systemd/openrc，将使用 nohup 后台方式管理 sing-box。"
+      ;;
+  esac
+}
+
+service_enable() {
+  case "$SERVICE_MANAGER" in
+    systemd) systemctl enable sing-box >/dev/null 2>&1 || true ;;
+    openrc) rc-update add sing-box default >/dev/null 2>&1 || true ;;
+    none) return 0 ;;
+  esac
+}
+
+service_disable() {
+  case "$SERVICE_MANAGER" in
+    systemd) systemctl disable sing-box >/dev/null 2>&1 || true ;;
+    openrc) rc-update del sing-box default >/dev/null 2>&1 || true ;;
+    none) return 0 ;;
+  esac
+}
+
+service_stop() {
+  case "$SERVICE_MANAGER" in
+    systemd) systemctl stop sing-box 2>/dev/null || true ;;
+    openrc) rc-service sing-box stop 2>/dev/null || true ;;
+    none)
+      if [ -f /run/sing-box.pid ]; then
+        kill "$(cat /run/sing-box.pid)" 2>/dev/null || true
+        rm -f /run/sing-box.pid
+      fi
+      pkill -f "sing-box.*-C /etc/sing-box run" 2>/dev/null || true
+      ;;
+  esac
+}
+
+service_restart() {
+  case "$SERVICE_MANAGER" in
+    systemd)
+      systemctl restart sing-box
+      ;;
+    openrc)
+      rc-service sing-box restart
+      ;;
+    none)
+      service_stop
+      SING_BOX_BIN="$(command -v sing-box 2>/dev/null || true)"
+      [ -n "$SING_BOX_BIN" ] || die "未找到 sing-box 可执行文件。"
+      install -d -m 755 -o sing-box -g sing-box /var/lib/sing-box /var/log/sing-box 2>/dev/null || mkdir -p /var/lib/sing-box /var/log/sing-box
+      nohup "$SING_BOX_BIN" -D /var/lib/sing-box -C /etc/sing-box run > /var/log/sing-box/sing-box.log 2>&1 &
+      echo $! > /run/sing-box.pid
+      sleep 1
+      if ! kill -0 "$(cat /run/sing-box.pid)" 2>/dev/null; then
+        cat /var/log/sing-box/sing-box.log >&2 || true
+        die "sing-box 后台启动失败。"
+      fi
+      ;;
+  esac
+}
+
+service_status() {
+  case "$SERVICE_MANAGER" in
+    systemd)
+      systemctl status sing-box --no-pager || true
+      ;;
+    openrc)
+      rc-service sing-box status || true
+      echo
+      tail -n 80 /var/log/sing-box/sing-box.log 2>/dev/null || true
+      tail -n 80 /var/log/sing-box/sing-box.err 2>/dev/null || true
+      ;;
+    none)
+      if [ -f /run/sing-box.pid ] && kill -0 "$(cat /run/sing-box.pid)" 2>/dev/null; then
+        ok "sing-box 正在运行，PID: $(cat /run/sing-box.pid)"
+      else
+        warn "sing-box 未运行。"
+      fi
+      echo
+      tail -n 80 /var/log/sing-box/sing-box.log 2>/dev/null || true
+      ;;
+  esac
+}
+
+service_daemon_reload() {
+  case "$SERVICE_MANAGER" in
+    systemd) systemctl daemon-reload 2>/dev/null || true ;;
+    openrc|none) return 0 ;;
+  esac
+}
 
 # -------------------------
 # 颜色输出
@@ -280,38 +597,63 @@ yaml_quote() {
 install_deps() {
   step "准备系统环境"
 
-  command -v apt >/dev/null 2>&1 || die "当前脚本只适配 Debian / Ubuntu 系统，需要 apt。"
+  detect_runtime
 
-  export DEBIAN_FRONTEND=noninteractive
-  apt update
-  apt install -y curl openssl jq ca-certificates iproute2
+  info "系统：${OS_NAME}"
+  info "包管理器：${PKG_MANAGER}"
+  info "服务管理：${SERVICE_MANAGER}"
 
-  ok "必要依赖安装完成：curl / openssl / jq / ca-certificates / iproute2。"
+  case "$PKG_MANAGER" in
+    apt)
+      pkg_update
+      pkg_install curl openssl jq ca-certificates iproute2 tar gzip
+      ;;
+    dnf|yum)
+      pkg_update
+      if ! pkg_install curl openssl jq ca-certificates iproute tar gzip shadow-utils; then
+        warn "依赖安装失败，尝试先安装 epel-release 后重试。"
+        pkg_install epel-release || true
+        pkg_install curl openssl jq ca-certificates iproute tar gzip shadow-utils
+      fi
+      ;;
+    apk)
+      pkg_update
+      pkg_install bash curl openssl jq ca-certificates iproute2 tar gzip openrc
+      update-ca-certificates 2>/dev/null || true
+      ;;
+  esac
+
+  ok "必要依赖安装完成：bash / curl / openssl / jq / ca-certificates / iproute / tar / gzip。"
 }
 
 install_singbox() {
   step "安装 / 检查 sing-box"
 
+  detect_runtime
+  ensure_singbox_user
+
   if command -v sing-box >/dev/null 2>&1; then
     ok "检测到 sing-box 已安装：$(sing-box version | head -n 1)"
   else
     info "正在安装 sing-box..."
-    if ! bash <(curl -fsSL https://sing-box.app/deb-install.sh); then
-      warn "deb-install.sh 安装失败，尝试备用安装脚本。"
-      curl -fsSL https://sing-box.app/install.sh | sh
+    if curl -fsSL https://sing-box.app/install.sh | sh; then
+      hash -r 2>/dev/null || true
+    else
+      warn "官方 install.sh 安装失败，尝试 GitHub Release 备用安装。"
+      install_singbox_manual
     fi
+
+    command -v sing-box >/dev/null 2>&1 || die "sing-box 安装失败，未找到可执行文件。"
     ok "sing-box 安装完成：$(sing-box version | head -n 1)"
   fi
 
-  if ! id sing-box >/dev/null 2>&1; then
-    useradd --system --no-create-home --shell /usr/sbin/nologin sing-box 2>/dev/null || true
-  fi
+  ensure_singbox_service
 }
 
 ensure_dirs() {
-  mkdir -p "$CONFIG_DIR" "$CERT_DIR"
-  chown -R sing-box:sing-box "$CONFIG_DIR" 2>/dev/null || true
-  chmod 755 "$CONFIG_DIR" "$CERT_DIR"
+  mkdir -p "$CONFIG_DIR" "$CERT_DIR" /var/lib/sing-box /var/log/sing-box
+  chown -R sing-box:sing-box "$CONFIG_DIR" /var/lib/sing-box /var/log/sing-box 2>/dev/null || true
+  chmod 755 "$CONFIG_DIR" "$CERT_DIR" /var/lib/sing-box /var/log/sing-box
 }
 
 state_get() {
@@ -364,6 +706,23 @@ ensure_tuic_cert() {
   tmp_dir="$(mktemp -d)"
   umask 077
 
+  cat > "$tmp_dir/openssl.cnf" <<EOF
+[req]
+default_bits = 256
+prompt = no
+default_md = sha256
+distinguished_name = dn
+x509_extensions = v3_req
+
+[dn]
+CN = ${tuic_sni}
+
+[v3_req]
+subjectAltName = ${san}
+keyUsage = digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+EOF
+
   if ! openssl req -x509 -newkey ec \
     -pkeyopt ec_paramgen_curve:prime256v1 \
     -nodes \
@@ -371,10 +730,7 @@ ensure_tuic_cert() {
     -keyout "$tmp_dir/tuic.key" \
     -out "$tmp_dir/tuic.crt" \
     -days 3650 \
-    -subj "/CN=${tuic_sni}" \
-    -addext "subjectAltName=${san}" \
-    -addext "keyUsage=digitalSignature,keyEncipherment" \
-    -addext "extendedKeyUsage=serverAuth" \
+    -config "$tmp_dir/openssl.cnf" \
     2>"$tmp_dir/openssl.log"; then
       cat "$tmp_dir/openssl.log" >&2 || true
       rm -rf "$tmp_dir"
@@ -1092,13 +1448,20 @@ YAML
 
 cleanup_old_subscription_service() {
   # 兼容从 v3 订阅版升级：关闭并删除旧的订阅服务残留。
-  systemctl stop ysq-subscription.socket 2>/dev/null || true
-  systemctl disable ysq-subscription.socket 2>/dev/null || true
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl stop ysq-subscription.socket 2>/dev/null || true
+    systemctl disable ysq-subscription.socket 2>/dev/null || true
+  fi
+  if command -v rc-service >/dev/null 2>&1; then
+    rc-service ysq-subscription stop 2>/dev/null || true
+    rc-update del ysq-subscription default 2>/dev/null || true
+  fi
   rm -f /root/singbox-sub.txt
   rm -f /usr/local/bin/ysq-subscription
   rm -f /etc/systemd/system/ysq-subscription.socket
   rm -f /etc/systemd/system/ysq-subscription@.service
-  systemctl daemon-reload 2>/dev/null || true
+  rm -f /etc/init.d/ysq-subscription
+  service_daemon_reload
 }
 
 render_all() {
@@ -1113,8 +1476,10 @@ render_all() {
 restart_singbox() {
   step "重启 sing-box"
 
-  systemctl enable sing-box >/dev/null 2>&1 || true
-  systemctl restart sing-box
+  detect_runtime
+  ensure_singbox_service
+  service_enable
+  service_restart
   ok "sing-box 已重启。"
 }
 
@@ -1199,19 +1564,19 @@ uninstall_all() {
   read -rp "确认删除请输入 y: " confirm
   [ "$confirm" = "y" ] || { warn "已取消删除。"; sleep 1; return 0; }
 
-  systemctl stop sing-box 2>/dev/null || true
-  systemctl disable sing-box 2>/dev/null || true
-
-  apt purge -y sing-box 2>/dev/null || true
-  apt remove -y sing-box 2>/dev/null || true
+  detect_runtime
+  service_stop
+  service_disable
+  pkg_remove_singbox
 
   rm -f /usr/local/bin/sing-box /usr/bin/sing-box
   rm -f /etc/systemd/system/sing-box.service
+  rm -f /etc/init.d/sing-box
   rm -f /root/install-singbox-ysq.sh
   cleanup_old_subscription_service
   rm -rf /etc/sing-box /var/lib/sing-box /var/log/sing-box
   rm -f "$INFO_FILE" "$YAML_FILE" "$PANEL_FILE" "$INSTALLER_FILE"
-  systemctl daemon-reload 2>/dev/null || true
+  service_daemon_reload
 
   ok "已彻底删除。"
   exit 0
@@ -1219,7 +1584,8 @@ uninstall_all() {
 
 show_status() {
   step "sing-box 状态"
-  systemctl status sing-box --no-pager || true
+  detect_runtime
+  service_status
   echo
   echo "当前节点："
   list_nodes_table || true
@@ -1282,7 +1648,7 @@ panel_menu() {
         ;;
       7)
         restart_singbox
-        systemctl status sing-box --no-pager || true
+        service_status
         pause
         ;;
       8)
