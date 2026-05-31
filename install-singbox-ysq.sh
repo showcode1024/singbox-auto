@@ -257,8 +257,10 @@ install_singbox_alpine_apk() {
   tmp_dir="$(mktemp -d)"
 
   info "Alpine 系统安装 sing-box..."
+  # version="$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r '.tag_name' | sed 's/^v//' 2>/dev/null || true)"
+  # [ -n "$version" ] && [ "$version" != "null" ] || die "无法获取 sing-box 最新版本号。"
   version="$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r '.tag_name' | sed 's/^v//' 2>/dev/null || true)"
-  [ -n "$version" ] && [ "$version" != "null" ] || die "无法获取 sing-box 最新版本号。"
+  [ -n "$version" ] && [ "$version" != "null" ] || { warn "无法获取最新版本号（可能触发API限制），将默认安装 1.13.12 版本。"; version="1.13.12"; }
 
   # 1) 优先尝试官方 Alpine .apk 包。
   url="https://github.com/SagerNet/sing-box/releases/download/v${version}/sing-box_${version}_linux_${arch}.apk"
