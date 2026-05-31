@@ -337,8 +337,10 @@ install_singbox_manual() {
   tmp_dir="$(mktemp -d)"
 
   info "正在使用 GitHub Release 备用方式安装 sing-box..."
-  version="$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r '.tag_name' | sed 's/^v//' 2>/dev/null || true)"
-  [ -n "$version" ] && [ "$version" != "null" ] || die "无法获取 sing-box 最新版本号。"
+  # version="$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r '.tag_name' | sed 's/^v//' 2>/dev/null || true)"
+  # [ -n "$version" ] && [ "$version" != "null" ] || die "无法获取 sing-box 最新版本号。"
+   version="$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r '.tag_name' | sed 's/^v//' 2>/dev/null || true)"
+  [ -n "$version" ] && [ "$version" != "null" ] || { warn "无法获取最新版本号（可能触发API限制），将默认安装 1.13.12 版本。"; version="1.13.12"; }
 
   url="https://github.com/SagerNet/sing-box/releases/download/v${version}/sing-box-${version}-linux-${arch}.tar.gz"
   tar_file="${tmp_dir}/sing-box.tar.gz"
