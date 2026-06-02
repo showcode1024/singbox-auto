@@ -8,7 +8,8 @@ set -euo pipefail
 #   - TUIC v5 直出
 #   - VLESS -> VLESS Reality 中转
 #   - TUIC v5 -> VLESS Reality 中转
-#   - 面板随时添加 / 删除 / 修改节点端口
+#   - 面板随时添加 / 批量删除 / 修改节点端口
+#   - 指定网站 / 域名屏蔽 (REJECT)
 #   - 根据服务器公网 IP 所在地自动命名节点
 #   - 生成节点直链和 Clash YAML 文件
 #   - 支持 Debian / Ubuntu / CentOS / Rocky / AlmaLinux / Alpine
@@ -91,8 +92,6 @@ detect_service_manager() {
   elif command -v rc-service >/dev/null 2>&1 && rc-status >/dev/null 2>&1; then
     SERVICE_MANAGER="openrc"
   else
-    # Docker / LXC / 精简 Alpine 里可能有 rc-service 命令，但 OpenRC 没真正运行。
-    # 这种情况下不要强行用 rc-service，改用 nohup 后台兜底。
     SERVICE_MANAGER="none"
   fi
 }
@@ -105,37 +104,19 @@ detect_runtime() {
 
 pkg_update() {
   case "$PKG_MANAGER" in
-    apt)
-      export DEBIAN_FRONTEND=noninteractive
-      apt update
-      ;;
-    dnf)
-      dnf makecache -y || true
-      ;;
-    yum)
-      yum makecache -y || true
-      ;;
-    apk)
-      apk update
-      ;;
+    apt) export DEBIAN_FRONTEND=noninteractive; apt update ;;
+    dnf) dnf makecache -y || true ;;
+    yum) yum makecache -y || true ;;
+    apk) apk update ;;
   esac
 }
 
 pkg_install() {
   case "$PKG_MANAGER" in
-    apt)
-      export DEBIAN_FRONTEND=noninteractive
-      apt install -y "$@"
-      ;;
-    dnf)
-      dnf install -y "$@"
-      ;;
-    yum)
-      yum install -y "$@"
-      ;;
-    apk)
-      apk add --no-cache "$@"
-      ;;
+    apt) export DEBIAN_FRONTEND=noninteractive; apt install -y "$@" ;;
+    dnf) dnf install -y "$@" ;;
+    yum) yum install -y "$@" ;;
+    apk) apk add --no-cache "$@" ;;
   esac
 }
 
@@ -145,43 +126,31 @@ pkg_remove_singbox() {
       apt purge -y sing-box 2>/dev/null || true
       apt remove -y sing-box 2>/dev/null || true
       ;;
-    dnf)
-      dnf remove -y sing-box 2>/dev/null || true
-      ;;
-    yum)
-      yum remove -y sing-box 2>/dev/null || true
-      ;;
-    apk)
-      apk del sing-box 2>/dev/null || true
-      ;;
+    dnf) dnf remove -y sing-box 2>/dev/null || true ;;
+    yum) yum remove -y sing-box 2>/dev/null || true ;;
+    apk) apk del sing-box 2>/dev/null || true ;;
   esac
 }
 
 nologin_shell() {
-  if [ -x /usr/sbin/nologin ]; then
-    echo "/usr/sbin/nologin"
-  elif [ -x /sbin/nologin ]; then
-    echo "/sbin/nologin"
-  else
-    echo "/bin/false"
+  if [ -x /usr/sbin/nologin ]; then echo "/usr/sbin/nologin"
+  elif [ -x /sbin/nologin ]; then echo "/sbin/nologin"
+  else echo "/bin/false"
   fi
 }
 
 ensure_singbox_user() {
   local shell_path
   id sing-box >/dev/null 2>&1 && return 0
-
   shell_path="$(nologin_shell)"
 
   if command -v useradd >/dev/null 2>&1; then
     useradd --system --no-create-home --shell "$shell_path" sing-box 2>/dev/null \
-      || useradd -r -M -s "$shell_path" sing-box 2>/dev/null \
-      || true
+      || useradd -r -M -s "$shell_path" sing-box 2>/dev/null || true
   elif command -v adduser >/dev/null 2>&1; then
     addgroup -S sing-box 2>/dev/null || true
     adduser -S -D -H -s "$shell_path" -G sing-box sing-box 2>/dev/null || true
   fi
-
   id sing-box >/dev/null 2>&1 || die "无法创建 sing-box 系统用户。"
 }
 
@@ -205,11 +174,7 @@ normalize_apk_arch() {
 
 ensure_alpine_glibc_compat() {
   [ "${PKG_MANAGER:-}" = "apk" ] || return 0
-
-  # 官方 tar.gz 里的 sing-box 在部分版本/架构上会依赖 glibc loader：
-  # /lib64/ld-linux-x86-64.so.2。Alpine 默认是 musl，所以需要兼容层。
   apk add --no-cache gcompat libc6-compat libstdc++ libgcc file 2>/dev/null || true
-
   case "$(uname -m)" in
     x86_64|amd64)
       mkdir -p /lib64
@@ -223,87 +188,59 @@ ensure_alpine_glibc_compat() {
 }
 
 singbox_bin_works() {
-  local bin
-  bin="${1:-$(command -v sing-box 2>/dev/null || true)}"
+  local bin="${1:-$(command -v sing-box 2>/dev/null || true)}"
   [ -n "$bin" ] || return 1
   [ -x "$bin" ] || return 1
   "$bin" version >/dev/null 2>&1
 }
 
 remove_broken_singbox_bins() {
-  local bin
-  bin="$(command -v sing-box 2>/dev/null || true)"
+  local bin="$(command -v sing-box 2>/dev/null || true)"
   if [ -n "$bin" ] && ! singbox_bin_works "$bin"; then
-    warn "检测到 sing-box 可执行文件存在但无法运行：$bin"
-    file "$bin" 2>/dev/null || true
     rm -f "$bin"
   fi
-
   for bin in /usr/local/bin/sing-box /usr/bin/sing-box; do
     if [ -e "$bin" ] && ! singbox_bin_works "$bin"; then
-      warn "删除无法运行的 sing-box：$bin"
-      file "$bin" 2>/dev/null || true
       rm -f "$bin"
     fi
   done
-
   hash -r 2>/dev/null || true
 }
 
 install_singbox_alpine_apk() {
   local arch version url tmp_dir apk_file extracted_bin tgz_arch tgz_file found_bin
-
   arch="$(normalize_apk_arch)"
   tmp_dir="$(mktemp -d)"
 
   info "Alpine 系统安装 sing-box..."
-  # version="$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r '.tag_name' | sed 's/^v//' 2>/dev/null || true)"
-  # [ -n "$version" ] && [ "$version" != "null" ] || die "无法获取 sing-box 最新版本号。"
   version="$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r '.tag_name' | sed 's/^v//' 2>/dev/null || true)"
-  [ -n "$version" ] && [ "$version" != "null" ] || { warn "无法获取最新版本号（可能触发API限制），将默认安装 1.13.12 版本。"; version="1.13.12"; }
+  [ -n "$version" ] && [ "$version" != "null" ] || { warn "无法获取最新版本号，默认安装 1.13.12 版本。"; version="1.13.12"; }
 
-  # 1) 优先尝试官方 Alpine .apk 包。
   url="https://github.com/SagerNet/sing-box/releases/download/v${version}/sing-box_${version}_linux_${arch}.apk"
   apk_file="${tmp_dir}/sing-box.apk"
-  info "正在下载 Alpine .apk 包：sing-box ${version} / ${arch}"
   curl -fL --connect-timeout 10 --retry 3 -o "$apk_file" "$url"
 
   if apk add --allow-untrusted "$apk_file"; then
     hash -r 2>/dev/null || true
     if command -v sing-box >/dev/null 2>&1 && singbox_bin_works "$(command -v sing-box)"; then
-      rm -rf "$tmp_dir"
-      return 0
+      rm -rf "$tmp_dir"; return 0
     fi
-    warn ".apk 安装完成，但 sing-box 无法运行，继续使用备用安装。"
-  else
-    warn "apk add 本地包失败，尝试直接解包 .apk。"
   fi
 
-  # 2) 有些 Alpine 环境不能 apk add 本地包，尝试把 apk 当 tar 包解开。
   if tar -xzf "$apk_file" -C "$tmp_dir" 2>/dev/null || tar -xf "$apk_file" -C "$tmp_dir" 2>/dev/null; then
     extracted_bin="$(find "$tmp_dir" \( -type f -path '*/bin/sing-box' -o -type f -name sing-box \) | head -n 1)"
     if [ -n "$extracted_bin" ]; then
       install -m 755 "$extracted_bin" /usr/bin/sing-box
       ln -sf /usr/bin/sing-box /usr/local/bin/sing-box
       hash -r 2>/dev/null || true
-      if singbox_bin_works /usr/bin/sing-box; then
-        rm -rf "$tmp_dir"
-        return 0
-      fi
-      warn "从 .apk 解出的 sing-box 仍无法运行，继续使用 tar.gz 备用安装。"
-    else
-      warn ".apk 解包后没有找到 sing-box 二进制，继续使用 tar.gz 备用安装。"
+      if singbox_bin_works /usr/bin/sing-box; then rm -rf "$tmp_dir"; return 0; fi
     fi
-  else
-    warn ".apk 无法解包，继续使用 tar.gz 备用安装。"
   fi
 
-  # 3) 最后兜底：使用 GitHub tar.gz。该包在 Alpine 上可能需要 gcompat/glibc loader 兼容层。
   ensure_alpine_glibc_compat
   tgz_arch="$(normalize_arch)"
   tgz_file="${tmp_dir}/sing-box.tar.gz"
   url="https://github.com/SagerNet/sing-box/releases/download/v${version}/sing-box-${version}-linux-${tgz_arch}.tar.gz"
-  info "正在下载 tar.gz 备用包：sing-box ${version} / linux-${tgz_arch}"
   curl -fL --connect-timeout 10 --retry 3 -o "$tgz_file" "$url"
   tar -xzf "$tgz_file" -C "$tmp_dir"
 
@@ -312,35 +249,25 @@ install_singbox_alpine_apk() {
 
   install -m 755 "$found_bin" /usr/bin/sing-box
   ln -sf /usr/bin/sing-box /usr/local/bin/sing-box
-
-  # tar.gz 包可能附带 libcronet.so，复制到系统库目录，避免运行时缺库。
   find "$tmp_dir" -type f -name libcronet.so -exec cp -f {} /usr/lib/libcronet.so \; 2>/dev/null || true
   chmod 755 /usr/lib/libcronet.so 2>/dev/null || true
-
   hash -r 2>/dev/null || true
 
   if ! singbox_bin_works /usr/bin/sing-box; then
-    err "tar.gz 备用安装后 sing-box 仍无法运行。"
-    file /usr/bin/sing-box 2>/dev/null || true
-    ldd /usr/bin/sing-box 2>/dev/null || true
     rm -rf "$tmp_dir"
     die "Alpine 上 sing-box 安装失败。"
   fi
-
   rm -rf "$tmp_dir"
 }
 
 install_singbox_manual() {
   local arch version url tmp_dir tar_file found_bin
-
   arch="$(normalize_arch)"
   tmp_dir="$(mktemp -d)"
 
   info "正在使用 GitHub Release 备用方式安装 sing-box..."
-  # version="$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r '.tag_name' | sed 's/^v//' 2>/dev/null || true)"
-  # [ -n "$version" ] && [ "$version" != "null" ] || die "无法获取 sing-box 最新版本号。"
-   version="$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r '.tag_name' | sed 's/^v//' 2>/dev/null || true)"
-  [ -n "$version" ] && [ "$version" != "null" ] || { warn "无法获取最新版本号（可能触发API限制），将默认安装 1.13.12 版本。"; version="1.13.12"; }
+  version="$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r '.tag_name' | sed 's/^v//' 2>/dev/null || true)"
+  [ -n "$version" ] && [ "$version" != "null" ] || { warn "无法获取最新版本号，默认安装 1.13.12 版本。"; version="1.13.12"; }
 
   url="https://github.com/SagerNet/sing-box/releases/download/v${version}/sing-box-${version}-linux-${arch}.tar.gz"
   tar_file="${tmp_dir}/sing-box.tar.gz"
@@ -459,7 +386,6 @@ service_restart() {
     none)
       service_stop
       SING_BOX_BIN="$(command -v sing-box 2>/dev/null || true)"
-      [ -n "$SING_BOX_BIN" ] || die "未找到 sing-box 可执行文件。"
       install -d -m 755 -o sing-box -g sing-box /var/lib/sing-box /var/log/sing-box 2>/dev/null || mkdir -p /var/lib/sing-box /var/log/sing-box
       nohup "$SING_BOX_BIN" -D /var/lib/sing-box -C /etc/sing-box run > /var/log/sing-box/sing-box.log 2>&1 &
       echo $! > /run/sing-box.pid
@@ -474,9 +400,7 @@ service_restart() {
 
 service_status() {
   case "$SERVICE_MANAGER" in
-    systemd)
-      systemctl status sing-box --no-pager || true
-      ;;
+    systemd) systemctl status sing-box --no-pager || true ;;
     openrc)
       rc-service sing-box status || true
       echo
@@ -562,17 +486,10 @@ ask_port() {
 
   while true; do
     read -rp "$name [默认 ${default_port}]: " input_port
-
-    if [ -z "$input_port" ]; then
-      echo "$default_port"
-      return
-    fi
-
+    if [ -z "$input_port" ]; then echo "$default_port"; return; fi
     if [[ "$input_port" =~ ^[0-9]+$ ]] && [ "$input_port" -ge 1 ] && [ "$input_port" -le 65535 ]; then
-      echo "$input_port"
-      return
+      echo "$input_port"; return
     fi
-
     warn "端口输入错误，请输入 1-65535 之间的数字。"
   done
 }
@@ -588,10 +505,7 @@ ask_text_default() {
   else
     while true; do
       read -rp "$prompt: " input
-      if [ -n "$input" ]; then
-        echo "$input"
-        return
-      fi
+      if [ -n "$input" ]; then echo "$input"; return; fi
       warn "这里不能为空。"
     done
   fi
@@ -600,7 +514,6 @@ ask_text_default() {
 port_used() {
   local port="$1"
   local ignore_tag="${2:-}"
-
   jq -e \
     --argjson p "$port" \
     --arg ignore_tag "$ignore_tag" \
@@ -626,7 +539,6 @@ check_port_available() {
 country_to_name() {
   local code
   code="$(echo "${1:-}" | tr '[:lower:]' '[:upper:]')"
-
   case "$code" in
     SG) echo "🇸🇬|新加坡" ;;
     HK) echo "🇭🇰|香港" ;;
@@ -658,15 +570,9 @@ country_to_name() {
 
 detect_public_ip() {
   local ip=""
-
   ip="$(curl -4 -s --max-time 6 https://api.ipify.org 2>/dev/null || true)"
-  if [ -z "$ip" ]; then
-    ip="$(curl -4 -s --max-time 6 https://ifconfig.me 2>/dev/null || true)"
-  fi
-  if [ -z "$ip" ]; then
-    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
-  fi
-
+  if [ -z "$ip" ]; then ip="$(curl -4 -s --max-time 6 https://ifconfig.me 2>/dev/null || true)"; fi
+  if [ -z "$ip" ]; then ip="$(hostname -I 2>/dev/null | awk '{print $1}')"; fi
   echo "$ip"
 }
 
@@ -679,9 +585,7 @@ detect_location() {
   if ! [[ "$code" =~ ^[A-Za-z]{2}$ ]]; then
     code="$(curl -4 -s --max-time 8 "https://ipinfo.io/${ip}/country" 2>/dev/null | tr -d '\r\n ' || true)"
   fi
-  if ! [[ "$code" =~ ^[A-Za-z]{2}$ ]]; then
-    code="XX"
-  fi
+  if ! [[ "$code" =~ ^[A-Za-z]{2}$ ]]; then code="XX"; fi
 
   pair="$(country_to_name "$code")"
   echo "${code}|${pair}"
@@ -736,13 +640,7 @@ yaml_quote() {
 
 install_deps() {
   step "准备系统环境"
-
   detect_runtime
-
-  info "系统：${OS_NAME}"
-  info "包管理器：${PKG_MANAGER}"
-  info "服务管理：${SERVICE_MANAGER}"
-
   case "$PKG_MANAGER" in
     apt)
       pkg_update
@@ -751,7 +649,6 @@ install_deps() {
     dnf|yum)
       pkg_update
       if ! pkg_install curl openssl jq ca-certificates iproute tar gzip shadow-utils; then
-        warn "依赖安装失败，尝试先安装 epel-release 后重试。"
         pkg_install epel-release || true
         pkg_install curl openssl jq ca-certificates iproute tar gzip shadow-utils
       fi
@@ -763,13 +660,11 @@ install_deps() {
       ensure_alpine_glibc_compat
       ;;
   esac
-
-  ok "必要依赖安装完成：bash / curl / openssl / jq / ca-certificates / iproute / tar / gzip。"
+  ok "必要依赖安装完成。"
 }
 
 install_singbox() {
   step "安装 / 检查 sing-box"
-
   detect_runtime
   ensure_singbox_user
   remove_broken_singbox_bins
@@ -778,31 +673,19 @@ install_singbox() {
     ok "检测到 sing-box 已安装：$(sing-box version | head -n 1)"
   else
     info "正在安装 sing-box..."
-
     if [ "$PKG_MANAGER" = "apk" ]; then
-      # Alpine 是 musl libc，不能随便使用通用 tar.gz 里的二进制。
-      # 这里优先使用官方 Alpine .apk 包，并用绝对路径安装，避免本地包 IO ERROR。
       install_singbox_alpine_apk
     elif curl -fsSL https://sing-box.app/install.sh | sh; then
       hash -r 2>/dev/null || true
     else
-      warn "官方 install.sh 安装失败，尝试 GitHub Release 备用安装。"
       install_singbox_manual
     fi
-
-    if ! command -v sing-box >/dev/null 2>&1; then
-      die "sing-box 安装失败，未找到可执行文件。"
-    fi
-
+    if ! command -v sing-box >/dev/null 2>&1; then die "sing-box 安装失败。"; fi
     if ! singbox_bin_works "$(command -v sing-box)"; then
-      err "sing-box 已安装但无法运行：$(command -v sing-box)"
-      file "$(command -v sing-box)" 2>/dev/null || true
       die "当前系统无法执行该 sing-box 二进制文件，请检查 CPU 架构或 libc 兼容性。"
     fi
-
     ok "sing-box 安装完成：$(sing-box version | head -n 1)"
   fi
-
   ensure_singbox_service
 }
 
@@ -818,12 +701,16 @@ state_get() {
 
 ensure_state_defaults() {
   need_state
-
-  # 兼容旧 v3：删除已经废弃的订阅字段。
   if jq -e 'has("sub_port") or has("sub_token")' "$STATE_FILE" >/dev/null 2>&1; then
-    local tmp
-    tmp="$(mktemp)"
+    local tmp; tmp="$(mktemp)"
     jq 'del(.sub_port, .sub_token)' "$STATE_FILE" > "$tmp"
+    mv "$tmp" "$STATE_FILE"
+  fi
+  
+  # 确保状态文件中存在被屏蔽的域名列表
+  if ! jq -e '. | has("blocked_domains")' "$STATE_FILE" >/dev/null 2>&1; then
+    local tmp; tmp="$(mktemp)"
+    jq '.blocked_domains = []' "$STATE_FILE" > "$tmp"
     mv "$tmp" "$STATE_FILE"
   fi
 
@@ -837,20 +724,15 @@ need_tuic_cert() {
 
 ensure_tuic_cert() {
   local tuic_sni san tmp_dir
-
   need_tuic_cert || return 0
-
   tuic_sni="$(state_get '.tuic_sni')"
-
   step "检查 TUIC 证书"
-
   install -d -m 755 -o sing-box -g sing-box "$CERT_DIR"
 
   if [ -f "$CERT_FILE" ] && [ -f "$KEY_FILE" ]; then
     ok "TUIC 证书已存在，跳过生成。"
     return 0
   fi
-
   info "正在生成 TUIC 自签证书，已隐藏 OpenSSL 进度输出。"
 
   if [[ "$tuic_sni" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ || "$tuic_sni" == *:* ]]; then
@@ -869,10 +751,8 @@ prompt = no
 default_md = sha256
 distinguished_name = dn
 x509_extensions = v3_req
-
 [dn]
 CN = ${tuic_sni}
-
 [v3_req]
 subjectAltName = ${san}
 keyUsage = digitalSignature, keyEncipherment
@@ -896,17 +776,14 @@ EOF
   install -m 600 -o sing-box -g sing-box "$tmp_dir/tuic.key" "$KEY_FILE"
   install -m 644 -o sing-box -g sing-box "$tmp_dir/tuic.crt" "$CERT_FILE"
   rm -rf "$tmp_dir"
-
   ok "TUIC 证书生成完成：$CERT_FILE"
 }
 
 create_state_file() {
   local uuid private_key public_key short_id tuic_pass server_ip location_raw country_code flag loc
-
   mkdir -p "$CONFIG_DIR"
 
   step "基础参数设置"
-
   echo "请选择是否生成新的 UUID / REALITY 密钥 / ShortID："
   echo "1) 生成新的"
   echo "2) 不生成，使用脚本内默认参数"
@@ -960,6 +837,7 @@ create_state_file() {
   "country_code": "${country_code}",
   "location_flag": "${flag}",
   "location_name": "${loc}",
+  "blocked_domains": [],
   "nodes": []
 }
 JSON
@@ -985,7 +863,6 @@ add_node_to_state() {
   local tag name tmp
 
   check_port_available "$port"
-
   tag="${type}-${port}"
   name="$(make_node_name "$type" "$port")"
   tmp="$(mktemp)"
@@ -1031,13 +908,11 @@ add_node_to_state() {
   mv "$tmp" "$STATE_FILE"
   chown sing-box:sing-box "$STATE_FILE" 2>/dev/null || true
   chmod 600 "$STATE_FILE"
-
   ok "已添加节点：${name} / 端口 ${port}"
 }
 
 add_node_wizard() {
   need_state
-
   step "添加节点"
 
   echo "1) VLESS 直出                  默认端口 ${VLESS_DIRECT_PORT}"
@@ -1068,13 +943,8 @@ add_node_wizard() {
       ask_landing_params
       add_node_to_state "tuic-relay" "$port"
       ;;
-    0)
-      return 0
-      ;;
-    *)
-      warn "输入错误。"
-      return 1
-      ;;
+    0) return 0 ;;
+    *) warn "输入错误。"; return 1 ;;
   esac
 
   render_all
@@ -1082,36 +952,60 @@ add_node_wizard() {
   ok "节点已生效。"
 }
 
+# --------- 修改后的删除节点功能（支持批量） ---------
 delete_node_wizard() {
   need_state
-
-  local count index tmp name
+  local count indices tmp name
 
   count="$(jq '.nodes | length' "$STATE_FILE")"
   [ "$count" -gt 0 ] || { warn "当前没有可删除的节点。"; pause; return 0; }
 
-  step "删除节点"
-
+  step "删除节点 (支持批量)"
   list_nodes_table
   echo
-  read -rp "请输入要删除的节点序号，输入 0 返回: " index
+  read -rp "请输入要删除的节点序号 (多个用空格或逗号隔开，如 1 2 3)，输入 0 返回: " indices
 
-  if [ "$index" = "0" ]; then
-    return 0
-  fi
+  if [ "$indices" = "0" ]; then return 0; fi
 
-  if ! [[ "$index" =~ ^[0-9]+$ ]] || [ "$index" -lt 1 ] || [ "$index" -gt "$count" ]; then
-    warn "序号输入错误。"
+  # 规范化输入：将逗号替换为空格
+  indices="${indices//,/ }"
+
+  declare -a valid_tags=()
+  declare -a names_to_print=()
+
+  for idx in $indices; do
+    if [[ "$idx" =~ ^[0-9]+$ ]] && [ "$idx" -ge 1 ] && [ "$idx" -le "$count" ]; then
+      local real_idx=$((idx-1))
+      local tag
+      tag="$(jq -r --argjson i "$real_idx" '.nodes[$i].tag' "$STATE_FILE")"
+      name="$(jq -r --argjson i "$real_idx" '.nodes[$i].name' "$STATE_FILE")"
+      valid_tags+=("$tag")
+      names_to_print+=("$name")
+    else
+      warn "忽略无效的序号: $idx"
+    fi
+  done
+
+  if [ ${#valid_tags[@]} -eq 0 ]; then 
+    warn "没有选择任何有效节点进行删除。"
     sleep 1
     return 1
   fi
 
-  name="$(jq -r --argjson i "$((index-1))" '.nodes[$i].name' "$STATE_FILE")"
-  read -rp "确认删除「${name}」？输入 y 确认: " confirm
+  echo "将要删除以下节点："
+  for n in "${names_to_print[@]}"; do
+    echo "  - $n"
+  done
+
+  read -rp "确认删除？输入 y 确认: " confirm
   [ "$confirm" = "y" ] || { warn "已取消删除。"; sleep 1; return 0; }
 
   tmp="$(mktemp)"
-  jq --argjson i "$((index-1))" 'del(.nodes[$i])' "$STATE_FILE" > "$tmp"
+  cp "$STATE_FILE" "$tmp"
+  for tag in "${valid_tags[@]}"; do
+    jq --arg t "$tag" 'del(.nodes[] | select(.tag == $t))' "$tmp" > "${tmp}.new"
+    mv "${tmp}.new" "$tmp"
+  done
   mv "$tmp" "$STATE_FILE"
   chown sing-box:sing-box "$STATE_FILE" 2>/dev/null || true
   chmod 600 "$STATE_FILE"
@@ -1119,32 +1013,94 @@ delete_node_wizard() {
   render_all
   restart_singbox
 
-  ok "已删除节点：${name}"
+  ok "已成功删除选定节点。"
   sleep 1
+}
+
+# --------- 新增的网站屏蔽功能 ---------
+block_website_wizard() {
+  need_state
+  while true; do
+    step "屏蔽指定网站 (域名) 管理"
+    local count
+    count="$(jq '.blocked_domains | length' "$STATE_FILE")"
+    
+    if [ "$count" -eq 0 ]; then
+      echo "当前没有屏蔽任何网站。"
+    else
+      echo "当前已屏蔽的域名后缀 (REJECT)："
+      jq -r '.blocked_domains[]' "$STATE_FILE" | nl -w1 -s') '
+    fi
+    
+    echo
+    echo "1) 添加屏蔽域名 (例如: baidu.com, 不能带http/https)"
+    echo "2) 解除已屏蔽的域名"
+    echo "0) 返回面板主菜单"
+    read -rp "请输入选项: " choice
+
+    case "$choice" in
+      1)
+        read -rp "请输入要屏蔽的域名: " domain
+        if [ -n "$domain" ]; then
+          local tmp="$(mktemp)"
+          # 追加域名并去重
+          jq --arg d "$domain" '.blocked_domains += [$d] | .blocked_domains |= unique' "$STATE_FILE" > "$tmp"
+          mv "$tmp" "$STATE_FILE"
+          chown sing-box:sing-box "$STATE_FILE" 2>/dev/null || true
+          chmod 600 "$STATE_FILE"
+          
+          ok "已添加屏蔽: $domain"
+          render_all
+          restart_singbox
+          sleep 1
+        fi
+        ;;
+      2)
+        if [ "$count" -eq 0 ]; then 
+          warn "当前屏蔽列表为空。"
+          sleep 1
+          continue
+        fi
+        read -rp "请输入要解除屏蔽的序号 (输入 0 取消): " index
+        if [[ "$index" =~ ^[0-9]+$ ]] && [ "$index" -ge 1 ] && [ "$index" -le "$count" ]; then
+          local tmp="$(mktemp)"
+          local d_name
+          d_name="$(jq -r --argjson i "$((index-1))" '.blocked_domains[$i]' "$STATE_FILE")"
+          jq --argjson i "$((index-1))" 'del(.blocked_domains[$i])' "$STATE_FILE" > "$tmp"
+          mv "$tmp" "$STATE_FILE"
+          chown sing-box:sing-box "$STATE_FILE" 2>/dev/null || true
+          chmod 600 "$STATE_FILE"
+          
+          ok "已解除屏蔽: $d_name"
+          render_all
+          restart_singbox
+          sleep 1
+        else
+          [ "$index" != "0" ] && { warn "无效的序号。"; sleep 1; }
+        fi
+        ;;
+      0) return 0 ;;
+      *) warn "输入错误。"; sleep 1 ;;
+    esac
+  done
 }
 
 modify_node_port_wizard() {
   need_state
-
   local count index old_port new_port old_tag new_tag type name tmp
-
   count="$(jq '.nodes | length' "$STATE_FILE")"
   [ "$count" -gt 0 ] || { warn "当前没有可修改端口的节点。"; pause; return 0; }
 
   step "修改节点端口"
-
   list_nodes_table
   echo
   read -rp "请输入要修改端口的节点序号，输入 0 返回: " index
 
-  if [ "$index" = "0" ]; then
-    return 0
-  fi
+  if [ "$index" = "0" ]; then return 0; fi
 
   if ! [[ "$index" =~ ^[0-9]+$ ]] || [ "$index" -lt 1 ] || [ "$index" -gt "$count" ]; then
     warn "序号输入错误。"
-    sleep 1
-    return 1
+    sleep 1; return 1
   fi
 
   old_port="$(jq -r --argjson i "$((index-1))" '.nodes[$i].port' "$STATE_FILE")"
@@ -1155,9 +1111,7 @@ modify_node_port_wizard() {
   new_port="$(ask_port "请输入「${name}」的新端口" "$old_port")"
 
   if [ "$new_port" = "$old_port" ]; then
-    warn "端口没有变化。"
-    sleep 1
-    return 0
+    warn "端口没有变化。"; sleep 1; return 0
   fi
 
   check_port_available "$new_port" "$old_tag"
@@ -1186,7 +1140,6 @@ modify_node_port_wizard() {
 
 choose_initial_nodes() {
   step "选择初始节点"
-
   echo "先选一个初始组合，安装完成后可随时输入 ysq 添加、删除节点或修改端口。"
   echo
   echo "1) 只创建 VLESS 直出"
@@ -1210,12 +1163,8 @@ choose_initial_nodes() {
       port="$(ask_port "请输入 TUIC 直出 UDP 端口" "$TUIC_DIRECT_PORT")"
       add_node_to_state "tuic-direct" "$port"
       ;;
-    4)
-      warn "已选择暂不创建直出节点。"
-      ;;
-    *)
-      die "输入错误，只能输入 1 / 2 / 3 / 4。"
-      ;;
+    4) warn "已选择暂不创建直出节点。" ;;
+    *) die "输入错误，只能输入 1 / 2 / 3 / 4。" ;;
   esac
 
   echo
@@ -1247,18 +1196,13 @@ choose_initial_nodes() {
       port="$(ask_port "请输入 TUIC 中转入口 UDP 端口" "$TUIC_RELAY_PORT")"
       add_node_to_state "tuic-relay" "$port"
       ;;
-    4)
-      warn "已选择不创建中转。"
-      ;;
-    *)
-      die "输入错误，只能输入 1 / 2 / 3 / 4。"
-      ;;
+    4) warn "已选择不创建中转。" ;;
+    *) die "输入错误，只能输入 1 / 2 / 3 / 4。" ;;
   esac
 }
 
 render_config() {
   need_state
-
   step "生成 sing-box 配置"
 
   jq '
@@ -1378,26 +1322,37 @@ render_config() {
         ]
       ),
       "route": {
-        "rules": [
-          $s.nodes[]? |
-          if (.type == "vless-relay" or .type == "tuic-relay") then
-            {
-              "inbound": [
-                .tag
-              ],
-              "action": "route",
-              "outbound": ("out-" + .tag)
-            }
-          else
-            {
-              "inbound": [
-                .tag
-              ],
-              "action": "route",
-              "outbound": "direct"
-            }
-          end
-        ],
+        "rules": (
+          (if ($s.blocked_domains != null and ($s.blocked_domains | length > 0)) then
+            [
+              {
+                "domain_suffix": $s.blocked_domains,
+                "action": "reject"
+              }
+            ]
+          else [] end)
+          +
+          [
+            $s.nodes[]? |
+            if (.type == "vless-relay" or .type == "tuic-relay") then
+              {
+                "inbound": [
+                  .tag
+                ],
+                "action": "route",
+                "outbound": ("out-" + .tag)
+              }
+            else
+              {
+                "inbound": [
+                  .tag
+                ],
+                "action": "route",
+                "outbound": "direct"
+              }
+            end
+          ]
+        ),
         "final": "direct"
       }
     }
@@ -1412,7 +1367,6 @@ render_config() {
 
 render_info() {
   need_state
-
   local uuid private_key public_key short_id tuic_pass reality_sni tuic_sni server_ip flag loc
   local type tag name port encoded_name link
 
@@ -1426,6 +1380,7 @@ render_info() {
   server_ip="$(state_get '.server_ip')"
   flag="$(state_get '.location_flag')"
   loc="$(state_get '.location_name')"
+
   cat > "$INFO_FILE" <<INFO
 ==============================
 ysq sing-box 节点信息
@@ -1468,9 +1423,7 @@ INFO
       tuic-direct|tuic-relay)
         link="tuic://${uuid}:${tuic_pass}@${server_ip}:${port}?congestion_control=bbr&alpn=h3&sni=${tuic_sni}&allow_insecure=1#${encoded_name}"
         ;;
-      *)
-        link=""
-        ;;
+      *) link="" ;;
     esac
 
     {
@@ -1479,24 +1432,20 @@ INFO
       echo "类型: $(node_type_name "$type")"
       echo "入口端口: ${port}"
       echo "入口 tag: ${tag}"
-
       if [[ "$type" == *"-relay" ]]; then
         echo "落地: $(echo "$node" | jq -r '.landing_server') : $(echo "$node" | jq -r '.landing_port')"
         echo "落地 SNI: $(echo "$node" | jq -r '.landing_sni')"
       fi
-
       echo "------------------------------"
       echo "$link"
       echo
     } >> "$INFO_FILE"
   done
-
   chmod 600 "$INFO_FILE"
 }
 
 render_yaml() {
   need_state
-
   local uuid public_key short_id tuic_pass reality_sni tuic_sni server_ip
   local type name port
 
@@ -1595,6 +1544,16 @@ YAML
       - DIRECT
 
 rules:
+YAML
+
+  # 将屏蔽网站写入 Clash YAML 的 REJECT 规则
+  if jq -e '.blocked_domains | length > 0' "$STATE_FILE" >/dev/null 2>&1; then
+    jq -r '.blocked_domains[]' "$STATE_FILE" | while read -r domain; do
+      printf '  - DOMAIN-SUFFIX,%s,REJECT\n' "$domain" >> "$YAML_FILE"
+    done
+  fi
+
+  cat >> "$YAML_FILE" <<YAML
   - GEOIP,CN,DIRECT
   - MATCH,PROXY
 YAML
@@ -1603,7 +1562,6 @@ YAML
 }
 
 cleanup_old_subscription_service() {
-  # 兼容从 v3 订阅版升级：关闭并删除旧的订阅服务残留。
   if command -v systemctl >/dev/null 2>&1; then
     systemctl stop ysq-subscription.socket 2>/dev/null || true
     systemctl disable ysq-subscription.socket 2>/dev/null || true
@@ -1631,7 +1589,6 @@ render_all() {
 
 restart_singbox() {
   step "重启 sing-box"
-
   detect_runtime
   ensure_singbox_service
   service_enable
@@ -1641,7 +1598,6 @@ restart_singbox() {
 
 list_nodes_table() {
   need_state
-
   local count
   count="$(jq '.nodes | length' "$STATE_FILE")"
 
@@ -1658,13 +1614,11 @@ list_nodes_table() {
     name="$(echo "$node" | jq -r '.name')"
     type="$(node_type_name "$(echo "$node" | jq -r '.type')")"
     port="$(echo "$node" | jq -r '.port')"
-
     if echo "$node" | jq -e 'has("landing_server")' >/dev/null 2>&1; then
       landing="$(echo "$node" | jq -r '.landing_server + ":" + (.landing_port|tostring)')"
     else
       landing="-"
     fi
-
     printf "%-4s %-30s %-20s %-8s %s\n" "$idx" "$name" "$type" "$port" "$landing"
   done
 }
@@ -1678,7 +1632,6 @@ show_ports() {
       return
     fi
   fi
-
   ss -lntup 2>/dev/null | grep sing-box || true
 }
 
@@ -1706,7 +1659,6 @@ save_self() {
     cp "$0" "$INSTALLER_FILE" 2>/dev/null || true
     chmod +x "$INSTALLER_FILE" 2>/dev/null || true
   fi
-
   if [ ! -x "$INSTALLER_FILE" ]; then
     warn "未能自动保存安装脚本到 ${INSTALLER_FILE}。"
     warn "ysq 面板需要这个文件，请手动把本脚本复制到 ${INSTALLER_FILE}。"
@@ -1715,7 +1667,6 @@ save_self() {
 
 uninstall_all() {
   step "彻底删除"
-
   echo "这个操作会删除：sing-box、配置、证书、节点信息、YAML、ysq 面板。"
   read -rp "确认删除请输入 y: " confirm
   [ "$confirm" = "y" ] || { warn "已取消删除。"; sleep 1; return 0; }
@@ -1771,10 +1722,11 @@ panel_menu() {
     echo "2) 查看 Clash YAML"
     echo "3) 查看 sing-box 状态 / 监听端口"
     echo "4) 添加节点"
-    echo "5) 删除节点"
+    echo "5) 删除节点 (支持批量)"
     echo "6) 修改节点端口"
-    echo "7) 重启 sing-box"
-    echo "8) 彻底删除 sing-box 和脚本"
+    echo "7) 屏蔽指定网站管理"
+    echo "8) 重启 sing-box"
+    echo "9) 彻底删除 sing-box 和脚本"
     echo "0) 退出"
     echo "=============================="
     read -rp "请输入选项: " choice
@@ -1788,35 +1740,15 @@ panel_menu() {
         [ -f "$YAML_FILE" ] && cat "$YAML_FILE" || warn "未找到 YAML 文件：$YAML_FILE"
         pause
         ;;
-      3)
-        show_status
-        ;;
-      4)
-        add_node_wizard
-        pause
-        ;;
-      5)
-        delete_node_wizard
-        ;;
-      6)
-        modify_node_port_wizard
-        pause
-        ;;
-      7)
-        restart_singbox
-        service_status
-        pause
-        ;;
-      8)
-        uninstall_all
-        ;;
-      0)
-        exit 0
-        ;;
-      *)
-        warn "输入错误。"
-        sleep 1
-        ;;
+      3) show_status ;;
+      4) add_node_wizard; pause ;;
+      5) delete_node_wizard ;;
+      6) modify_node_port_wizard; pause ;;
+      7) block_website_wizard ;;
+      8) restart_singbox; service_status; pause ;;
+      9) uninstall_all ;;
+      0) exit 0 ;;
+      *) warn "输入错误。"; sleep 1 ;;
     esac
   done
 }
@@ -1856,12 +1788,8 @@ install_wizard() {
 }
 
 case "${1:-install}" in
-  install)
-    install_wizard
-    ;;
-  panel)
-    panel_menu
-    ;;
+  install) install_wizard ;;
+  panel) panel_menu ;;
   render)
     need_root
     render_all
