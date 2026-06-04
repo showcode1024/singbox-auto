@@ -6,8 +6,8 @@ set -euo pipefail
 # 支持：
 #   - VLESS Reality 直出
 #   - TUIC v5 直出
-#   - VLESS -> VLESS Reality 中转
-#   - TUIC v5 -> VLESS Reality 中转
+#   - 中转入口支持 VLESS / TUIC v5
+#   - 落地节点支持 VLESS Reality / TUIC v5 (新增支持)
 #   - 面板随时添加 / 删除 / 修改节点端口
 #   - 屏蔽指定网站管理
 #   - 根据服务器公网 IP 所在地自动命名节点
@@ -92,8 +92,6 @@ detect_service_manager() {
   elif command -v rc-service >/dev/null 2>&1 && rc-status >/dev/null 2>&1; then
     SERVICE_MANAGER="openrc"
   else
-    # Docker / LXC / 精简 Alpine 里可能有 rc-service 命令，但 OpenRC 没真正运行。
-    # 这种情况下不要强行用 rc-service，改用 nohup 后台兜底。
     SERVICE_MANAGER="none"
   fi
 }
@@ -207,8 +205,6 @@ normalize_apk_arch() {
 ensure_alpine_glibc_compat() {
   [ "${PKG_MANAGER:-}" = "apk" ] || return 0
 
-  # 官方 tar.gz 里的 sing-box 在部分版本/架构上会依赖 glibc loader：
-  # /lib64/ld-linux-x86-64.so.2。Alpine 默认是 musl，所以需要兼容层。
   apk add --no-cache gcompat libc6-compat libstdc++ libgcc file 2>/dev/null || true
 
   case "$(uname -m)" in
@@ -253,9 +249,7 @@ remove_broken_singbox_bins() {
 
 get_latest_version() {
   local version
-  # 优先使用 API 抓取
   version="$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r '.tag_name' | sed 's/^v//' 2>/dev/null || true)"
-  # 如果遭遇 API 限流，改用抓取跳转链接防封锁兜底
   if [ -z "$version" ] || [ "$version" = "null" ]; then
     version="$(curl -Ls -o /dev/null -w %{url_effective} https://github.com/SagerNet/sing-box/releases/latest | grep -oE '[^/]+$' | sed 's/^v//' || true)"
   fi
@@ -276,7 +270,6 @@ install_singbox_alpine_apk() {
     version="1.13.12"
   fi
 
-  # 1) 优先尝试官方 Alpine .apk 包。
   url="https://github.com/SagerNet/sing-box/releases/download/v${version}/sing-box_${version}_linux_${arch}.apk"
   apk_file="${tmp_dir}/sing-box.apk"
   info "正在下载 Alpine .apk 包：sing-box ${version} / ${arch}"
@@ -293,7 +286,6 @@ install_singbox_alpine_apk() {
     warn "apk add 本地包失败，尝试直接解包 .apk。"
   fi
 
-  # 2) 有些 Alpine 环境不能 apk add 本地包，尝试把 apk 当 tar 包解开。
   if tar -xzf "$apk_file" -C "$tmp_dir" 2>/dev/null || tar -xf "$apk_file" -C "$tmp_dir" 2>/dev/null; then
     extracted_bin="$(find "$tmp_dir" \( -type f -path '*/bin/sing-box' -o -type f -name sing-box \) | head -n 1)"
     if [ -n "$extracted_bin" ]; then
@@ -304,15 +296,9 @@ install_singbox_alpine_apk() {
         rm -rf "$tmp_dir"
         return 0
       fi
-      warn "从 .apk 解出的 sing-box 仍无法运行，继续使用 tar.gz 备用安装。"
-    else
-      warn ".apk 解包后没有找到 sing-box 二进制，继续使用 tar.gz 备用安装。"
     fi
-  else
-    warn ".apk 无法解包，继续使用 tar.gz 备用安装。"
   fi
 
-  # 3) 最后兜底：使用 GitHub tar.gz。该包在 Alpine 上可能需要 gcompat/glibc loader 兼容层。
   ensure_alpine_glibc_compat
   tgz_arch="$(normalize_arch)"
   tgz_file="${tmp_dir}/sing-box.tar.gz"
@@ -330,16 +316,12 @@ install_singbox_alpine_apk() {
   install -m 755 "$found_bin" /usr/bin/sing-box
   ln -sf /usr/bin/sing-box /usr/local/bin/sing-box
 
-  # tar.gz 包可能附带 libcronet.so，复制到系统库目录，避免运行时缺库。
   find "$tmp_dir" -type f -name libcronet.so -exec cp -f {} /usr/lib/libcronet.so \; 2>/dev/null || true
   chmod 755 /usr/lib/libcronet.so 2>/dev/null || true
 
   hash -r 2>/dev/null || true
 
   if ! singbox_bin_works /usr/bin/sing-box; then
-    err "tar.gz 备用安装后 sing-box 仍无法运行。"
-    file /usr/bin/sing-box 2>/dev/null || true
-    ldd /usr/bin/sing-box 2>/dev/null || true
     rm -rf "$tmp_dir"
     die "Alpine 上 sing-box 安装失败。"
   fi
@@ -736,8 +718,8 @@ node_suffix() {
   case "$1" in
     vless-direct) echo "vless" ;;
     tuic-direct) echo "tuic5" ;;
-    vless-relay) echo "vless转vless" ;;
-    tuic-relay) echo "tuic5转vless" ;;
+    vless-relay) echo "vless转接" ;;
+    tuic-relay) echo "tuic5转接" ;;
     *) echo "node" ;;
   esac
 }
@@ -746,8 +728,8 @@ node_type_name() {
   case "$1" in
     vless-direct) echo "VLESS 直出" ;;
     tuic-direct) echo "TUIC v5 直出" ;;
-    vless-relay) echo "VLESS -> VLESS 中转" ;;
-    tuic-relay) echo "TUIC v5 -> VLESS 中转" ;;
+    vless-relay) echo "VLESS 中转入口" ;;
+    tuic-relay) echo "TUIC v5 中转入口" ;;
     *) echo "$1" ;;
   esac
 }
@@ -862,7 +844,6 @@ state_get() {
 ensure_state_defaults() {
   need_state
 
-  # 兼容旧 v3：删除已经废弃的订阅字段。
   if jq -e 'has("sub_port") or has("sub_token")' "$STATE_FILE" >/dev/null 2>&1; then
     local tmp
     tmp="$(mktemp)"
@@ -870,7 +851,6 @@ ensure_state_defaults() {
     mv "$tmp" "$STATE_FILE"
   fi
   
-  # 确保状态文件中存在被屏蔽的域名列表
   if ! jq -e '. | has("blocked_domains")' "$STATE_FILE" >/dev/null 2>&1; then
     local tmp
     tmp="$(mktemp)"
@@ -1023,16 +1003,37 @@ JSON
 }
 
 ask_landing_params() {
+  echo "请选择落地节点（目标服务器）的协议类型："
+  echo "1) VLESS Reality (默认)"
+  echo "2) TUIC v5"
+  read -rp "请输入 1 或 2 [默认 1]: " landing_choice
+  
+  if [ "$landing_choice" = "2" ]; then
+    LANDING_TYPE="tuic"
+  else
+    LANDING_TYPE="vless"
+  fi
+
   LANDING_SERVER="$(ask_text_default "请输入落地节点 IP 或域名，不能填 0.0.0.0" "")"
   if [ "$LANDING_SERVER" = "0.0.0.0" ]; then
     die "落地地址不能是 0.0.0.0。"
   fi
 
-  LANDING_PORT="$(ask_port "请输入落地节点 VLESS 端口" "$VLESS_DIRECT_PORT")"
-  LANDING_UUID="$(ask_text_default "请输入落地 VLESS UUID" "$(state_get '.uuid')")"
-  LANDING_PUBLIC_KEY="$(ask_text_default "请输入落地 Reality PublicKey" "$(state_get '.public_key')")"
-  LANDING_SHORT_ID="$(ask_text_default "请输入落地 Reality ShortID" "$(state_get '.short_id')")"
-  LANDING_SNI="$(ask_text_default "请输入落地 Reality SNI" "$(state_get '.reality_sni')")"
+  if [ "$LANDING_TYPE" = "tuic" ]; then
+    LANDING_PORT="$(ask_port "请输入落地节点 TUIC 端口" "$TUIC_DIRECT_PORT")"
+    LANDING_UUID="$(ask_text_default "请输入落地 TUIC UUID" "$(state_get '.uuid')")"
+    LANDING_TUIC_PASS="$(ask_text_default "请输入落地 TUIC 密码" "$(state_get '.tuic_pass')")"
+    LANDING_SNI="$(ask_text_default "请输入落地 TUIC SNI" "$(state_get '.tuic_sni')")"
+    LANDING_PUBLIC_KEY=""
+    LANDING_SHORT_ID=""
+  else
+    LANDING_PORT="$(ask_port "请输入落地节点 VLESS 端口" "$VLESS_DIRECT_PORT")"
+    LANDING_UUID="$(ask_text_default "请输入落地 VLESS UUID" "$(state_get '.uuid')")"
+    LANDING_PUBLIC_KEY="$(ask_text_default "请输入落地 Reality PublicKey" "$(state_get '.public_key')")"
+    LANDING_SHORT_ID="$(ask_text_default "请输入落地 Reality ShortID" "$(state_get '.short_id')")"
+    LANDING_SNI="$(ask_text_default "请输入落地 Reality SNI" "$(state_get '.reality_sni')")"
+    LANDING_TUIC_PASS=""
+  fi
 }
 
 add_node_to_state() {
@@ -1052,22 +1053,26 @@ add_node_to_state() {
       --arg tag "$tag" \
       --arg name "$name" \
       --argjson port "$port" \
+      --arg landing_type "$LANDING_TYPE" \
       --arg landing_server "$LANDING_SERVER" \
       --argjson landing_port "$LANDING_PORT" \
       --arg landing_uuid "$LANDING_UUID" \
       --arg landing_public_key "$LANDING_PUBLIC_KEY" \
       --arg landing_short_id "$LANDING_SHORT_ID" \
+      --arg landing_tuic_pass "$LANDING_TUIC_PASS" \
       --arg landing_sni "$LANDING_SNI" \
       '.nodes += [{
         "type": $type,
         "tag": $tag,
         "name": $name,
         "port": $port,
+        "landing_type": $landing_type,
         "landing_server": $landing_server,
         "landing_port": $landing_port,
         "landing_uuid": $landing_uuid,
         "landing_public_key": $landing_public_key,
         "landing_short_id": $landing_short_id,
+        "landing_tuic_pass": $landing_tuic_pass,
         "landing_sni": $landing_sni
       }]' "$STATE_FILE" > "$tmp"
   else
@@ -1098,8 +1103,8 @@ add_node_wizard() {
 
   echo "1) VLESS 直出                  默认端口 ${VLESS_DIRECT_PORT}"
   echo "2) TUIC v5 直出                默认端口 ${TUIC_DIRECT_PORT}"
-  echo "3) VLESS -> VLESS 中转          默认端口 ${VLESS_RELAY_PORT}"
-  echo "4) TUIC v5 -> VLESS 中转        默认端口 ${TUIC_RELAY_PORT}"
+  echo "3) VLESS 中转入口               默认端口 ${VLESS_RELAY_PORT}"
+  echo "4) TUIC v5 中转入口             默认端口 ${TUIC_RELAY_PORT}"
   echo "0) 返回"
   read -rp "请选择要添加的节点类型: " choice
 
@@ -1114,13 +1119,13 @@ add_node_wizard() {
       ;;
     3)
       port="$(ask_port "请输入 VLESS 中转入口 TCP 端口" "$VLESS_RELAY_PORT")"
-      step "落地 VLESS 参数"
+      step "落地节点参数"
       ask_landing_params
       add_node_to_state "vless-relay" "$port"
       ;;
     4)
       port="$(ask_port "请输入 TUIC 中转入口 UDP 端口" "$TUIC_RELAY_PORT")"
-      step "落地 VLESS 参数"
+      step "落地节点参数"
       ask_landing_params
       add_node_to_state "tuic-relay" "$port"
       ;;
@@ -1160,7 +1165,6 @@ delete_node_wizard() {
     return 0
   fi
 
-  # 规范化输入：将逗号替换为空格
   indices="${indices//,/ }"
 
   declare -a valid_tags=()
@@ -1240,7 +1244,6 @@ block_website_wizard() {
       1)
         read -rp "请输入要屏蔽的域名: " domain
         if [ -n "$domain" ]; then
-          # 域名清洗规则：去除协议、去除末尾路径、去除头尾空格
           domain="$(echo "$domain" | sed -e 's|^[^/]*//||' -e 's|/.*$||' -e 's|^[ \t]*||' -e 's|[ \t]*$||')"
           
           if [ -n "$domain" ]; then
@@ -1459,27 +1462,27 @@ choose_initial_nodes() {
 
   echo
   echo "是否同时创建中转入口？"
-  echo "1) 创建 VLESS -> VLESS 中转，默认入口端口 ${VLESS_RELAY_PORT}"
-  echo "2) 创建 TUIC v5 -> VLESS 中转，默认入口端口 ${TUIC_RELAY_PORT}"
-  echo "3) 两个中转都创建"
+  echo "1) 创建 VLESS 中转入口，默认端口 ${VLESS_RELAY_PORT}"
+  echo "2) 创建 TUIC v5 中转入口，默认端口 ${TUIC_RELAY_PORT}"
+  echo "3) 两个中转入口都创建"
   echo "4) 不创建中转"
   read -rp "请输入 1 / 2 / 3 / 4: " relay_choice
 
   case "$relay_choice" in
     1)
-      step "落地 VLESS 参数"
+      step "落地节点参数"
       ask_landing_params
       port="$(ask_port "请输入 VLESS 中转入口 TCP 端口" "$VLESS_RELAY_PORT")"
       add_node_to_state "vless-relay" "$port"
       ;;
     2)
-      step "落地 VLESS 参数"
+      step "落地节点参数"
       ask_landing_params
       port="$(ask_port "请输入 TUIC 中转入口 UDP 端口" "$TUIC_RELAY_PORT")"
       add_node_to_state "tuic-relay" "$port"
       ;;
     3)
-      step "落地 VLESS 参数，两个中转会共用这一组落地参数"
+      step "落地节点参数，两个中转将共用这一组落地参数"
       ask_landing_params
       port="$(ask_port "请输入 VLESS 中转入口 TCP 端口" "$VLESS_RELAY_PORT")"
       add_node_to_state "vless-relay" "$port"
@@ -1561,28 +1564,50 @@ render_config() {
     };
 
     def landing_out($n):
-    {
-      "type": "vless",
-      "tag": ("out-" + $n.tag),
-      "server": $n.landing_server,
-      "server_port": ($n.landing_port | tonumber),
-      "uuid": ($n.landing_uuid // $s.uuid),
-      "flow": "xtls-rprx-vision",
-      "tls": {
-        "enabled": true,
-        "server_name": ($n.landing_sni // $s.reality_sni),
-        "utls": {
+    if ($n.landing_type == "tuic") then
+      {
+        "type": "tuic",
+        "tag": ("out-" + $n.tag),
+        "server": $n.landing_server,
+        "server_port": ($n.landing_port | tonumber),
+        "uuid": ($n.landing_uuid // $s.uuid),
+        "password": ($n.landing_tuic_pass // $s.tuic_pass),
+        "congestion_control": "bbr",
+        "udp_relay_mode": "native",
+        "zero_rtt_handshake": false,
+        "heartbeat": "10s",
+        "tls": {
           "enabled": true,
-          "fingerprint": "chrome"
-        },
-        "reality": {
-          "enabled": true,
-          "public_key": ($n.landing_public_key // $s.public_key),
-          "short_id": ($n.landing_short_id // $s.short_id)
+          "server_name": ($n.landing_sni // $s.tuic_sni),
+          "alpn": [
+            "h3"
+          ]
         }
-      },
-      "packet_encoding": "xudp"
-    };
+      }
+    else
+      {
+        "type": "vless",
+        "tag": ("out-" + $n.tag),
+        "server": $n.landing_server,
+        "server_port": ($n.landing_port | tonumber),
+        "uuid": ($n.landing_uuid // $s.uuid),
+        "flow": "xtls-rprx-vision",
+        "tls": {
+          "enabled": true,
+          "server_name": ($n.landing_sni // $s.reality_sni),
+          "utls": {
+            "enabled": true,
+            "fingerprint": "chrome"
+          },
+          "reality": {
+            "enabled": true,
+            "public_key": ($n.landing_public_key // $s.public_key),
+            "short_id": ($n.landing_short_id // $s.short_id)
+          }
+        },
+        "packet_encoding": "xudp"
+      }
+    end;
 
     {
       "log": {
@@ -1736,7 +1761,13 @@ INFO
       echo "入口 tag: ${tag}"
 
       if [[ "$type" == *"-relay" ]]; then
-        echo "落地: $(echo "$node" | jq -r '.landing_server') : $(echo "$node" | jq -r '.landing_port')"
+        local l_type="$(echo "$node" | jq -r '.landing_type // "vless"')"
+        if [ "$l_type" = "tuic" ]; then
+          echo "落地类型: TUIC v5"
+        else
+          echo "落地类型: VLESS Reality"
+        fi
+        echo "落地目标: $(echo "$node" | jq -r '.landing_server') : $(echo "$node" | jq -r '.landing_port')"
         echo "落地 SNI: $(echo "$node" | jq -r '.landing_sni')"
       fi
 
@@ -1858,7 +1889,6 @@ YAML
 }
 
 cleanup_old_subscription_service() {
-  # 兼容从旧版本订阅体系升级：关闭并删除旧的订阅服务残留。
   if command -v systemctl >/dev/null 2>&1; then
     systemctl stop ysq-subscription.socket 2>/dev/null || true
     systemctl disable ysq-subscription.socket 2>/dev/null || true
@@ -1908,17 +1938,22 @@ list_nodes_table() {
     return 0
   fi
 
-  printf "%-4s %-30s %-20s %-8s %s\n" "序号" "节点名" "类型" "端口" "落地"
-  printf "%-4s %-30s %-20s %-8s %s\n" "----" "------------------------------" "--------------------" "------" "----------------"
+  printf "%-4s %-30s %-20s %-8s %s\n" "序号" "节点名" "类型" "端口" "落地类型及地址"
+  printf "%-4s %-30s %-20s %-8s %s\n" "----" "------------------------------" "--------------------" "------" "------------------------"
 
   jq -c '.nodes[]' "$STATE_FILE" | nl -w1 -s' ' | while read -r idx node; do
-    local name type port landing
+    local name type port landing l_type
     name="$(echo "$node" | jq -r '.name')"
     type="$(node_type_name "$(echo "$node" | jq -r '.type')")"
     port="$(echo "$node" | jq -r '.port')"
 
     if echo "$node" | jq -e 'has("landing_server")' >/dev/null 2>&1; then
-      landing="$(echo "$node" | jq -r '.landing_server + ":" + (.landing_port|tostring)')"
+      l_type="$(echo "$node" | jq -r '.landing_type // "vless"')"
+      if [ "$l_type" = "tuic" ]; then
+        landing="TUIC -> $(echo "$node" | jq -r '.landing_server + ":" + (.landing_port|tostring)')"
+      else
+        landing="VLESS -> $(echo "$node" | jq -r '.landing_server + ":" + (.landing_port|tostring)')"
+      fi
     else
       landing="-"
     fi
@@ -2113,7 +2148,7 @@ install_wizard() {
   
   echo -e "${C_BOLD}==============================${C_RESET}"
   echo -e "${C_BOLD} ysq sing-box 一键安装脚本${C_RESET}"
-  echo -e "${C_BOLD} VLESS / TUIC / VLESS中转 / TUIC中转${C_RESET}"
+  echo -e "${C_BOLD} 直出 / 中转：均支持 VLESS / TUIC v5${C_RESET}"
   echo -e "${C_BOLD}==============================${C_RESET}"
   echo
 
