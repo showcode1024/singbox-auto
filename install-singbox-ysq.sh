@@ -12,6 +12,7 @@ set -euo pipefail
 #   - 屏蔽指定网站管理
 #   - 根据服务器公网 IP 所在地自动命名节点
 #   - 生成节点直链和 Clash YAML 文件
+#   - 支持 IPv4 / IPv6 独立选择与绑定 (双栈支持)
 #   - 支持 Debian / Ubuntu / CentOS / Rocky / AlmaLinux / Alpine
 # ============================================================
 
@@ -640,6 +641,35 @@ ask_text_default() {
   fi
 }
 
+ask_network_type() {
+  local v4="$1"
+  local v6="$2"
+  local net_choice=""
+
+  if [ -n "$v4" ] && [ -n "$v6" ]; then
+    echo
+    echo "检测到服务器支持双栈，请选择该节点绑定的网络协议："
+    echo "1) IPv4 (默认，直链/配置将使用 IPv4 地址)"
+    echo "2) IPv6 (直链/配置将使用 IPv6 地址)"
+    while true; do
+      read -rp "请输入 1 或 2 [默认 1]: " net_choice
+      if [ -z "$net_choice" ] || [ "$net_choice" = "1" ]; then
+        echo "ipv4"
+        return
+      elif [ "$net_choice" = "2" ]; then
+        echo "ipv6"
+        return
+      else
+        warn "输入错误，请输入 1 或 2。"
+      fi
+    done
+  elif [ -n "$v6" ]; then
+    echo "ipv6"
+  else
+    echo "ipv4"
+  fi
+}
+
 port_used() {
   local port="$1"
   local ignore_tag="${2:-}"
@@ -701,9 +731,8 @@ country_to_name() {
   esac
 }
 
-detect_public_ip() {
+detect_public_ipv4() {
   local ip=""
-
   ip="$(curl -4 -s --max-time 6 https://api.ipify.org 2>/dev/null || true)"
   if [ -z "$ip" ]; then
     ip="$(curl -4 -s --max-time 6 https://ifconfig.me 2>/dev/null || true)"
@@ -711,7 +740,15 @@ detect_public_ip() {
   if [ -z "$ip" ]; then
     ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
   fi
+  echo "$ip"
+}
 
+detect_public_ipv6() {
+  local ip=""
+  ip="$(curl -6 -s --max-time 6 https://api64.ipify.org 2>/dev/null || true)"
+  if [ -z "$ip" ]; then
+    ip="$(curl -6 -s --max-time 6 https://ifconfig.co 2>/dev/null || true)"
+  fi
   echo "$ip"
 }
 
@@ -720,9 +757,9 @@ detect_location() {
   local code=""
   local pair=""
 
-  code="$(curl -4 -s --max-time 8 "https://ipapi.co/${ip}/country/" 2>/dev/null | tr -d '\r\n ' || true)"
+  code="$(curl -s --max-time 8 "https://ipapi.co/${ip}/country/" 2>/dev/null | tr -d '\r\n ' || true)"
   if ! [[ "$code" =~ ^[A-Za-z]{2}$ ]]; then
-    code="$(curl -4 -s --max-time 8 "https://ipinfo.io/${ip}/country" 2>/dev/null | tr -d '\r\n ' || true)"
+    code="$(curl -s --max-time 8 "https://ipinfo.io/${ip}/country" 2>/dev/null | tr -d '\r\n ' || true)"
   fi
   if ! [[ "$code" =~ ^[A-Za-z]{2}$ ]]; then
     code="XX"
@@ -878,6 +915,21 @@ ensure_state_defaults() {
     mv "$tmp" "$STATE_FILE"
   fi
 
+  # 兼容旧版本单 IP 升级为 IPv4/IPv6 双 IP 模型
+  if ! jq -e '. | has("server_ipv4")' "$STATE_FILE" >/dev/null 2>&1; then
+    local old_ip new_v6 tmp tmp2
+    old_ip="$(jq -r '.server_ip // ""' "$STATE_FILE")"
+    info "正在检测当前服务器 IPv6 支持状态以升级配置..."
+    new_v6="$(detect_public_ipv6 || true)"
+    tmp="$(mktemp)"
+    jq --arg v4 "$old_ip" --arg v6 "$new_v6" '.server_ipv4 = $v4 | .server_ipv6 = $v6' "$STATE_FILE" > "$tmp"
+    mv "$tmp" "$STATE_FILE"
+    
+    tmp2="$(mktemp)"
+    jq '.nodes |= map(if has("address_type") then . else . + {"address_type": "ipv4"} end)' "$STATE_FILE" > "$tmp2"
+    mv "$tmp2" "$STATE_FILE"
+  fi
+
   chown sing-box:sing-box "$STATE_FILE" 2>/dev/null || true
   chmod 600 "$STATE_FILE"
 }
@@ -952,7 +1004,7 @@ EOF
 }
 
 create_state_file() {
-  local uuid private_key public_key short_id tuic_pass server_ip location_raw country_code flag loc
+  local uuid private_key public_key short_id tuic_pass server_ipv4 server_ipv6 location_raw country_code flag loc detect_ip
 
   mkdir -p "$CONFIG_DIR"
 
@@ -987,17 +1039,29 @@ create_state_file() {
   esac
 
   step "检测公网 IP 和所在地"
-  server_ip="$(detect_public_ip)"
-  if [ -z "$server_ip" ]; then
-    die "无法获取公网 IP。"
+  info "正在检测网络栈 (IPv4/IPv6)..."
+  server_ipv4="$(detect_public_ipv4)"
+  server_ipv6="$(detect_public_ipv6)"
+
+  if [ -z "$server_ipv4" ] && [ -z "$server_ipv6" ]; then
+    die "无法获取任何公网 IP (IPv4 或 IPv6)。"
   fi
 
-  location_raw="$(detect_location "$server_ip")"
+  if [ -n "$server_ipv4" ]; then
+    ok "公网 IPv4：${server_ipv4}"
+  fi
+  if [ -n "$server_ipv6" ]; then
+    ok "公网 IPv6：${server_ipv6}"
+  fi
+
+  # 使用获取到的有效 IP 查询所在地
+  detect_ip="${server_ipv4:-$server_ipv6}"
+
+  location_raw="$(detect_location "$detect_ip")"
   country_code="$(echo "$location_raw" | cut -d'|' -f1)"
   flag="$(echo "$location_raw" | cut -d'|' -f2)"
   loc="$(echo "$location_raw" | cut -d'|' -f3)"
 
-  ok "公网 IP：${server_ip}"
   ok "自动命名地区：${flag}${loc}"
 
   cat > "$STATE_FILE" <<JSON
@@ -1009,7 +1073,8 @@ create_state_file() {
   "tuic_pass": "${tuic_pass}",
   "reality_sni": "${REALITY_SNI}",
   "tuic_sni": "${TUIC_SNI}",
-  "server_ip": "${server_ip}",
+  "server_ipv4": "${server_ipv4}",
+  "server_ipv6": "${server_ipv6}",
   "country_code": "${country_code}",
   "location_flag": "${flag}",
   "location_name": "${loc}",
@@ -1038,6 +1103,7 @@ ask_landing_params() {
 add_node_to_state() {
   local type="$1"
   local port="$2"
+  local addr_type="${3:-ipv4}"
   local tag name tmp
 
   check_port_available "$port"
@@ -1052,6 +1118,7 @@ add_node_to_state() {
       --arg tag "$tag" \
       --arg name "$name" \
       --argjson port "$port" \
+      --arg addr "$addr_type" \
       --arg landing_server "$LANDING_SERVER" \
       --argjson landing_port "$LANDING_PORT" \
       --arg landing_uuid "$LANDING_UUID" \
@@ -1063,6 +1130,7 @@ add_node_to_state() {
         "tag": $tag,
         "name": $name,
         "port": $port,
+        "address_type": $addr,
         "landing_server": $landing_server,
         "landing_port": $landing_port,
         "landing_uuid": $landing_uuid,
@@ -1076,11 +1144,13 @@ add_node_to_state() {
       --arg tag "$tag" \
       --arg name "$name" \
       --argjson port "$port" \
+      --arg addr "$addr_type" \
       '.nodes += [{
         "type": $type,
         "tag": $tag,
         "name": $name,
-        "port": $port
+        "port": $port,
+        "address_type": $addr
       }]' "$STATE_FILE" > "$tmp"
   fi
 
@@ -1088,11 +1158,15 @@ add_node_to_state() {
   chown sing-box:sing-box "$STATE_FILE" 2>/dev/null || true
   chmod 600 "$STATE_FILE"
 
-  ok "已添加节点：${name} / 端口 ${port}"
+  ok "已添加节点：${name} / 端口 ${port} / 网络: ${addr_type^^}"
 }
 
 add_node_wizard() {
   need_state
+
+  local v4 v6 net_type port choice
+  v4="$(state_get '.server_ipv4')"
+  v6="$(state_get '.server_ipv6')"
 
   step "添加节点"
 
@@ -1106,23 +1180,27 @@ add_node_wizard() {
   case "$choice" in
     1)
       port="$(ask_port "请输入 VLESS 直出 TCP 端口" "$VLESS_DIRECT_PORT")"
-      add_node_to_state "vless-direct" "$port"
+      net_type="$(ask_network_type "$v4" "$v6")"
+      add_node_to_state "vless-direct" "$port" "$net_type"
       ;;
     2)
       port="$(ask_port "请输入 TUIC 直出 UDP 端口" "$TUIC_DIRECT_PORT")"
-      add_node_to_state "tuic-direct" "$port"
+      net_type="$(ask_network_type "$v4" "$v6")"
+      add_node_to_state "tuic-direct" "$port" "$net_type"
       ;;
     3)
       port="$(ask_port "请输入 VLESS 中转入口 TCP 端口" "$VLESS_RELAY_PORT")"
+      net_type="$(ask_network_type "$v4" "$v6")"
       step "落地 VLESS 参数"
       ask_landing_params
-      add_node_to_state "vless-relay" "$port"
+      add_node_to_state "vless-relay" "$port" "$net_type"
       ;;
     4)
       port="$(ask_port "请输入 TUIC 中转入口 UDP 端口" "$TUIC_RELAY_PORT")"
+      net_type="$(ask_network_type "$v4" "$v6")"
       step "落地 VLESS 参数"
       ask_landing_params
-      add_node_to_state "tuic-relay" "$port"
+      add_node_to_state "tuic-relay" "$port" "$net_type"
       ;;
     0)
       return 0
@@ -1426,6 +1504,10 @@ update_core_wizard() {
 choose_initial_nodes() {
   step "选择初始节点"
 
+  local v4 v6 net_type port node_choice relay_choice
+  v4="$(state_get '.server_ipv4')"
+  v6="$(state_get '.server_ipv6')"
+
   echo "先选一个初始组合，安装完成后可随时输入 ysq 添加、删除节点或修改端口。"
   echo
   echo "1) 只创建 VLESS 直出"
@@ -1437,17 +1519,22 @@ choose_initial_nodes() {
   case "$node_choice" in
     1)
       port="$(ask_port "请输入 VLESS 直出 TCP 端口" "$VLESS_DIRECT_PORT")"
-      add_node_to_state "vless-direct" "$port"
+      net_type="$(ask_network_type "$v4" "$v6")"
+      add_node_to_state "vless-direct" "$port" "$net_type"
       ;;
     2)
       port="$(ask_port "请输入 TUIC 直出 UDP 端口" "$TUIC_DIRECT_PORT")"
-      add_node_to_state "tuic-direct" "$port"
+      net_type="$(ask_network_type "$v4" "$v6")"
+      add_node_to_state "tuic-direct" "$port" "$net_type"
       ;;
     3)
       port="$(ask_port "请输入 VLESS 直出 TCP 端口" "$VLESS_DIRECT_PORT")"
-      add_node_to_state "vless-direct" "$port"
+      net_type="$(ask_network_type "$v4" "$v6")"
+      add_node_to_state "vless-direct" "$port" "$net_type"
+      
       port="$(ask_port "请输入 TUIC 直出 UDP 端口" "$TUIC_DIRECT_PORT")"
-      add_node_to_state "tuic-direct" "$port"
+      net_type="$(ask_network_type "$v4" "$v6")"
+      add_node_to_state "tuic-direct" "$port" "$net_type"
       ;;
     4)
       warn "已选择暂不创建直出节点。"
@@ -1470,21 +1557,26 @@ choose_initial_nodes() {
       step "落地 VLESS 参数"
       ask_landing_params
       port="$(ask_port "请输入 VLESS 中转入口 TCP 端口" "$VLESS_RELAY_PORT")"
-      add_node_to_state "vless-relay" "$port"
+      net_type="$(ask_network_type "$v4" "$v6")"
+      add_node_to_state "vless-relay" "$port" "$net_type"
       ;;
     2)
       step "落地 VLESS 参数"
       ask_landing_params
       port="$(ask_port "请输入 TUIC 中转入口 UDP 端口" "$TUIC_RELAY_PORT")"
-      add_node_to_state "tuic-relay" "$port"
+      net_type="$(ask_network_type "$v4" "$v6")"
+      add_node_to_state "tuic-relay" "$port" "$net_type"
       ;;
     3)
       step "落地 VLESS 参数，两个中转会共用这一组落地参数"
       ask_landing_params
       port="$(ask_port "请输入 VLESS 中转入口 TCP 端口" "$VLESS_RELAY_PORT")"
-      add_node_to_state "vless-relay" "$port"
+      net_type="$(ask_network_type "$v4" "$v6")"
+      add_node_to_state "vless-relay" "$port" "$net_type"
+      
       port="$(ask_port "请输入 TUIC 中转入口 UDP 端口" "$TUIC_RELAY_PORT")"
-      add_node_to_state "tuic-relay" "$port"
+      net_type="$(ask_network_type "$v4" "$v6")"
+      add_node_to_state "tuic-relay" "$port" "$net_type"
       ;;
     4)
       warn "已选择不创建中转。"
@@ -1507,7 +1599,7 @@ render_config() {
     {
       "type": "vless",
       "tag": $n.tag,
-      "listen": "::",
+      "listen": (if $n.address_type == "ipv6" then "::" else "0.0.0.0" end),
       "listen_port": ($n.port | tonumber),
       "users": [
         {
@@ -1536,7 +1628,7 @@ render_config() {
     {
       "type": "tuic",
       "tag": $n.tag,
-      "listen": "::",
+      "listen": (if $n.address_type == "ipv6" then "::" else "0.0.0.0" end),
       "listen_port": ($n.port | tonumber),
       "users": [
         {
@@ -1667,8 +1759,8 @@ render_config() {
 render_info() {
   need_state
 
-  local uuid private_key public_key short_id tuic_pass reality_sni tuic_sni server_ip flag loc
-  local type tag name port encoded_name link
+  local uuid private_key public_key short_id tuic_pass reality_sni tuic_sni v4 v6 flag loc
+  local type tag name port addr_type node_ip encoded_name link
 
   uuid="$(state_get '.uuid')"
   private_key="$(state_get '.private_key')"
@@ -1677,7 +1769,8 @@ render_info() {
   tuic_pass="$(state_get '.tuic_pass')"
   reality_sni="$(state_get '.reality_sni')"
   tuic_sni="$(state_get '.tuic_sni')"
-  server_ip="$(state_get '.server_ip')"
+  v4="$(state_get '.server_ipv4')"
+  v6="$(state_get '.server_ipv6')"
   flag="$(state_get '.location_flag')"
   loc="$(state_get '.location_name')"
 
@@ -1685,7 +1778,8 @@ render_info() {
 ==============================
 ysq sing-box 节点信息
 ==============================
-服务器地址: ${server_ip}
+服务器 IPv4: ${v4}
+服务器 IPv6: ${v6}
 自动命名: ${flag}${loc}
 UUID: ${uuid}
 REALITY PrivateKey: ${private_key}
@@ -1714,14 +1808,21 @@ INFO
     tag="$(echo "$node" | jq -r '.tag')"
     name="$(echo "$node" | jq -r '.name')"
     port="$(echo "$node" | jq -r '.port')"
+    addr_type="$(echo "$node" | jq -r '.address_type // "ipv4"')"
     encoded_name="$(url_encode "$name")"
+
+    if [ "$addr_type" = "ipv6" ]; then
+      node_ip="[${v6}]"
+    else
+      node_ip="${v4}"
+    fi
 
     case "$type" in
       vless-direct|vless-relay)
-        link="vless://${uuid}@${server_ip}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reality_sni}&fp=chrome&pbk=${public_key}&sid=${short_id}&type=tcp&headerType=none#${encoded_name}"
+        link="vless://${uuid}@${node_ip}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reality_sni}&fp=chrome&pbk=${public_key}&sid=${short_id}&type=tcp&headerType=none#${encoded_name}"
         ;;
       tuic-direct|tuic-relay)
-        link="tuic://${uuid}:${tuic_pass}@${server_ip}:${port}?congestion_control=bbr&alpn=h3&sni=${tuic_sni}&allow_insecure=1#${encoded_name}"
+        link="tuic://${uuid}:${tuic_pass}@${node_ip}:${port}?congestion_control=bbr&alpn=h3&sni=${tuic_sni}&allow_insecure=1#${encoded_name}"
         ;;
       *)
         link=""
@@ -1732,6 +1833,7 @@ INFO
       echo "=============================="
       echo "${name}"
       echo "类型: $(node_type_name "$type")"
+      echo "绑定网络: ${addr_type^^}"
       echo "入口端口: ${port}"
       echo "入口 tag: ${tag}"
 
@@ -1752,8 +1854,8 @@ INFO
 render_yaml() {
   need_state
 
-  local uuid public_key short_id tuic_pass reality_sni tuic_sni server_ip
-  local type name port
+  local uuid public_key short_id tuic_pass reality_sni tuic_sni v4 v6
+  local type name port addr_type node_ip
 
   uuid="$(state_get '.uuid')"
   public_key="$(state_get '.public_key')"
@@ -1761,7 +1863,8 @@ render_yaml() {
   tuic_pass="$(state_get '.tuic_pass')"
   reality_sni="$(state_get '.reality_sni')"
   tuic_sni="$(state_get '.tuic_sni')"
-  server_ip="$(state_get '.server_ip')"
+  v4="$(state_get '.server_ipv4')"
+  v6="$(state_get '.server_ipv6')"
 
   cat > "$YAML_FILE" <<YAML
 mixed-port: 7890
@@ -1789,6 +1892,13 @@ YAML
     type="$(echo "$node" | jq -r '.type')"
     name="$(echo "$node" | jq -r '.name')"
     port="$(echo "$node" | jq -r '.port')"
+    addr_type="$(echo "$node" | jq -r '.address_type // "ipv4"')"
+    
+    if [ "$addr_type" = "ipv6" ]; then
+      node_ip="${v6}"
+    else
+      node_ip="${v4}"
+    fi
 
     case "$type" in
       vless-direct|vless-relay)
@@ -1796,7 +1906,7 @@ YAML
           printf '  - name: %s\n' "$(yaml_quote "$name")"
           cat <<YAML
     type: vless
-    server: ${server_ip}
+    server: ${node_ip}
     port: ${port}
     uuid: ${uuid}
     network: tcp
@@ -1816,7 +1926,7 @@ YAML
           printf '  - name: %s\n' "$(yaml_quote "$name")"
           cat <<YAML
     type: tuic
-    server: ${server_ip}
+    server: ${node_ip}
     port: ${port}
     uuid: ${uuid}
     password: ${tuic_pass}
@@ -1908,14 +2018,21 @@ list_nodes_table() {
     return 0
   fi
 
-  printf "%-4s %-30s %-20s %-8s %s\n" "序号" "节点名" "类型" "端口" "落地"
-  printf "%-4s %-30s %-20s %-8s %s\n" "----" "------------------------------" "--------------------" "------" "----------------"
+  printf "%-4s %-28s %-18s %-6s %-6s %s\n" "序号" "节点名" "类型" "网络" "端口" "落地"
+  printf "%-4s %-28s %-18s %-6s %-6s %s\n" "----" "----------------------------" "------------------" "------" "------" "----------------"
 
   jq -c '.nodes[]' "$STATE_FILE" | nl -w1 -s' ' | while read -r idx node; do
-    local name type port landing
+    local name type port addr_type net_str landing
     name="$(echo "$node" | jq -r '.name')"
     type="$(node_type_name "$(echo "$node" | jq -r '.type')")"
     port="$(echo "$node" | jq -r '.port')"
+    addr_type="$(echo "$node" | jq -r '.address_type // "ipv4"')"
+    
+    if [ "$addr_type" = "ipv6" ]; then
+      net_str="IPv6"
+    else
+      net_str="IPv4"
+    fi
 
     if echo "$node" | jq -e 'has("landing_server")' >/dev/null 2>&1; then
       landing="$(echo "$node" | jq -r '.landing_server + ":" + (.landing_port|tostring)')"
@@ -1923,7 +2040,7 @@ list_nodes_table() {
       landing="-"
     fi
 
-    printf "%-4s %-30s %-20s %-8s %s\n" "$idx" "$name" "$type" "$port" "$landing"
+    printf "%-4s %-28s %-18s %-6s %-6s %s\n" "$idx" "$name" "$type" "$net_str" "$port" "$landing"
   done
 }
 
@@ -2114,6 +2231,7 @@ install_wizard() {
   echo -e "${C_BOLD}==============================${C_RESET}"
   echo -e "${C_BOLD} ysq sing-box 一键安装脚本${C_RESET}"
   echo -e "${C_BOLD} VLESS / TUIC / VLESS中转 / TUIC中转${C_RESET}"
+  echo -e "${C_BOLD} (支持 IPv4/IPv6 双栈网络选择)${C_RESET}"
   echo -e "${C_BOLD}==============================${C_RESET}"
   echo
 
