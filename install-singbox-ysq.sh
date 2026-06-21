@@ -34,8 +34,8 @@ DEFAULT_PUBLIC_KEY="pyrWuKuPUx-bt6NOFvugQEszO8XR2qYeKZhVw_dysCM"
 DEFAULT_SHORT_ID="884158a048b01725"
 DEFAULT_TUIC_PASS="884158a048b01725"
 
-REALITY_SNI="www.microsoft.com"
-TUIC_SNI="www.bing.com"
+REALITY_SNI="www.nvidia.com"
+TUIC_SNI="www.nvidia.com"
 
 CONFIG_DIR="/etc/sing-box"
 CONFIG_FILE="/etc/sing-box/config.json"
@@ -1063,10 +1063,8 @@ JSON
 }
 
 ask_landing_params() {
-  LANDING_SERVER="$(ask_text_default "请输入落地节点 IP 或域名，不能填 0.0.0.0" "")"
-  if [ "$LANDING_SERVER" = "0.0.0.0" ]; then
-    die "落地地址不能是 0.0.0.0。"
-  fi
+  LANDING_SERVER="$(ask_text_default "请输入落地节点 IP 或域名" "")"
+
 
   LANDING_PORT="$(ask_port "请输入落地节点 VLESS 端口" "$VLESS_DIRECT_PORT")"
   LANDING_UUID="$(ask_text_default "请输入落地 VLESS UUID" "$(state_get '.uuid')")"
@@ -1344,20 +1342,21 @@ block_website_wizard() {
 modify_node_port_wizard() {
   need_state
 
-  local count index old_port new_port old_tag new_tag type name tmp
+  local count index old_port new_port old_tag type name tmp
+  local change_port change_sni new_sni
 
   count="$(jq '.nodes | length' "$STATE_FILE")"
   if [ "$count" -eq 0 ]; then
-    warn "当前没有可修改端口的节点。"
+    warn "当前没有可修改的节点。"
     pause
     return 0
   fi
 
-  step "修改节点端口"
+  step "修改节点 (端口 / SNI)"
 
   list_nodes_table
   echo
-  read -rp "请输入要修改端口的节点序号，输入 0 返回: " index
+  read -rp "请输入要修改的节点序号，输入 0 返回: " index
 
   if [ "$index" = "0" ]; then
     return 0
@@ -1369,45 +1368,123 @@ modify_node_port_wizard() {
     return 1
   fi
 
-  old_port="$(jq -r --argjson i "$((index-1))" '.nodes[$i].port' "$STATE_FILE")"
-  old_tag="$(jq -r --argjson i "$((index-1))" '.nodes[$i].tag' "$STATE_FILE")"
-  type="$(jq -r --argjson i "$((index-1))" '.nodes[$i].type' "$STATE_FILE")"
-  name="$(jq -r --argjson i "$((index-1))" '.nodes[$i].name' "$STATE_FILE")"
+  local real_idx=$((index-1))
+  type="$(jq -r --argjson i "$real_idx" '.nodes[$i].type' "$STATE_FILE")"
+  name="$(jq -r --argjson i "$real_idx" '.nodes[$i].name' "$STATE_FILE")"
+  old_port="$(jq -r --argjson i "$real_idx" '.nodes[$i].port' "$STATE_FILE")"
+  old_tag="$(jq -r --argjson i "$real_idx" '.nodes[$i].tag' "$STATE_FILE")"
 
-  new_port="$(ask_port "请输入「${name}」的新端口" "$old_port")"
+  # 显示当前信息
+  echo "节点名称: ${name}"
+  echo "类型: $(node_type_name "$type")"
+  echo "当前端口: ${old_port}"
 
-  if [ "$new_port" = "$old_port" ]; then
-    warn "端口没有变化。"
+  # 根据类型显示当前 SNI
+  local current_sni sni_field
+  case "$type" in
+    vless-direct)
+      current_sni="$(state_get '.reality_sni')"
+      echo "当前全局 VLESS SNI: ${current_sni}"
+      sni_field="reality_sni"
+      ;;
+    tuic-direct)
+      current_sni="$(state_get '.tuic_sni')"
+      echo "当前全局 TUIC SNI: ${current_sni}"
+      sni_field="tuic_sni"
+      ;;
+    vless-relay|tuic-relay)
+      current_sni="$(jq -r --argjson i "$real_idx" '.nodes[$i].landing_sni' "$STATE_FILE")"
+      echo "当前落地 SNI: ${current_sni}"
+      sni_field="landing_sni"
+      ;;
+  esac
+
+  echo
+  read -rp "是否修改端口？(y/N) " change_port
+  change_port="${change_port:-n}"
+
+  if [[ "$change_port" =~ ^[Yy]$ ]]; then
+    new_port="$(ask_port "请输入「${name}」的新端口" "$old_port")"
+    if [ "$new_port" = "$old_port" ]; then
+      warn "端口没有变化。"
+      change_port="n"
+    else
+      check_port_available "$new_port" "$old_tag"
+    fi
+  fi
+
+  read -rp "是否修改 SNI？(y/N) " change_sni
+  change_sni="${change_sni:-n}"
+
+  if [[ "$change_sni" =~ ^[Yy]$ ]]; then
+    new_sni="$(ask_text_default "请输入新的 SNI" "$current_sni")"
+    if [ "$new_sni" = "$current_sni" ]; then
+      warn "SNI 没有变化。"
+      change_sni="n"
+    fi
+  fi
+
+  # 若没有实际修改则退出
+  if [[ "$change_port" != [Yy] ]] && [[ "$change_sni" != [Yy] ]]; then
+    warn "未做任何修改。"
     sleep 1
     return 0
   fi
 
-  check_port_available "$new_port" "$old_tag"
-  new_tag="${type}-${new_port}"
-
-  read -rp "确认把「${name}」端口从 ${old_port} 改为 ${new_port}？输入 y 确认: " confirm
+  # 确认操作
+  echo
+  echo "即将应用以下修改："
+  [[ "$change_port" =~ ^[Yy]$ ]] && echo "  - 端口: ${old_port} → ${new_port}"
+  [[ "$change_sni"  =~ ^[Yy]$ ]] && echo "  - SNI : ${current_sni} → ${new_sni}"
+  if [ "$sni_field" = "reality_sni" ] || [ "$sni_field" = "tuic_sni" ]; then
+    echo "  注意：修改全局 SNI 会影响所有同类型节点。"
+  fi
+  read -rp "确认修改？输入 y 继续: " confirm
   if [ "$confirm" != "y" ]; then
     warn "已取消修改。"
     sleep 1
     return 0
   fi
 
+  # 逐项更新状态文件
   tmp="$(mktemp)"
-  jq \
-    --argjson i "$((index-1))" \
-    --argjson port "$new_port" \
-    --arg tag "$new_tag" \
-    '.nodes[$i].port = $port | .nodes[$i].tag = $tag' \
-    "$STATE_FILE" > "$tmp"
+  cp "$STATE_FILE" "$tmp"
+
+  if [[ "$change_port" =~ ^[Yy]$ ]]; then
+    local new_tag="${type}-${new_port}"
+    jq --argjson i "$real_idx" \
+       --argjson port "$new_port" \
+       --arg tag "$new_tag" \
+       '.nodes[$i].port = $port | .nodes[$i].tag = $tag' \
+       "$tmp" > "${tmp}.1" && mv "${tmp}.1" "$tmp"
+  fi
+
+  if [[ "$change_sni" =~ ^[Yy]$ ]]; then
+    case "$sni_field" in
+      reality_sni)
+        jq --arg sni "$new_sni" '.reality_sni = $sni' "$tmp" > "${tmp}.1" && mv "${tmp}.1" "$tmp"
+        ;;
+      tuic_sni)
+        jq --arg sni "$new_sni" '.tuic_sni = $sni' "$tmp" > "${tmp}.1" && mv "${tmp}.1" "$tmp"
+        # 删除旧证书，让后续 render 重新生成
+        rm -f "$CERT_FILE" "$KEY_FILE"
+        warn "TUIC 证书已清除，重启后将自动重新生成。"
+        ;;
+      landing_sni)
+        jq --argjson i "$real_idx" --arg sni "$new_sni" \
+           '.nodes[$i].landing_sni = $sni' "$tmp" > "${tmp}.1" && mv "${tmp}.1" "$tmp"
+        ;;
+    esac
+  fi
+
   mv "$tmp" "$STATE_FILE"
-  
   chown sing-box:sing-box "$STATE_FILE" 2>/dev/null || true
   chmod 600 "$STATE_FILE"
 
   render_all
   restart_singbox
 
-  ok "已修改端口：${name} ${old_port} -> ${new_port}"
+  ok "节点修改完成。"
   sleep 1
 }
 
@@ -2142,7 +2219,7 @@ panel_menu() {
     echo "3) 查看 sing-box 状态 / 监听端口"
     echo "4) 添加节点"
     echo "5) 删除节点 (支持批量)"
-    echo "6) 修改节点端口"
+    echo "6) 修改节点 (端口 / SNI)"
     echo "7) 屏蔽指定网站管理"
     echo "8) 更新 sing-box 内核"
     echo "9) 重启 sing-box"
