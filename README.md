@@ -1,17 +1,22 @@
 # 🚀 sing-box 一键安装与管理面板
 
-## 📥 一键安装与部署
-
 ### 1. 默认极速安装（推荐）
 指定端口并使用默认安全参数：
 ```bash
-curl -Ls -o install-singbox-ysq.sh https://raw.githubusercontent.com/showcode1024/singbox-auto/main/install-singbox-ysq.sh && bash install-singbox-ysq.sh vless=20001 tuic=20002 safe=0
+curl -Ls -o install-singbox-ysq.sh https://raw.githubusercontent.com/showcode1024/singbox-auto/main/install-singbox-ysq.sh && bash install-singbox-ysq.sh vless=34567 tuic=34567 safe=0
 ```
 ### 2. 纯交互式菜单安装
 不带任何参数执行，将启动完整交互式向导：
 ```bash
 curl -Ls -o install-singbox-ysq.sh https://raw.githubusercontent.com/showcode1024/singbox-auto/main/install-singbox-ysq.sh && bash install-singbox-ysq.sh
 ```
+## 📖 命令行参数详解
+
+| 参数名称 | 示例值 | 说明 |
+| :--- | :--- | :--- |
+| `vless` | `vless=20001` | 指定 VLESS 节点端口。端口需在 `10000-65535` 之间；设置为 `0` 表示不安装 VLESS 节点。低于 10000 会要求重新输入。 |
+| `tuic` | `tuic=20002` | 指定 TUIC v5 节点端口。端口需在 `10000-65535` 之间；设置为 `0` 表示不安装 TUIC 节点。低于 10000 会要求重新输入。 |
+| `safe` | `safe=0` | **安全模式开关**：<br>• `0`：静默使用预设默认 UUID、Reality 私钥、公钥及 SNI，跳过提问。<br>• `1`：弹出菜单询问是否全新生成随机 UUID 与密钥对。 |
 
 ---
 
@@ -55,15 +60,7 @@ ysq
 
 ---
 
-## 📖 命令行参数详解
 
-| 参数名称 | 示例值 | 说明 |
-| :--- | :--- | :--- |
-| `vless` | `vless=20001` | 指定 VLESS 节点端口。端口需在 `10000-65535` 之间；设置为 `0` 表示不安装 VLESS 节点。低于 10000 会要求重新输入。 |
-| `tuic` | `tuic=20002` | 指定 TUIC v5 节点端口。端口需在 `10000-65535` 之间；设置为 `0` 表示不安装 TUIC 节点。低于 10000 会要求重新输入。 |
-| `safe` | `safe=0` | **安全模式开关**：<br>• `0`：静默使用预设默认 UUID、Reality 私钥、公钥及 SNI，跳过提问。<br>• `1`：弹出菜单询问是否全新生成随机 UUID 与密钥对。 |
-
----
 
 ## 📂 文件与路径结构
 
