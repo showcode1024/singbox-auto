@@ -3,11 +3,9 @@
 ## 📥 一键安装与部署
 
 ### 1. 默认极速安装（推荐）
-指定端口并使用默认安全参数（`safe=0` 免去一切交互确认，端口需 $\ge 10000$）：
+指定端口并使用默认安全参数：
 ```bash
 curl -Ls -o install-singbox-ysq.sh https://raw.githubusercontent.com/showcode1024/singbox-auto/main/install-singbox-ysq.sh && bash install-singbox-ysq.sh vless=20001 tuic=20002 safe=0
-```
-
 ```
 ### 2. 纯交互式菜单安装
 不带任何参数执行，将启动完整交互式向导：
