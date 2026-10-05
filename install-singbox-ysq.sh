@@ -2030,7 +2030,7 @@ render_config() {
 
     {
       "log": {
-        "level": "info",
+        "level": "error",
         "timestamp": true
       },
       "inbounds": [
