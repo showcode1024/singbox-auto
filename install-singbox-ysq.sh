@@ -8,28 +8,39 @@ set -euo pipefail
 #   - TUIC v5 直出 / 中转
 #   - TCP / UDP 端口支持复用（同端口可分别运行 VLESS 和 TUIC）
 #   - 独立落地节点池（查看 / 添加 / 修改 IP 端口 / 删除，显示为“国家：ip”）
-#   - 命令行快速安装参数（vless=xxx tuic=xxx safe=0）
+#   - 命令行安装参数（vless=端口 tuic=端口 -y）：无参数只装 sing-box 不建节点；-y 静默使用预设密钥
+#   - 卸载可选「彻底删除」或「保留节点数据」；安装时发现有效的 ysq-state.db 会直接沿用，不覆盖
+#   - 面板内一键「更新面板」（从 GitHub 下载新脚本，保留全部数据）
 #   - 面板随时添加 / 删除 / 修改节点端口及落地出口
-#   - 屏蔽指定网站管理
-#   - 支持 IPv4 / IPv6 入口地址选择
+#   - 屏蔽指定网站管理（支持批量添加与批量删除，自动启用 sniff 保证规则生效）
+#   - 支持 IPv4 / IPv6 入口地址选择与纯 IPv6 环境（地区检测多源 + 手动兜底）
+#   - 节点入站端口要求 10000 及以上（落地节点的远端端口不受此限制）
 #   - 支持 Debian / Ubuntu / CentOS / Rocky / AlmaLinux / Alpine
 #
 # 设计要点：
 #   - 落地信息只保存在落地池 (.landings)，节点只通过 landing_id 引用
 #   - 所有修改先写临时文件；配置通过 sing-box check 后才替换；失败自动回滚 state
 #   - 面板里每个操作都在子 shell 中运行，die 只会中止当前操作，不会退出面板
+#   - 节点管理与落地管理解耦：落地的增删改只在「落地节点池管理」里做，节点只能选择已有落地
+#   - Alpine(OpenRC)：日志写入单个文件，busybox cron 每小时检查，达 9MB 裁剪、保留最后 2MB
 # ============================================================
+
+YSQ_VERSION="2026.10.15"
+INSTALLER_NAME="install-singbox-ysq.sh"
+DEFAULT_SCRIPT_URL="https://raw.githubusercontent.com/showcode1024/singbox-auto/main/install-singbox-ysq.sh"
 
 # -------------------------
 # 默认端口
 # -------------------------
+# 节点（入站）端口下限：低于该值一律拒绝（同时也避开了 1024 以下需要特权的端口）
+MIN_NODE_PORT=10000
 VLESS_DIRECT_PORT=20001
 TUIC_DIRECT_PORT=20002
 VLESS_RELAY_PORT=20003
 TUIC_RELAY_PORT=20004
 
 # -------------------------
-# 默认参数（safe=0 时使用）
+# 预设默认参数（命令行加 -y，或交互时选择“使用默认参数”时使用）
 # -------------------------
 DEFAULT_UUID="a1126537-6b28-4fd3-856c-2514a7626a8b"
 DEFAULT_PRIVATE_KEY="GOThQzAstrApbL92Kb-BU_7GXKOrRfNDQMK74qrEB0g"
@@ -47,6 +58,12 @@ CERT_DIR="/etc/sing-box/cert"
 CERT_FILE="/etc/sing-box/cert/tuic.crt"
 KEY_FILE="/etc/sing-box/cert/tuic.key"
 CERT_SNI_FILE="/etc/sing-box/cert/tuic.sni"
+LOG_DIR="/var/log/sing-box"
+LOG_FILE="/var/log/sing-box/sing-box.log"
+# 日志裁剪（仅 OpenRC / Alpine 使用 busybox cron；systemd 的日志由 journald 管理）
+LOG_TRIM_MAX_MB=9      # 日志文件达到 9MB 时触发裁剪
+LOG_TRIM_KEEP_MB=2     # 裁剪后保留最后 2MB
+LOG_TRIM_SCRIPT="/etc/periodic/hourly/ysq-singbox-log-trim"
 INFO_FILE="/root/singbox-node-info.txt"
 YAML_FILE="/root/singbox-nodes.yaml"
 PANEL_FILE="/usr/local/bin/ysq"
@@ -56,6 +73,10 @@ INSTALLER_FILE="/root/install-singbox-ysq.sh"
 CANCEL_RC=3
 # 约定：卸载完成后返回 99，让面板整体退出
 EXIT_PANEL_RC=99
+# 约定：更新面板完成后返回 98，由主 shell 用 exec 原地换成新面板（不留下嵌套的旧面板进程）
+RESTART_PANEL_RC=98
+# ysq 快捷命令是否安装成功（save_self 成功才会置 1）
+PANEL_READY=0
 
 # -------------------------
 # 颜色输出（需要在参数解析之前定义）
@@ -99,7 +120,14 @@ pause() { echo; read -rp "按回车返回..." _ || true; }
 # -------------------------
 WORK_DIR="/tmp/ysq-work.$$"
 
+# 安装流程里为“覆盖状态文件前”留的备份；安装成功会删除它，退出时它还在就说明安装中途失败，
+# 此时把状态恢复到安装前，并且不留下 .prev 残留
+INSTALL_PREV_FILE=""
+
 cleanup_tmp() {
+  if [ -n "$INSTALL_PREV_FILE" ] && [ -f "$INSTALL_PREV_FILE" ]; then
+    mv -f "$INSTALL_PREV_FILE" "$STATE_FILE" 2>/dev/null || true
+  fi
   rm -rf "$WORK_DIR" 2>/dev/null || true
   rm -f "${STATE_FILE}".tmp.* "${CONFIG_FILE}".tmp.* 2>/dev/null || true
 }
@@ -118,16 +146,22 @@ new_work_dir() {
 # -------------------------
 CLI_VLESS=""
 CLI_TUIC=""
-CLI_SAFE=""
+CLI_YES=""
 ACTION=""
 
 usage() {
   cat <<EOF
 用法：
-  bash $0                                    # 交互式安装
-  bash $0 vless=20001 tuic=20002 safe=0      # 快速指定端口安装（端口 1-65535，0 表示不创建）
-  bash $0 panel                              # 打开管理面板
-  bash $0 render                             # 重新生成配置并重启
+  bash ${INSTALLER_NAME}                                   # 只安装 sing-box，不创建任何节点（会询问是否全新生成 UUID / 密钥）
+  bash ${INSTALLER_NAME} vless=41454 tuic=41454            # 安装并创建节点（端口 ${MIN_NODE_PORT}-65535，0 表示不创建），仍会询问密钥
+  bash ${INSTALLER_NAME} vless=41454 tuic=41454 -y         # 静默：使用预设 UUID / Reality 密钥 / SNI，不提任何问题
+  bash ${INSTALLER_NAME} panel                             # 打开管理面板
+  bash ${INSTALLER_NAME} render                            # 重新生成配置并重启
+  bash ${INSTALLER_NAME} upgrade                           # 应用新版脚本（刷新服务 / 重新渲染 / 重启，保留数据）
+
+说明：
+  - 已存在有效的 ${STATE_FILE} 时直接沿用其中的 UUID / 密钥 / 节点，不会覆盖。
+  - 节点端口必须 >= ${MIN_NODE_PORT}，低于该值会直接报错退出。
 EOF
 }
 
@@ -144,13 +178,14 @@ for arg in "$@"; do
   case "$arg" in
     vless=*) CLI_VLESS="${arg#*=}" ;;
     tuic=*)  CLI_TUIC="${arg#*=}" ;;
-    safe=*)  CLI_SAFE="${arg#*=}" ;;
-    panel|render|install) set_action "$arg" ;;
+    -y|--yes) CLI_YES="1" ;;
+    panel|render|install|upgrade) set_action "$arg" ;;
     -h|--help|help) usage; exit 0 ;;
     *)
       err "未知参数：${arg}"
       case "$arg" in
-        vless|tuic|safe) warn "参数格式应为 ${arg}=值，例如 ${arg}=20001（等号两边不要有空格）。" ;;
+        vless|tuic) warn "参数格式应为 ${arg}=值，例如 ${arg}=41454（等号两边不要有空格）。" ;;
+        safe=*)     warn "safe= 参数已取消，静默安装请改用 -y。" ;;
       esac
       usage >&2
       exit 1
@@ -160,10 +195,10 @@ done
 
 ACTION="${ACTION:-install}"
 
-# 显式写了 vless= / tuic= / safe= 但值为空
+# 显式写了 vless= / tuic= 但值为空
 for arg in "$@"; do
   case "$arg" in
-    vless=|tuic=|safe=)
+    vless=|tuic=)
       err "参数 ${arg} 的值不能为空。"
       usage >&2
       exit 1
@@ -171,14 +206,8 @@ for arg in "$@"; do
   esac
 done
 
-if [ -n "$CLI_SAFE" ] && [ "$CLI_SAFE" != "0" ] && [ "$CLI_SAFE" != "1" ]; then
-  err "safe 参数只能是 0 或 1，当前为：${CLI_SAFE}"
-  usage >&2
-  exit 1
-fi
-
-if [ "$ACTION" != "install" ] && { [ -n "$CLI_VLESS" ] || [ -n "$CLI_TUIC" ] || [ -n "$CLI_SAFE" ]; }; then
-  err "vless= / tuic= / safe= 只能用于安装模式。"
+if [ "$ACTION" != "install" ] && { [ -n "$CLI_VLESS" ] || [ -n "$CLI_TUIC" ] || [ -n "$CLI_YES" ]; }; then
+  err "vless= / tuic= / -y 只能用于安装模式。"
   usage >&2
   exit 1
 fi
@@ -272,6 +301,49 @@ pkg_remove_singbox() {
     yum) yum remove -y sing-box 2>/dev/null || true ;;
     apk) apk del sing-box 2>/dev/null || true ;;
   esac
+}
+
+# sing-box 是否由系统包管理器（apt / dnf / yum）安装。
+# Alpine 的 .apk 是从 GitHub 下载后安装的，apk upgrade 取不到新版，仍走原来的下载安装流程。
+pkg_managed_singbox() {
+  case "$PKG_MANAGER" in
+    apt)     dpkg-query -W -f='${Status}' sing-box 2>/dev/null | grep -q 'install ok installed' ;;
+    dnf|yum) rpm -q sing-box >/dev/null 2>&1 ;;
+    *)       return 1 ;;
+  esac
+}
+
+# 用包管理器升级 / 重装 sing-box。$1: upgrade | reinstall
+# 不能先删二进制再跑官方 install.sh：包管理器认为包仍是已安装状态，install 什么都不会做。
+pkg_upgrade_singbox() {
+  local mode="${1:-upgrade}"
+
+  case "$PKG_MANAGER" in
+    apt)
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update || warn "apt-get update 失败，继续尝试。"
+      if [ "$mode" = "reinstall" ]; then
+        apt-get install -y --reinstall sing-box
+      else
+        apt-get install -y --only-upgrade sing-box
+      fi
+      ;;
+    dnf|yum)
+      "$PKG_MANAGER" makecache -y || true
+      if [ "$mode" = "reinstall" ]; then
+        "$PKG_MANAGER" reinstall -y sing-box
+      else
+        "$PKG_MANAGER" upgrade -y sing-box
+      fi
+      ;;
+    *)
+      die "当前系统的 sing-box 不是由包管理器安装的。"
+      ;;
+  esac
+
+  hash -r 2>/dev/null || true
+  singbox_bin_works "$(command -v sing-box 2>/dev/null || true)" || die "升级后的 sing-box 无法运行。"
+  ensure_singbox_service
 }
 
 nologin_shell() {
@@ -467,6 +539,73 @@ install_if_changed() {
   install -m "$mode" "$src" "$dest"
 }
 
+# 生成日志裁剪脚本：文件 >= MAX 字节时只保留最后 KEEP 字节
+write_log_trim_script() {
+  local dest="$1"
+  local max_bytes=$((LOG_TRIM_MAX_MB * 1024 * 1024))
+  local keep_bytes=$((LOG_TRIM_KEEP_MB * 1024 * 1024))
+
+  cat > "$dest" <<'TRIM'
+#!/bin/sh
+# ysq: sing-box 日志裁剪。由 install-singbox-ysq.sh 生成，重新安装 / 升级时会被覆盖。
+# 日志文件达到 MAX 字节时，只保留最后 KEEP 字节。
+LOG="@LOG@"
+MAX=@MAX@
+KEEP=@KEEP@
+
+[ -f "$LOG" ] || exit 0
+size=$(wc -c < "$LOG" 2>/dev/null | tr -d ' ')
+[ "${size:-0}" -ge "$MAX" ] || exit 0
+
+tmp="${LOG}.trim.$$"
+# 取最后 KEEP 字节；开头那一行大概率被截断，丢掉它
+if tail -c "$KEEP" "$LOG" | sed '1d' > "$tmp"; then
+  # 原地覆盖，不能 mv：sing-box 以追加模式持有这个文件，inode 不能换
+  cat "$tmp" > "$LOG"
+fi
+rm -f "$tmp"
+TRIM
+  sed -i -e "s|@LOG@|${LOG_FILE}|" -e "s|@MAX@|${max_bytes}|" -e "s|@KEEP@|${keep_bytes}|" "$dest"
+  chmod 755 "$dest"
+}
+
+# OpenRC(Alpine)：安装 busybox cron 的每小时裁剪任务，并确保 crond 已启用
+install_log_trim() {
+  [ "$SERVICE_MANAGER" = "openrc" ] || return 0
+
+  local wd
+
+  mkdir -p /etc/periodic/hourly
+  wd="$(new_work_dir)"
+  write_log_trim_script "$wd/trim"
+  install_if_changed "$wd/trim" "$LOG_TRIM_SCRIPT" 755 || true
+  rm -rf "$wd"
+
+  # 旧版本留下的 .err 日志不再使用
+  rm -f "${LOG_DIR}/sing-box.err"
+
+  # busybox crond 靠 root 的 crontab 调用 run-parts；缺了就补上
+  mkdir -p /etc/crontabs
+  if [ ! -f /etc/crontabs/root ]; then
+    : > /etc/crontabs/root
+    chmod 600 /etc/crontabs/root
+  fi
+  if ! grep -q 'periodic/hourly' /etc/crontabs/root 2>/dev/null; then
+    echo '0 * * * * run-parts /etc/periodic/hourly' >> /etc/crontabs/root
+  fi
+
+  if [ -x /etc/init.d/crond ]; then
+    rc-update add crond default >/dev/null 2>&1 || true
+    rc-service crond status >/dev/null 2>&1 || rc-service crond start >/dev/null 2>&1 || true
+  else
+    warn "未找到 crond 服务，sing-box 日志不会自动裁剪（可手动 apk add busybox-openrc 后重试）。"
+  fi
+}
+
+remove_log_trim() {
+  rm -f "$LOG_TRIM_SCRIPT"
+}
+
 # 只在安装 / 更新内核时调用；restart_singbox 不再重写 unit
 ensure_singbox_service() {
   local wd
@@ -495,7 +634,7 @@ Wants=network.target
 User=sing-box
 Group=sing-box
 Type=simple
-ExecStart=${SING_BOX_BIN} -D /var/lib/sing-box -C /etc/sing-box run
+ExecStart=${SING_BOX_BIN} -D /var/lib/sing-box -c /etc/sing-box/config.json run
 Restart=on-failure
 RestartSec=10s
 LimitNOFILE=infinity
@@ -512,12 +651,13 @@ EOF
 #!/sbin/openrc-run
 description="sing-box service"
 command="${SING_BOX_BIN}"
-command_args="-D /var/lib/sing-box -C /etc/sing-box run"
+command_args="-D /var/lib/sing-box -c /etc/sing-box/config.json run"
 command_user="sing-box:sing-box"
 command_background="yes"
 pidfile="/run/sing-box.pid"
-output_log="/var/log/sing-box/sing-box.log"
-error_log="/var/log/sing-box/sing-box.err"
+# stdout 与 stderr 都追加（O_APPEND）写入同一个文件，方便 cron 原地裁剪
+output_log="${LOG_FILE}"
+error_log="${LOG_FILE}"
 
 start_pre() {
   checkpath -d -m 0755 -o sing-box:sing-box /var/lib/sing-box
@@ -530,6 +670,7 @@ depend() {
 }
 EOF
       install_if_changed "$wd/unit" /etc/init.d/sing-box 755 || true
+      install_log_trim
       ;;
     none)
       warn "未检测到 systemd/openrc，将使用 nohup 后台方式管理 sing-box。"
@@ -561,10 +702,20 @@ service_stop() {
     openrc) rc-service sing-box stop 2>/dev/null || true ;;
     none)
       if [ -f /run/sing-box.pid ]; then
-        kill "$(cat /run/sing-box.pid)" 2>/dev/null || true
+        local old_pid i
+        old_pid="$(cat /run/sing-box.pid 2>/dev/null || true)"
+        if [ -n "$old_pid" ]; then
+          kill "$old_pid" 2>/dev/null || true
+          # 等旧进程真正退出（最多 15 秒），否则重启时新进程可能和旧进程抢端口
+          for i in $(seq 1 15); do
+            kill -0 "$old_pid" 2>/dev/null || break
+            sleep 1
+          done
+          kill -0 "$old_pid" 2>/dev/null && kill -9 "$old_pid" 2>/dev/null || true
+        fi
         rm -f /run/sing-box.pid
       fi
-      pkill -f "sing-box.*-C /etc/sing-box run" 2>/dev/null || true
+      pkill -f "sing-box.*-[cC] /etc/sing-box.*run" 2>/dev/null || true
       ;;
   esac
 }
@@ -588,13 +739,13 @@ service_restart() {
     openrc)
       if ! rc-service sing-box restart; then
         err "rc-service sing-box restart 失败。"
-        tail -n 20 /var/log/sing-box/sing-box.err 2>/dev/null >&2 || true
+        tail -n 20 "$LOG_FILE" 2>/dev/null >&2 || true
         return 1
       fi
       sleep 1
       if ! rc-service sing-box status >/dev/null 2>&1; then
         err "sing-box 启动后异常退出。"
-        tail -n 20 /var/log/sing-box/sing-box.err 2>/dev/null >&2 || true
+        tail -n 20 "$LOG_FILE" 2>/dev/null >&2 || true
         return 1
       fi
       ;;
@@ -607,11 +758,17 @@ service_restart() {
       fi
       install -d -m 755 -o sing-box -g sing-box /var/lib/sing-box /var/log/sing-box 2>/dev/null \
         || mkdir -p /var/lib/sing-box /var/log/sing-box
-      nohup "$SING_BOX_BIN" -D /var/lib/sing-box -C /etc/sing-box run > /var/log/sing-box/sing-box.log 2>&1 &
+      # 没有 cron 可用：每次启动前（进程已停）顺手裁剪一次，并用追加模式写日志
+      local trim_wd
+      trim_wd="$(new_work_dir)"
+      write_log_trim_script "$trim_wd/trim"
+      sh "$trim_wd/trim" || true
+      rm -rf "$trim_wd"
+      nohup "$SING_BOX_BIN" -D /var/lib/sing-box -c /etc/sing-box/config.json run >> "$LOG_FILE" 2>&1 &
       echo $! > /run/sing-box.pid
       sleep 1
       if ! kill -0 "$(cat /run/sing-box.pid)" 2>/dev/null; then
-        cat /var/log/sing-box/sing-box.log >&2 || true
+        tail -n 20 "$LOG_FILE" >&2 || true
         err "sing-box 后台启动失败。"
         return 1
       fi
@@ -628,8 +785,7 @@ service_status() {
     openrc)
       rc-service sing-box status || true
       echo
-      tail -n 80 /var/log/sing-box/sing-box.log 2>/dev/null || true
-      tail -n 80 /var/log/sing-box/sing-box.err 2>/dev/null || true
+      tail -n 80 "$LOG_FILE" 2>/dev/null || true
       ;;
     none)
       if [ -f /run/sing-box.pid ] && kill -0 "$(cat /run/sing-box.pid)" 2>/dev/null; then
@@ -638,7 +794,7 @@ service_status() {
         warn "sing-box 未运行。"
       fi
       echo
-      tail -n 80 /var/log/sing-box/sing-box.log 2>/dev/null || true
+      tail -n 80 "$LOG_FILE" 2>/dev/null || true
       ;;
   esac
 }
@@ -649,6 +805,115 @@ service_daemon_reload() {
     openrc|none) return 0 ;;
   esac
 }
+
+# -------------------------
+# 状态栏辅助函数（运行状态 / 版本 / 内存）
+# -------------------------
+is_singbox_running() {
+  case "$SERVICE_MANAGER" in
+    systemd) systemctl is-active --quiet sing-box 2>/dev/null ;;
+    openrc)  rc-service sing-box status >/dev/null 2>&1 ;;
+    none)    [ -f /run/sing-box.pid ] && kill -0 "$(cat /run/sing-box.pid 2>/dev/null)" 2>/dev/null ;;
+  esac
+}
+
+get_singbox_pid() {
+  local pid=""
+  case "$SERVICE_MANAGER" in
+    systemd)
+      pid="$(systemctl show -p MainPID --value sing-box 2>/dev/null || true)"
+      [ "$pid" = "0" ] && pid=""
+      ;;
+    openrc|none)
+      if [ -f /run/sing-box.pid ]; then
+        pid="$(cat /run/sing-box.pid 2>/dev/null || true)"
+      fi
+      ;;
+  esac
+
+  if [ -z "$pid" ] && command -v pidof >/dev/null 2>&1; then
+    pid="$(pidof sing-box 2>/dev/null | awk '{print $1}' || true)"
+  fi
+  if [ -z "$pid" ] && command -v pgrep >/dev/null 2>&1; then
+    pid="$(pgrep -f "sing-box.*-[cC] /etc/sing-box.*run" 2>/dev/null | head -n 1 || true)"
+  fi
+  echo "$pid"
+}
+
+get_singbox_memory() {
+  local pid rss_kb=""
+  pid="$(get_singbox_pid)"
+  if [ -z "$pid" ]; then
+    echo "-"
+    return 0
+  fi
+
+  if [ -r "/proc/${pid}/status" ]; then
+    rss_kb="$(awk '/^VmRSS:/ {print $2}' "/proc/${pid}/status" 2>/dev/null || true)"
+  fi
+  if [ -z "$rss_kb" ] && command -v ps >/dev/null 2>&1; then
+    rss_kb="$(ps -o rss= -p "$pid" 2>/dev/null | awk '{print $1}' || true)"
+  fi
+
+  if [[ "$rss_kb" =~ ^[0-9]+$ ]] && [ "$rss_kb" -gt 0 ]; then
+    awk -v kb="$rss_kb" 'BEGIN { printf "%.1f MB", kb / 1024 }'
+  else
+    echo "-"
+  fi
+}
+
+print_status_bar() {
+  local status_str ver_str mem_str
+  if command -v sing-box >/dev/null 2>&1; then
+    ver_str="$(sing-box version 2>/dev/null | awk 'NR==1 {print $3}' || true)"
+    ver_str="${ver_str:+v${ver_str#v}}"
+    ver_str="${ver_str:-未知}"
+  else
+    ver_str="未安装"
+  fi
+
+  if is_singbox_running; then
+    status_str="${C_GREEN}● 运行中${C_RESET}"
+    mem_str="$(get_singbox_memory)"
+  else
+    status_str="${C_RED}○ 未运行${C_RESET}"
+    mem_str="-"
+  fi
+
+  echo -e "运行状态: ${status_str}  |  版本: ${C_BLUE}${ver_str}${C_RESET}  |  内存占用: ${C_YELLOW}${mem_str}${C_RESET}"
+}
+
+# -------------------------
+# 终端表格：按「显示宽度」补空格（中文 / 全角符号 / emoji 占 2 列，国旗按一对区域指示符合计 2 列，
+# 零宽连接符与变体选择符占 0 列）。区间采用 Unicode East Asian Wide / Fullwidth 的主要范围。
+# 注意：这是 jq 程序片段，会被拼接到各个表格的 jq 程序前面。
+# -------------------------
+JQ_TABLE_LIB='
+def dwidth:
+  [ explode[] | . as $c |
+    if $c == 8205 or $c == 65039 or ($c >= 768 and $c <= 879) then 0
+    elif $c >= 127462 and $c <= 127487 then 1
+    elif ($c >= 4352 and $c <= 4447)
+      or ($c >= 11904 and $c <= 42191)
+      or ($c >= 44032 and $c <= 55203)
+      or ($c >= 63744 and $c <= 64255)
+      or ($c >= 65040 and $c <= 65049)
+      or ($c >= 65072 and $c <= 65135)
+      or ($c >= 65281 and $c <= 65376)
+      or ($c >= 65504 and $c <= 65510)
+      or ($c >= 126976 and $c <= 129791)
+      or ($c >= 131072 and $c <= 262141) then 2
+    else 1 end
+  ] | add // 0;
+
+def pad($w):
+  tostring as $s |
+  ($w - ($s | dwidth)) as $p |
+  $s + ([range(0; if $p > 0 then $p else 0 end) | " "] | join(""));
+
+def dash($w):
+  [range(0; $w) | "-"] | join("");
+'
 
 # -------------------------
 # 通用工具
@@ -672,20 +937,35 @@ trim() {
   printf '%s' "$s"
 }
 
-# 端口范围 1-65535
+# 通用端口范围 1-65535（用于落地节点的远端端口）
 valid_port() {
   [[ "${1:-}" =~ ^[0-9]{1,5}$ ]] || return 1
   [ "$((10#$1))" -ge 1 ] && [ "$((10#$1))" -le 65535 ]
 }
 
+# 节点（入站）端口：MIN_NODE_PORT-65535
+valid_node_port() {
+  valid_port "${1:-}" && [ "$((10#$1))" -ge "$MIN_NODE_PORT" ]
+}
+
+# 读一行输入；stdin 已关闭（EOF）时直接中止当前操作，避免 set -e 下静默退出
+read_line() {
+  local __prompt="$1" __var="$2"
+  # shellcheck disable=SC2229
+  IFS= read -rp "$__prompt" "$__var" || die "无法读取输入（标准输入已关闭），请在交互终端中运行。"
+}
+
+# 用法：ask_port <提示> <默认值> [allow_zero=false] [最小端口=1]
+#   节点入站端口传 "$MIN_NODE_PORT"；落地节点远端端口用默认下限 1
 ask_port() {
   local name="$1"
   local default_port="$2"
   local allow_zero="${3:-false}"
+  local min_port="${4:-1}"
   local input_port=""
 
   while true; do
-    read -rp "$name [默认 ${default_port}]: " input_port
+    read_line "$name [默认 ${default_port}]: " input_port
     input_port="$(trim "$input_port")"
 
     if [ -z "$input_port" ]; then
@@ -698,12 +978,17 @@ ask_port() {
       return
     fi
 
-    if valid_port "$input_port"; then
+    if valid_port "$input_port" && [ "$((10#$input_port))" -ge "$min_port" ]; then
       echo "$((10#$input_port))"
       return
     fi
-    warn "端口输入错误，请输入 1-65535 之间的数字。"
+    warn "端口输入错误，请输入 ${min_port}-65535 之间的数字。"
   done
+}
+
+# 节点入站端口输入（>= MIN_NODE_PORT）
+ask_node_port() {
+  ask_port "$1" "$2" "${3:-false}" "$MIN_NODE_PORT"
 }
 
 ask_text_default() {
@@ -712,12 +997,12 @@ ask_text_default() {
   local input=""
 
   if [ -n "$default_value" ]; then
-    read -rp "$prompt [默认 ${default_value}]: " input
+    read_line "$prompt [默认 ${default_value}]: " input
     input="$(trim "$input")"
     echo "${input:-$default_value}"
   else
     while true; do
-      read -rp "$prompt: " input
+      read_line "$prompt: " input
       input="$(trim "$input")"
       if [ -n "$input" ]; then
         echo "$input"
@@ -742,27 +1027,180 @@ port_used() {
     "$STATE_FILE" >/dev/null 2>&1
 }
 
-# 区分 TCP/UDP 检查系统端口
+# 列出占用指定端口的监听行（TCP / UDP 分别查）。
+# 只比较「本地地址:端口」整段最后一个冒号之后的端口号，且必须整数相等：
+#   - 2000 不会误匹配 20001 / 12000
+#   - 不会被 IPv6 地址里的片段（如 [::1]:80 里的 :1）或远端端口、PID 数字误伤
+#   - 兼容 *:443 / 0.0.0.0:443 / [::]:443 / 127.0.0.53%lo:53
+port_listen_lines() {
+  local port="$1"
+  local proto="${2:-tcp}"
+  local ss_arg="-tlnp"
+
+  [ "$proto" = "udp" ] && ss_arg="-ulnp"
+  command -v ss >/dev/null 2>&1 || return 0
+
+  ss "$ss_arg" 2>/dev/null | awk -v p="$port" '
+    NR > 1 && NF >= 4 {
+      loc = $4
+      sub(/^.*:/, "", loc)
+      if (loc ~ /^[0-9]+$/ && (loc + 0) == (p + 0)) print $0
+    }'
+}
+
+# 检查端口是否可用。返回：0 可用 / CANCEL_RC 用户选择放弃 / 脚本内冲突时 die
+#   - 脚本内其他节点已用同协议同端口：直接拒绝
+#   - 系统里被「非 sing-box」进程监听：提示并让用户确认
+#   - 仅被 sing-box 自己监听（覆盖重装 / 旧配置残留）：视为可用，重启后由新配置接管
 check_port_available() {
   local port="$1"
   local proto="${2:-tcp}"
   local ignore_tag="${3:-}"
-  local confirm=""
+  local confirm="" lines="" foreign=""
 
   if port_used "$port" "$proto" "$ignore_tag"; then
     die "端口 ${port} (${proto^^}) 已经被当前脚本里的其他节点使用，请换一个端口。"
   fi
 
-  local ss_arg="-tlpn"
-  [ "$proto" = "udp" ] && ss_arg="-ulpn"
+  lines="$(port_listen_lines "$port" "$proto")"
+  [ -n "$lines" ] || return 0
 
-  if ss "$ss_arg" 2>/dev/null | awk '{print $4, $5}' | grep -Eq "[:.]${port}\\b"; then
-    warn "检测到系统里已有程序在 ${proto^^} 监听 ${port}。如果不是当前 sing-box 节点，请换端口。"
-    read -rp "仍然继续使用这个端口？输入 y 继续: " confirm
-    if [ "${confirm,,}" != "y" ]; then
-      die "已取消。"
-    fi
+  foreign="$(printf '%s\n' "$lines" | grep -v 'users:(("sing-box"' || true)"
+  if [ -z "$foreign" ]; then
+    info "端口 ${port} (${proto^^}) 当前由 sing-box 自身监听（旧配置），将在重启后由新配置接管。"
+    return 0
   fi
+
+  warn "检测到系统里已有其他程序在 ${proto^^} 监听 ${port}："
+  printf '%s\n' "$foreign" >&2
+  read_line "仍然继续使用这个端口？输入 y 继续: " confirm
+  if [ "${confirm,,}" != "y" ]; then
+    warn "已取消。"
+    return "$CANCEL_RC"
+  fi
+  return 0
+}
+
+# 主机名 / IP 合法性（只允许字母数字与 . : - _，且不能以 - 开头）
+valid_host() {
+  local h="${1:-}"
+  [ -n "$h" ] && [ "${#h}" -le 253 ] || return 1
+  [[ "$h" =~ ^[A-Za-z0-9._:-]+$ ]] || return 1
+  [[ "$h" != -* ]] || return 1
+  return 0
+}
+
+# TCP 连通性测试（支持 IPv4 / IPv6 / 域名）；host / port 全部以参数传递，绝不拼进命令字符串
+test_tcp_connect() {
+  local host="$1"
+  local port="$2"
+  local timeout_sec="${3:-5}"
+  local url_host="" conn_time=""
+
+  host="${host#[}"
+  host="${host%]}"
+
+  valid_host "$host" || return 1
+  valid_port "$port" || return 1
+
+  if is_ipv6 "$host"; then
+    url_host="[${host}]"
+  else
+    url_host="$host"
+  fi
+
+  # 三种方式做的是同一件事（TCP 握手），所以只用一种，并把它的结果当作最终结果：
+  # 连接失败 / 超时就是失败，绝不再换下一种重试（否则丢包目标会串联等 3 × 超时）。
+  # 只有「这个工具本身不可用」才换下一种。最坏耗时 ≈ timeout_sec。
+  local err="" rc=0
+
+  # 1. bash 内建 /dev/tcp（host/port 作为位置参数传入）
+  if command -v timeout >/dev/null 2>&1; then
+    err="$(timeout "$timeout_sec" bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$host" "$port" 2>&1)" && return 0
+    # bash 编译时没带 /dev/tcp 支持：报 No such file or directory，才换下一种；否则（超时 124 / 被拒绝）直接判失败
+    case "$err" in
+      *"No such file or directory"*|*"not supported"*) ;;
+      *) return 1 ;;
+    esac
+  fi
+
+  # 2. nc（-w 是连接超时）；只有 nc 不认 -z / -w 参数时才换 curl
+  if command -v nc >/dev/null 2>&1; then
+    err="$(nc -z -w "$timeout_sec" "$host" "$port" 2>&1)" && return 0
+    case "$err" in
+      *[Uu]sage*|*"invalid option"*|*"unrecognized option"*|*"illegal option"*) ;;
+      *) return 1 ;;
+    esac
+  fi
+
+  # 3. curl：time_connect > 0 代表 TCP 三次握手成功
+  conn_time="$(curl -s -o /dev/null -w '%{time_connect}' --connect-timeout "$timeout_sec" --max-time "$timeout_sec" "http://${url_host}:${port}" 2>/dev/null || true)"
+  if [ -n "$conn_time" ] && awk -v t="$conn_time" 'BEGIN { exit((t + 0 > 0) ? 0 : 1) }' 2>/dev/null; then
+    return 0
+  fi
+
+  return 1
+}
+
+# 落地节点 TCP 预检。通过返回 0；失败时让用户决定是否仍保存，放弃则返回 CANCEL_RC
+check_landing_connectivity() {
+  local server="$1"
+  local port="$2"
+  local confirm=""
+
+  info "正在预检落地节点 TCP 连通性 (${server}:${port})..."
+  if test_tcp_connect "$server" "$port" 5; then
+    ok "落地节点 TCP 连通性检测通过 (${server}:${port})。"
+    return 0
+  fi
+
+  warn "无法连接到落地节点 ${server}:${port}（TCP 连接超时、被拒绝或防火墙未放行）。"
+  read_line "是否仍然继续保存该落地节点？输入 y 继续: " confirm
+  if [ "${confirm,,}" != "y" ]; then
+    warn "已取消保存落地节点。"
+    return "$CANCEL_RC"
+  fi
+  return 0
+}
+
+# 输入落地 IP / 域名（带格式校验，去掉 IPv6 方括号）
+ask_landing_host() {
+  local prompt="$1" default_value="${2:-}" h=""
+  while true; do
+    h="$(ask_text_default "$prompt" "$default_value")"
+    h="${h#[}"
+    h="${h%]}"
+    if valid_host "$h"; then
+      echo "$h"
+      return 0
+    fi
+    warn "地址格式无效：只允许 IP 或域名（字母、数字、点、冒号、连字符）。"
+  done
+}
+
+# SNI（TLS server_name）合法性：只允许域名 / IPv4 形式（字母、数字、点、连字符），
+# 首尾必须是字母或数字，总长 <= 253，不能有连续的点。
+# TUIC 的 SNI 会写进 openssl 配置文件（CN / subjectAltName），所以必须严格校验。
+valid_sni() {
+  local v="${1:-}"
+  [ -n "$v" ] && [ "${#v}" -le 253 ] || return 1
+  [[ "$v" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || return 1
+  [[ "$v" != *..* ]] || return 1
+  return 0
+}
+
+# 输入 SNI（带校验，无效则重新输入）。调用方必须写成 x="$(ask_sni ...)" 并且不要接 ||，
+# 这样标准输入 EOF 时这里 return 1 能让外层的 set -e 生效，而不是死循环。
+ask_sni() {
+  local prompt="$1" default_value="${2:-}" v=""
+  while true; do
+    v="$(ask_text_default "$prompt" "$default_value")" || return 1
+    if valid_sni "$v"; then
+      echo "$v"
+      return 0
+    fi
+    warn "SNI 格式无效：只允许域名（字母、数字、点、连字符，首尾须为字母或数字，不含空格和特殊符号）。"
+  done
 }
 
 country_to_name() {
@@ -794,8 +1232,52 @@ country_to_name() {
     IN) echo "🇮🇳|印度" ;;
     RU) echo "🇷🇺|俄罗斯" ;;
     CN) echo "🇨🇳|中国" ;;
-    *) echo "🌐|未知地区" ;;
+    IT) echo "🇮🇹|意大利" ;;
+    ES) echo "🇪🇸|西班牙" ;;
+    PT) echo "🇵🇹|葡萄牙" ;;
+    CH) echo "🇨🇭|瑞士" ;;
+    AT) echo "🇦🇹|奥地利" ;;
+    IE) echo "🇮🇪|爱尔兰" ;;
+    BE) echo "🇧🇪|比利时" ;;
+    LU) echo "🇱🇺|卢森堡" ;;
+    NO) echo "🇳🇴|挪威" ;;
+    DK) echo "🇩🇰|丹麦" ;;
+    IS) echo "🇮🇸|冰岛" ;;
+    CZ) echo "🇨🇿|捷克" ;;
+    RO) echo "🇷🇴|罗马尼亚" ;;
+    BG) echo "🇧🇬|保加利亚" ;;
+    HU) echo "🇭🇺|匈牙利" ;;
+    GR) echo "🇬🇷|希腊" ;;
+    LT) echo "🇱🇹|立陶宛" ;;
+    LV) echo "🇱🇻|拉脱维亚" ;;
+    EE) echo "🇪🇪|爱沙尼亚" ;;
+    UA) echo "🇺🇦|乌克兰" ;;
+    KZ) echo "🇰🇿|哈萨克斯坦" ;;
+    IL) echo "🇮🇱|以色列" ;;
+    AE) echo "🇦🇪|阿联酋" ;;
+    MO) echo "🇲🇴|澳门" ;;
+    NZ) echo "🇳🇿|新西兰" ;;
+    BR) echo "🇧🇷|巴西" ;;
+    MX) echo "🇲🇽|墨西哥" ;;
+    AR) echo "🇦🇷|阿根廷" ;;
+    CL) echo "🇨🇱|智利" ;;
+    ZA) echo "🇿🇦|南非" ;;
+    XX|"") echo "🌐|未知地区" ;;
+    *)
+      # 表里没有的合法两位国家码：自动由字母生成国旗，名称直接用国家码
+      if [[ "$code" =~ ^[A-Z]{2}$ ]]; then
+        echo "$(flag_from_code "$code")|${code}"
+      else
+        echo "🌐|未知地区"
+      fi
+      ;;
   esac
+}
+
+# 两位国家码 -> 国旗 emoji（用 jq implode 生成，不依赖终端 locale）
+flag_from_code() {
+  local code="${1:-}"
+  jq -nr --arg c "$code" '[ $c | ascii_upcase | explode[] | . - 65 + 127462 ] | implode' 2>/dev/null || printf '🌐'
 }
 
 # -------------------------
@@ -869,7 +1351,7 @@ detect_public_ip() {
   return 1
 }
 
-# 域名 -> IP（IP 原样返回）；解析失败输出空
+# 域名 -> IP（IP 原样返回）；支持 IPv4 与纯 IPv6 环境
 resolve_host_ip() {
   local host="${1:-}" ip=""
 
@@ -884,6 +1366,9 @@ resolve_host_ip() {
   if command -v getent >/dev/null 2>&1; then
     ip="$(getent ahostsv4 "$host" 2>/dev/null | awk 'NR==1{print $1}' || true)"
     if [ -z "$ip" ]; then
+      ip="$(getent ahostsv6 "$host" 2>/dev/null | awk 'NR==1{print $1}' || true)"
+    fi
+    if [ -z "$ip" ]; then
       ip="$(getent ahosts "$host" 2>/dev/null | awk 'NR==1{print $1}' || true)"
     fi
   fi
@@ -891,22 +1376,86 @@ resolve_host_ip() {
   echo "$ip"
 }
 
+# 是否为两位国家码
+valid_cc() {
+  [[ "${1:-}" =~ ^[A-Za-z]{2}$ ]]
+}
+
+# 请求一个地区查询接口并取出国家码。
+#   $1 URL   $2 jq 过滤器（空 = 响应体本身就是国家码）
+# curl 依次用「默认 / -6 / -4」三种方式尝试：
+#   纯 IPv6 机器上只有 -6 能连上仅有 AAAA 的接口；纯 IPv4 机器则反之。
+# 命中返回 0 并输出大写国家码，全部失败返回 1。
+geo_query() {
+  local url="$1" filter="${2:-}" fam body code
+  local -a fams=("" "-6" "-4")
+
+  for fam in "${fams[@]}"; do
+    body="$(curl ${fam:+"$fam"} -fsS --max-time 6 "$url" 2>/dev/null || true)"
+    [ -n "$body" ] || continue
+
+    if [ -n "$filter" ]; then
+      code="$(printf '%s' "$body" | jq -r "$filter // empty" 2>/dev/null || true)"
+    else
+      code="$body"
+    fi
+    code="$(printf '%s' "$code" | tr -d '\r\n "')"
+
+    if valid_cc "$code"; then
+      printf '%s' "${code^^}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# 手动输入国家码（仅在交互终端下询问；回车跳过）
+ask_country_code() {
+  local label="${1:-}" cc=""
+  [ "${CLI_YES:-}" = "1" ] && return 1
+  [ -t 0 ] || return 1
+  read -rp "未能自动识别${label}所在地区，请输入两位国家代码（如 US / JP / HK，直接回车跳过）: " cc || return 1
+  cc="$(trim "$cc")"
+  valid_cc "$cc" || return 1
+  printf '%s' "${cc^^}"
+}
+
 # 输出：国家码|旗帜|名称
+#   $1 主机（IP 或域名）
+#   $2 "self" 表示查询的是本机公网 IP：此时额外使用「查询调用者自身」的接口，
+#      这类接口只要本机能出网就能返回，对纯 IPv6 服务器最可靠
+#   $3 展示用标签（手动兜底提问时使用，如「落地节点」）
 detect_location() {
-  local host="$1"
-  local ip="" code="" pair=""
+  local host="$1" mode="${2:-}" label="${3:-}"
+  local ip="" code="" fam_flag="" pair=""
 
   ip="$(resolve_host_ip "$host")" || ip=""
 
   if [ -n "$ip" ]; then
-    code="$(curl -4 -s --max-time 8 "https://ipapi.co/${ip}/country/" 2>/dev/null | tr -d '\r\n ' || true)"
-    if ! [[ "$code" =~ ^[A-Za-z]{2}$ ]]; then
-      code="$(curl -4 -s --max-time 8 "https://ipinfo.io/${ip}/country" 2>/dev/null | tr -d '\r\n ' || true)"
-    fi
+    code="$(geo_query "https://ipapi.co/${ip}/country/" "")" \
+      || code="$(geo_query "https://ipinfo.io/${ip}/country" "")" \
+      || code="$(geo_query "https://api.country.is/${ip}" '.country')" \
+      || code="$(geo_query "https://ipwho.is/${ip}" '.country_code')" \
+      || code="$(geo_query "https://api.ip.sb/geoip/${ip}" '.country_code')" \
+      || code=""
   fi
-  if ! [[ "$code" =~ ^[A-Za-z]{2}$ ]]; then
-    code="XX"
+
+  # 本机公网 IP：用「查询调用者自身」的接口兜底，并按 IP 版本强制走对应协议栈
+  if [ -z "$code" ] && [ "$mode" = "self" ]; then
+    if is_ipv6 "$ip"; then fam_flag="-6"; else fam_flag="-4"; fi
+    local url
+    for url in https://ifconfig.co/country-iso https://ipapi.co/country/ https://ipinfo.io/country; do
+      code="$(curl "$fam_flag" -fsS --max-time 6 "$url" 2>/dev/null | tr -d '\r\n "' || true)"
+      if valid_cc "$code"; then code="${code^^}"; break; fi
+      code=""
+    done
   fi
+
+  # 仍然失败：交互式手动输入，否则标记为未知
+  if [ -z "$code" ]; then
+    code="$(ask_country_code "$label" || true)"
+  fi
+  [ -n "$code" ] || code="XX"
 
   pair="$(country_to_name "$code")"
   echo "${code}|${pair}"
@@ -945,20 +1494,58 @@ node_type_name() {
   esac
 }
 
+# 获取指定 landing_id 的落地地区标识（如 "🇸🇬新加坡"）
+get_landing_region() {
+  local lid="${1:-}" disp=""
+  [ -n "$lid" ] || return 0
+  disp="$(jq -r --arg id "$lid" '(first(.landings[]? | select(.id == $id)) | .display) // empty' "$STATE_FILE")"
+  if [ -n "$disp" ]; then
+    printf '%s' "${disp%%：*}"
+  fi
+}
+
+# 生成节点名称：
+#   - 中转节点自动带上落地地区标识（例如：🇭🇰香港-vless转vless-🇸🇬新加坡）
+#   - 支持传入 ignore_tag 排除正在修改的节点自身，避免重名误判
 make_node_name() {
   local type="$1"
   local port="$2"
   local outbound_type="${3:-direct}"
-  local flag loc base
+  local landing_id="${4:-}"
+  local ignore_tag="${5:-}"
+  local landing_region="${6:-}"
+  local flag loc base candidate
+
   flag="$(jq -r '.location_flag // "🌐"' "$STATE_FILE")"
   loc="$(jq -r '.location_name // "未知地区"' "$STATE_FILE")"
-  base="${flag}${loc}-$(node_suffix "$type" "$outbound_type")"
 
-  if jq -e --arg name "$base" '.nodes[]? | select(.name == $name)' "$STATE_FILE" >/dev/null 2>&1; then
-    echo "${base}-${port}"
+  if [ "$outbound_type" = "landing" ]; then
+    if [ -z "$landing_region" ] && [ -n "$landing_id" ]; then
+      landing_region="$(get_landing_region "$landing_id")"
+    fi
+    if [ -n "$landing_region" ]; then
+      base="${flag}${loc}-$(node_suffix "$type" "$outbound_type")-${landing_region}"
+    else
+      base="${flag}${loc}-$(node_suffix "$type" "$outbound_type")"
+    fi
   else
-    echo "$base"
+    base="${flag}${loc}-$(node_suffix "$type" "$outbound_type")"
   fi
+
+  if ! jq -e --arg name "$base" --arg ignore "$ignore_tag" \
+    '.nodes[]? | select(.tag != $ignore and .name == $name)' "$STATE_FILE" >/dev/null 2>&1; then
+    echo "$base"
+    return 0
+  fi
+
+  candidate="${base}-${port}"
+  if ! jq -e --arg name "$candidate" --arg ignore "$ignore_tag" \
+    '.nodes[]? | select(.tag != $ignore and .name == $name)' "$STATE_FILE" >/dev/null 2>&1; then
+    echo "$candidate"
+    return 0
+  fi
+
+  echo "${base}-${port}-${type%%-*}"
 }
 
 url_encode() {
@@ -1129,10 +1716,20 @@ apply_state() {
   [ -n "$NEW_STATE" ] && [ -f "$NEW_STATE" ] || die "内部错误：没有待提交的状态。"
 
   bak_state="$(mktemp "${STATE_FILE}.tmp.XXXXXX")" || die "无法创建备份文件。"
-  cp -p "$STATE_FILE" "$bak_state"
+  if ! cp -p "$STATE_FILE" "$bak_state"; then
+    rm -f "$bak_state" "$NEW_STATE"
+    NEW_STATE=""
+    err "备份状态文件失败（磁盘已满？），本次修改已放弃，状态未改动。"
+    return 1
+  fi
   if [ -f "$CONFIG_FILE" ]; then
     bak_conf="$(mktemp "${CONFIG_FILE}.tmp.XXXXXX")" || die "无法创建备份文件。"
-    cp -p "$CONFIG_FILE" "$bak_conf"
+    if ! cp -p "$CONFIG_FILE" "$bak_conf"; then
+      rm -f "$bak_state" "$bak_conf" "$NEW_STATE"
+      NEW_STATE=""
+      err "备份配置文件失败（磁盘已满？），本次修改已放弃，状态未改动。"
+      return 1
+    fi
   fi
 
   commit_state_plain
@@ -1305,8 +1902,8 @@ create_state_file() {
 
   step "基础参数设置"
 
-  if [ "$CLI_SAFE" = "0" ]; then
-    info "已指定 safe=0：直接使用默认安全参数（UUID / 密钥 / SNI）。"
+  if [ "$CLI_YES" = "1" ]; then
+    info "已指定 -y：静默使用预设的 UUID / Reality 密钥 / SNI。"
     uuid="$DEFAULT_UUID"
     private_key="$DEFAULT_PRIVATE_KEY"
     public_key="$DEFAULT_PUBLIC_KEY"
@@ -1316,7 +1913,7 @@ create_state_file() {
     echo "请选择是否生成新的 UUID / REALITY 密钥 / ShortID："
     echo "1) 生成新的"
     echo "2) 不生成，使用脚本内默认参数"
-    read -rp "请输入 1 或 2 [默认 1]: " key_choice
+    read_line "请输入 1 或 2 [默认 1]: " key_choice
     key_choice="${key_choice:-1}"
 
     case "$key_choice" in
@@ -1331,7 +1928,7 @@ create_state_file() {
         [ -n "$uuid" ] && [ -n "$private_key" ] && [ -n "$public_key" ] || die "生成密钥失败。"
         ;;
       2)
-        warn "将使用脚本内默认参数。"
+        warn "将使用脚本内预设参数（密钥公开，仅建议测试使用）。"
         uuid="$DEFAULT_UUID"
         private_key="$DEFAULT_PRIVATE_KEY"
         public_key="$DEFAULT_PUBLIC_KEY"
@@ -1344,16 +1941,21 @@ create_state_file() {
     esac
   fi
 
-  if [ "$CLI_SAFE" = "0" ]; then
-    ip_version="ipv4"
-    server_ip="$(detect_public_ip 4)" || server_ip=""
+  if [ "$CLI_YES" = "1" ]; then
+    if server_ip="$(detect_public_ip 4)"; then
+      ip_version="ipv4"
+    elif server_ip="$(detect_public_ip 6)"; then
+      ip_version="ipv6"
+    else
+      ip_version="ipv4"
+      server_ip=""
+    fi
   else
     step "选择 IP 版本"
     echo "请选择用于节点分享的公网 IP 版本："
     echo "1) IPv4 (默认)"
     echo "2) IPv6"
-    read -rp "请输入 1 或 2: " ipv_choice
-
+    read_line "请输入 1 或 2: " ipv_choice
     case "$ipv_choice" in
       1|"")
         ip_version="ipv4"
@@ -1374,7 +1976,7 @@ create_state_file() {
   fi
 
   step "检测公网 IP 和所在地"
-  location_raw="$(detect_location "$server_ip")"
+  location_raw="$(detect_location "$server_ip" self "本机")"
   country_code="$(echo "$location_raw" | cut -d'|' -f1)"
   flag="$(echo "$location_raw" | cut -d'|' -f2)"
   loc="$(echo "$location_raw" | cut -d'|' -f3)"
@@ -1434,17 +2036,18 @@ add_landing_wizard() {
 
   local l_server l_port l_uuid l_public_key l_short_id l_sni loc_raw flag loc l_display l_id
 
-  l_server="$(ask_text_default "请输入落地节点 IP 或域名" "")"
-  l_server="${l_server#[}"
-  l_server="${l_server%]}"
-  l_port="$(ask_port "请输入落地节点 VLESS 端口" "$VLESS_DIRECT_PORT")"
+  l_server="$(ask_landing_host "请输入落地节点 IP 或域名" "")"
+  l_port="$(ask_port "请输入落地节点 VLESS 端口 (远端端口，1-65535)" "$VLESS_DIRECT_PORT")"
+
+  check_landing_connectivity "$l_server" "$l_port"
+
   l_uuid="$(ask_text_default "请输入落地 VLESS UUID" "$(state_get '.uuid')")"
   l_public_key="$(ask_text_default "请输入落地 Reality PublicKey" "$(state_get '.public_key')")"
   l_short_id="$(ask_text_default "请输入落地 Reality ShortID" "$(state_get '.short_id')")"
-  l_sni="$(ask_text_default "请输入落地 Reality SNI" "$(state_get '.reality_sni')")"
+  l_sni="$(ask_sni "请输入落地 Reality SNI" "$(state_get '.reality_sni')")"
 
   info "正在检测落地节点地区..."
-  loc_raw="$(detect_location "$l_server")"
+  loc_raw="$(detect_location "$l_server" "" "落地节点")"
   flag="$(echo "$loc_raw" | cut -d'|' -f2)"
   loc="$(echo "$loc_raw" | cut -d'|' -f3)"
   l_display="${flag}${loc}：${l_server}"
@@ -1476,31 +2079,51 @@ add_landing_wizard() {
   ok "落地节点添加成功：${l_display} (端口: ${l_port})"
 }
 
+# 使用 jq 码点宽度计算，解决中文与国旗 Emoji 在终端表格中的错位问题
 list_landings_table() {
-  local idx disp port sni used
-
   if [ "$(landing_count)" -eq 0 ]; then
     warn "当前无任何落地节点。"
     return 1
   fi
 
-  printf "%-4s %-32s %-8s %-8s %s\n" "序号" "落地节点 (国家：ip)" "端口" "被引用" "SNI"
-  printf "%-4s %-32s %-8s %-8s %s\n" "----" "--------------------------------" "------" "------" "----------------"
-
-  while IFS=$'\t' read -r idx disp port used sni; do
-    printf "%-4s %-32s %-8s %-8s %s\n" "$idx" "$disp" "$port" "$used" "$sni"
-  done < <(jq -r '. as $s | .landings | to_entries[] | .value as $l
-    | [(.key + 1), $l.display, $l.port,
-       ([$s.nodes[]? | select(.landing_id == $l.id)] | length), $l.sni] | @tsv' "$STATE_FILE")
+  jq -r "$JQ_TABLE_LIB"'
+    . as $s |
+    ["序号", "落地节点 (国家：ip)", "端口", "被引用", "SNI"] as $headers |
+    [4, 28, 6, 6, 16] as $mins |
+    [
+      .landings | to_entries[] | .value as $l |
+      [
+        ((.key + 1) | tostring),
+        ($l.display // "-"),
+        ($l.port | tostring),
+        (([ $s.nodes[]? | select(.landing_id == $l.id) ] | length) | tostring),
+        ($l.sni // "-")
+      ]
+    ] as $rows |
+    [
+      range(0; 5) as $c |
+      ([ $mins[$c], ($headers[$c] | dwidth), ($rows[]?[$c] | dwidth) ] | max)
+    ] as $widths |
+    (
+      [ range(0; 4) as $c | ($headers[$c] | pad($widths[$c])) ] + [$headers[4]] | join("  ")
+    ),
+    (
+      [ range(0; 5) as $c | dash($widths[$c]) ] | join("  ")
+    ),
+    (
+      $rows[] | . as $r |
+      [ range(0; 4) as $c | ($r[$c] | pad($widths[$c])) ] + [$r[4]] | join("  ")
+    )
+  ' "$STATE_FILE"
 
   return 0
 }
 
-# 修改落地池中第 idx（从 0 开始）个条目；节点只引用 id，所以不需要同步任何拷贝
+# 修改落地池中第 idx（从 0 开始）个条目；若落地地区变化则同步更新引用该落地的节点名称
 edit_landing() {
   local idx="$1"
   local l_id old_server old_port old_uuid old_pbk old_sid old_sni old_disp used
-  local new_server new_port new_uuid new_pbk new_sid new_sni new_disp loc_raw flag loc
+  local new_server new_port new_uuid new_pbk new_sid new_sni new_disp new_region loc_raw flag loc
 
   l_id="$(jq -r --argjson i "$idx" '.landings[$i].id' "$STATE_FILE")"
   old_server="$(jq -r --argjson i "$idx" '.landings[$i].server' "$STATE_FILE")"
@@ -1528,27 +2151,33 @@ edit_landing() {
   fi
   echo "请直接输入新值，按回车保持当前默认："
 
-  new_server="$(ask_text_default "落地 IP 或域名" "$old_server")"
-  new_server="${new_server#[}"
-  new_server="${new_server%]}"
-  new_port="$(ask_port "落地 VLESS 端口" "$old_port")"
+  new_server="$(ask_landing_host "落地 IP 或域名" "$old_server")"
+  new_port="$(ask_port "落地 VLESS 端口 (远端端口，1-65535)" "$old_port")"
+
+  # 只有地址或端口发生变化时才重新预检
+  if [ "$new_server" != "$old_server" ] || [ "$new_port" != "$old_port" ]; then
+    check_landing_connectivity "$new_server" "$new_port"
+  fi
+
   new_uuid="$(ask_text_default "落地 UUID" "$old_uuid")"
   new_pbk="$(ask_text_default "落地 Reality PublicKey" "$old_pbk")"
   new_sid="$(ask_text_default "落地 Reality ShortID" "$old_sid")"
-  new_sni="$(ask_text_default "落地 Reality SNI" "$old_sni")"
+  new_sni="$(ask_sni "落地 Reality SNI" "$old_sni")"
 
   if [ "$new_server" != "$old_server" ]; then
     info "检测到 IP/域名变动，正在重新解析地区..."
-    loc_raw="$(detect_location "$new_server")"
+    loc_raw="$(detect_location "$new_server" "" "落地节点")"
     flag="$(echo "$loc_raw" | cut -d'|' -f2)"
     loc="$(echo "$loc_raw" | cut -d'|' -f3)"
     new_disp="${flag}${loc}：${new_server}"
   else
     new_disp="$old_disp"
   fi
+  new_region="${new_disp%%：*}"
 
   state_build \
     --argjson i "$idx" \
+    --arg id "$l_id" \
     --arg server "$new_server" \
     --argjson port "$new_port" \
     --arg uuid "$new_uuid" \
@@ -1556,10 +2185,24 @@ edit_landing() {
     --arg sid "$new_sid" \
     --arg sni "$new_sni" \
     --arg disp "$new_disp" \
-    '.landings[$i] |= (
-        .server = $server | .port = $port | .uuid = $uuid |
-        .public_key = $pbk | .short_id = $sid | .sni = $sni | .display = $disp
-     )'
+    --arg region "$new_region" \
+    '
+    (.location_flag // "🌐") as $eflag |
+    (.location_name // "未知地区") as $eloc |
+    .landings[$i] |= (
+      .server = $server | .port = $port | .uuid = $uuid |
+      .public_key = $pbk | .short_id = $sid | .sni = $sni | .display = $disp
+    ) |
+    reduce (
+      .nodes | to_entries[] | select(.value.landing_id == $id) | .key
+    ) as $ni (.;
+      .nodes[$ni] as $n |
+      (if ($n.type | startswith("tuic")) then "tuic5转vless" else "vless转vless" end) as $suf |
+      ($eflag + $eloc + "-" + $suf + "-" + $region) as $base |
+      ([.nodes[] | select(.tag != $n.tag and .name == $base)] | length) as $dup |
+      .nodes[$ni].name = (if $dup == 0 then $base else ($base + "-" + ($n.port | tostring)) end)
+    )
+    '
 
   if [ "$used" -gt 0 ]; then
     apply_state
@@ -1584,7 +2227,7 @@ modify_landing_wizard() {
 
   list_landings_table || true
   echo
-  read -rp "请输入要修改的落地节点序号 (输入 0 返回): " pick
+  read_line "请输入要修改的落地节点序号 (输入 0 返回): " pick
   pick="$(trim "$pick")"
   if [ -z "$pick" ] || [ "$pick" = "0" ]; then return "$CANCEL_RC"; fi
 
@@ -1610,7 +2253,7 @@ delete_landing_wizard() {
 
   list_landings_table || true
   echo
-  read -rp "请输入要删除的落地节点序号 (输入 0 返回): " pick
+  read_line "请输入要删除的落地节点序号 (输入 0 返回): " pick
   pick="$(trim "$pick")"
   if [ -z "$pick" ] || [ "$pick" = "0" ]; then return "$CANCEL_RC"; fi
 
@@ -1632,7 +2275,7 @@ delete_landing_wizard() {
     return 1
   fi
 
-  read -rp "确认删除落地节点 [${disp}] 吗？输入 y 确认: " confirm
+  read_line "确认删除落地节点 [${disp}] 吗？输入 y 确认: " confirm
   if [ "${confirm,,}" != "y" ]; then
     warn "已取消。"
     return "$CANCEL_RC"
@@ -1649,14 +2292,14 @@ landing_pool_menu() {
 
   while true; do
     step "落地节点池管理"
+    info "落地的增删改只在这里进行；节点只通过 ID 引用落地（添加 / 修改节点时选择即可）。"
     list_landings_table || true
     echo
     echo "1) 添加落地节点"
     echo "2) 修改落地节点信息 (IP / 端口 / 密钥等)"
     echo "3) 删除落地节点"
     echo "0) 返回主菜单"
-    read -rp "请输入选项: " lchoice
-
+    read_line "请输入选项: " lchoice
     case "$lchoice" in
       1) act add_landing_wizard ;;
       2) act modify_landing_wizard ;;
@@ -1667,31 +2310,33 @@ landing_pool_menu() {
   done
 }
 
-# 选择已有落地，或新建；输入 0 取消（返回 1）
+# 从落地池里选择一个已有的落地（只选择，不在这里新建 / 修改，那些都在「落地节点池管理」里做）。
+# 选中返回 0（结果在 SEL_LANDING_ID / SEL_LANDING_DISPLAY）；取消或池为空返回 CANCEL_RC
+# 调用方直接裸调用，不要写成 select_landing || ...（否则函数内部的 set -e 会失效）
 SEL_LANDING_ID=""
 SEL_LANDING_DISPLAY=""
-select_or_create_landing() {
+select_landing() {
   local count pick real_idx
+
+  count="$(landing_count)"
+  if [ "$count" -eq 0 ]; then
+    warn "落地节点池是空的。请先回到主菜单「落地节点池管理」添加落地节点，再来创建 / 切换中转节点。"
+    return "$CANCEL_RC"
+  fi
 
   while true; do
     echo
-    echo "请选择落地节点："
+    echo "请选择落地节点（落地的增删改请到「落地节点池管理」）："
     list_landings_table || true
-    echo "  +) 添加新的落地节点"
     echo "  0) 取消"
-    read -rp "请输入序号 / + / 0: " pick
+    read_line "请输入序号: " pick
     pick="$(trim "$pick")"
 
-    if [ "$pick" = "0" ]; then
-      return 1
+    if [ -z "$pick" ] || [ "$pick" = "0" ]; then
+      warn "已取消。"
+      return "$CANCEL_RC"
     fi
 
-    if [ "$pick" = "+" ]; then
-      add_landing_wizard
-      continue
-    fi
-
-    count="$(landing_count)"
     if [[ "$pick" =~ ^[0-9]{1,6}$ ]] && [ "$((10#$pick))" -ge 1 ] && [ "$((10#$pick))" -le "$count" ]; then
       real_idx=$((10#$pick - 1))
       SEL_LANDING_ID="$(jq -r --argjson i "$real_idx" '.landings[$i].id' "$STATE_FILE")"
@@ -1719,10 +2364,10 @@ prepare_add_node() {
     protocol="tcp"
   fi
 
-  check_port_available "$port" "$protocol"
+  check_port_available "$port" "$protocol" || return $?
 
   tag="${type}-${port}"
-  name="$(make_node_name "$type" "$port" "$outbound_type")"
+  name="$(make_node_name "$type" "$port" "$outbound_type" "$landing_id")"
 
   state_build \
     --arg type "$type" \
@@ -1750,50 +2395,48 @@ add_node_wizard() {
   need_state
   step "添加节点"
 
-  local choice port outbound_choice
+  local choice port outbound_choice type_base landing_id=""
 
   echo "1) 添加 VLESS 节点 (TCP)"
   echo "2) 添加 TUIC v5 节点 (UDP)"
-  echo "3) 添加落地节点"
   echo "0) 返回"
-  read -rp "请选择: " choice
-
+  read_line "请选择: " choice
   case "$choice" in
-    1|2)
-      if [ "$choice" = "1" ]; then
-        port="$(ask_port "请输入 VLESS TCP 端口" "$VLESS_DIRECT_PORT")"
-      else
-        port="$(ask_port "请输入 TUIC UDP 端口" "$TUIC_DIRECT_PORT")"
-      fi
-      echo
-      echo "请选择出站方式："
-      echo "1) 直出"
-      echo "2) 落地中转 (选择已添加的落地节点)"
-      read -rp "请输入 1 或 2 [默认 1]: " outbound_choice
-      outbound_choice="${outbound_choice:-1}"
-
-      if [ "$outbound_choice" = "2" ]; then
-        select_or_create_landing || { warn "已取消。"; return "$CANCEL_RC"; }
-        if [ "$choice" = "1" ]; then
-          prepare_add_node "vless-relay" "$port" "landing" "$SEL_LANDING_ID"
-        else
-          prepare_add_node "tuic-relay" "$port" "landing" "$SEL_LANDING_ID"
-        fi
-      else
-        if [ "$choice" = "1" ]; then
-          prepare_add_node "vless-direct" "$port" "direct"
-        else
-          prepare_add_node "tuic-direct" "$port" "direct"
-        fi
-      fi
-      ;;
-    3)
-      add_landing_wizard
-      return 0
-      ;;
+    1) type_base="vless" ;;
+    2) type_base="tuic" ;;
     0) return "$CANCEL_RC" ;;
     *) warn "输入错误。"; return 1 ;;
   esac
+
+  # 先确定出口，再填端口：选了中转却没有落地时，不会白填一遍端口
+  echo
+  echo "请选择出站方式："
+  echo "1) 直出"
+  echo "2) 落地中转 (从「落地节点池」里选择已有落地)"
+  read_line "请输入 1 或 2 [默认 1]: " outbound_choice
+  outbound_choice="${outbound_choice:-1}"
+
+  case "$outbound_choice" in
+    1) ;;
+    2)
+      select_landing
+      landing_id="$SEL_LANDING_ID"
+      info "已选择落地：${SEL_LANDING_DISPLAY}"
+      ;;
+    *) warn "输入错误。"; return 1 ;;
+  esac
+
+  if [ "$type_base" = "vless" ]; then
+    port="$(ask_node_port "请输入 VLESS TCP 端口" "$VLESS_DIRECT_PORT")"
+  else
+    port="$(ask_node_port "请输入 TUIC UDP 端口" "$TUIC_DIRECT_PORT")"
+  fi
+
+  if [ -n "$landing_id" ]; then
+    prepare_add_node "${type_base}-relay" "$port" "landing" "$landing_id"
+  else
+    prepare_add_node "${type_base}-direct" "$port" "direct"
+  fi
 
   apply_state
   ok "节点已生效。"
@@ -1816,7 +2459,8 @@ delete_node_wizard() {
   step "删除节点 (支持批量)"
   list_nodes_table
   echo
-  read -rp "请输入要删除的节点序号 (多个用空格隔开，如 1 2)，输入 0 返回: " indices
+  read_line "请输入要删除的节点序号 (多个用空格隔开，如 1 2)，输入 0 返回: " indices
+  indices="${indices//，/ }"
   indices="${indices//,/ }"
   indices="$(trim "$indices")"
 
@@ -1847,7 +2491,7 @@ delete_node_wizard() {
     echo "  - $n"
   done
 
-  read -rp "确认删除？输入 y 确认: " confirm
+  read_line "确认删除？输入 y 确认: " confirm
   if [ "${confirm,,}" != "y" ]; then
     warn "已取消删除。"
     return "$CANCEL_RC"
@@ -1864,9 +2508,9 @@ delete_node_wizard() {
 modify_node_wizard() {
   need_state
 
-  local count index real_idx old_port new_port old_tag type protocol name
+  local count index real_idx old_port new_port old_tag new_tag type protocol name
   local outbound_type landing_id landing_display mod_choice
-  local current_sni new_sni out_target new_type new_name lidx
+  local current_sni new_sni out_target new_type new_name
 
   count="$(jq '.nodes | length' "$STATE_FILE")"
   if [ "$count" -eq 0 ]; then
@@ -1877,7 +2521,7 @@ modify_node_wizard() {
   step "修改节点 (端口 / SNI / 出口落地)"
   list_nodes_table
   echo
-  read -rp "请输入要修改的节点序号，输入 0 返回: " index
+  read_line "请输入要修改的节点序号，输入 0 返回: " index
   index="$(trim "$index")"
 
   if [ -z "$index" ] || [ "$index" = "0" ]; then return "$CANCEL_RC"; fi
@@ -1913,25 +2557,24 @@ modify_node_wizard() {
   echo "请选择要修改的内容："
   echo "1) 修改端口"
   echo "2) 修改入站 SNI (同协议所有节点共用)"
-  echo "3) 修改出口方式 (切换直出 / 更换已有落地)"
-  if [ "$outbound_type" = "landing" ]; then
-    echo "4) 编辑当前绑定的落地参数 (IP / 端口 / 密钥等，所有引用该落地的节点同步生效)"
-  fi
+  echo "3) 修改出口方式 (切换直出 / 更换为落地池里的其他落地)"
   echo "0) 返回"
-  read -rp "请输入选项: " mod_choice
-
+  read_line "请输入选项: " mod_choice
   case "$mod_choice" in
     1)
-      new_port="$(ask_port "请输入新端口 (${protocol^^})" "$old_port")"
+      new_port="$(ask_node_port "请输入新端口 (${protocol^^}，>= ${MIN_NODE_PORT})" "$old_port")"
       if [ "$new_port" = "$old_port" ]; then
         info "端口未改变。"
         return "$CANCEL_RC"
       fi
       check_port_available "$new_port" "$protocol" "$old_tag"
+      new_tag="${type}-${new_port}"
+      new_name="$(make_node_name "$type" "$new_port" "$outbound_type" "$landing_id" "$old_tag")"
       state_build --argjson i "$real_idx" \
         --argjson port "$new_port" \
-        --arg tag "${type}-${new_port}" \
-        '.nodes[$i].port = $port | .nodes[$i].tag = $tag'
+        --arg tag "$new_tag" \
+        --arg name "$new_name" \
+        '.nodes[$i] |= (.port = $port | .tag = $tag | .name = $name)'
       ;;
     2)
       if [[ "$type" == tuic* ]]; then
@@ -1939,9 +2582,9 @@ modify_node_wizard() {
         info "TUIC SNI 为所有 TUIC 节点共用，修改后会自动重新生成自签证书。"
       else
         current_sni="$(state_get '.reality_sni')"
-        info "Reality SNI 为所有 VLESS 节点共用。落地侧 SNI 请用选项 4 或落地池管理修改。"
+        info "Reality SNI 为所有 VLESS 节点共用。落地侧的 IP / 端口 / SNI 请到「落地节点池管理」修改。"
       fi
-      new_sni="$(ask_text_default "请输入新 SNI" "$current_sni")"
+      new_sni="$(ask_sni "请输入新 SNI" "$current_sni")"
       if [ "$new_sni" = "$current_sni" ]; then
         info "SNI 未改变。"
         return "$CANCEL_RC"
@@ -1955,41 +2598,32 @@ modify_node_wizard() {
     3)
       echo "请选择新出站方式："
       echo "1) 改为直出 (Direct)"
-      echo "2) 选择已有或新建落地节点"
+      echo "2) 改为落地中转 (从「落地节点池」里选择)"
       echo "0) 返回"
-      read -rp "请输入 1 / 2 / 0: " out_target
-
+      read_line "请输入 1 / 2 / 0: " out_target
       if [ "$out_target" = "1" ]; then
         if [[ "$type" == tuic* ]]; then new_type="tuic-direct"; else new_type="vless-direct"; fi
-        new_name="$(make_node_name "$new_type" "$old_port" "direct")"
+        new_tag="${new_type}-${old_port}"
+        new_name="$(make_node_name "$new_type" "$old_port" "direct" "" "$old_tag")"
         state_build --argjson i "$real_idx" \
           --arg type "$new_type" \
+          --arg tag "$new_tag" \
           --arg name "$new_name" \
-          '.nodes[$i] |= (.type = $type | .name = $name | .outbound_type = "direct" | del(.landing_id))'
+          '.nodes[$i] |= (.type = $type | .tag = $tag | .name = $name | .outbound_type = "direct" | del(.landing_id))'
       elif [ "$out_target" = "2" ]; then
-        select_or_create_landing || { warn "已取消。"; return "$CANCEL_RC"; }
+        select_landing
         if [[ "$type" == tuic* ]]; then new_type="tuic-relay"; else new_type="vless-relay"; fi
-        new_name="$(make_node_name "$new_type" "$old_port" "landing")"
+        new_tag="${new_type}-${old_port}"
+        new_name="$(make_node_name "$new_type" "$old_port" "landing" "$SEL_LANDING_ID" "$old_tag")"
         state_build --argjson i "$real_idx" \
           --arg type "$new_type" \
+          --arg tag "$new_tag" \
           --arg name "$new_name" \
           --arg lid "$SEL_LANDING_ID" \
-          '.nodes[$i] |= (.type = $type | .name = $name | .outbound_type = "landing" | .landing_id = $lid)'
+          '.nodes[$i] |= (.type = $type | .tag = $tag | .name = $name | .outbound_type = "landing" | .landing_id = $lid)'
       else
         return "$CANCEL_RC"
       fi
-      ;;
-    4)
-      if [ "$outbound_type" != "landing" ]; then
-        warn "当前节点为直出节点，无落地参数可修改。"
-        return "$CANCEL_RC"
-      fi
-      lidx="$(jq -r --arg id "$landing_id" '.landings | map(.id) | index($id) // empty' "$STATE_FILE")"
-      if [ -z "$lidx" ]; then
-        die "该节点引用的落地节点已不存在，请用选项 3 重新选择落地。"
-      fi
-      edit_landing "$lidx"
-      return 0
       ;;
     0)
       return "$CANCEL_RC"
@@ -2005,7 +2639,7 @@ modify_node_wizard() {
 }
 
 # -------------------------
-# 屏蔽指定网站（route reject 规则；sing-box 1.11+ 已移除 block 出站）
+# 屏蔽指定网站（支持批量输入与批量删除）
 # -------------------------
 normalize_domain() {
   local d="$1"
@@ -2025,32 +2659,49 @@ normalize_domain() {
 block_add() {
   need_state
 
-  local domain
+  local raw_input item domain domains_json
+  local -a new_domains=()
 
-  read -rp "请输入要屏蔽的域名 (输入 0 返回): " domain
-  domain="$(trim "$domain")"
-  if [ -z "$domain" ] || [ "$domain" = "0" ]; then return "$CANCEL_RC"; fi
+  read_line "请输入要屏蔽的域名 (多个用空格或逗号隔开，输入 0 返回): " raw_input
+  raw_input="${raw_input//，/ }"
+  raw_input="${raw_input//,/ }"
+  raw_input="$(trim "$raw_input")"
+  if [ -z "$raw_input" ] || [ "$raw_input" = "0" ]; then return "$CANCEL_RC"; fi
 
-  domain="$(normalize_domain "$domain")"
-  if ! [[ "$domain" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]]; then
-    warn "域名格式无效：${domain:-<空>}（中文域名请填写 punycode 形式）"
-    return 1
-  fi
+  for item in $raw_input; do
+    domain="$(normalize_domain "$item")"
+    if [ -z "$domain" ]; then continue; fi
+    if ! [[ "$domain" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]]; then
+      warn "忽略无效域名格式：${item}（中文域名请填写 punycode 形式）"
+      continue
+    fi
+    if jq -e --arg d "$domain" '.blocked_domains | index($d)' "$STATE_FILE" >/dev/null 2>&1; then
+      info "域名已在屏蔽列表中，跳过：$domain"
+      continue
+    fi
+    if [[ " ${new_domains[*]:-} " == *" ${domain} "* ]]; then
+      continue
+    fi
+    new_domains+=("$domain")
+  done
 
-  if jq -e --arg d "$domain" '.blocked_domains | index($d)' "$STATE_FILE" >/dev/null 2>&1; then
-    info "该域名已在屏蔽列表中：$domain"
+  if [ "${#new_domains[@]}" -eq 0 ]; then
+    warn "没有新增任何有效域名。"
     return "$CANCEL_RC"
   fi
 
-  state_build --arg d "$domain" '.blocked_domains += [$d] | .blocked_domains |= unique'
+  domains_json="$(printf '%s\n' "${new_domains[@]}" | jq -R . | jq -s .)"
+  state_build --argjson ds "$domains_json" '.blocked_domains += $ds | .blocked_domains |= unique'
   apply_state
-  ok "已屏蔽: $domain"
+  ok "已批量屏蔽 ${#new_domains[@]} 个域名: ${new_domains[*]}"
 }
 
 block_remove() {
   need_state
 
-  local count index d_name
+  local count raw_indices idx real_idx d_name confirm remove_json
+  local -a remove_domains=()
+  local -a seen=()
 
   count="$(jq '.blocked_domains | length' "$STATE_FILE")"
   if [ "$count" -eq 0 ]; then
@@ -2058,19 +2709,46 @@ block_remove() {
     return "$CANCEL_RC"
   fi
 
-  read -rp "请输入要解除屏蔽的序号 (输入 0 取消): " index
-  index="$(trim "$index")"
-  if [ -z "$index" ] || [ "$index" = "0" ]; then return "$CANCEL_RC"; fi
+  read_line "请输入要解除屏蔽的序号 (多个用空格或逗号隔开，输入 all 清空全部，输入 0 取消): " raw_indices
+  raw_indices="${raw_indices//，/ }"
+  raw_indices="${raw_indices//,/ }"
+  raw_indices="$(trim "$raw_indices")"
+  if [ -z "$raw_indices" ] || [ "$raw_indices" = "0" ]; then return "$CANCEL_RC"; fi
 
-  if ! [[ "$index" =~ ^[0-9]{1,6}$ ]] || [ "$((10#$index))" -lt 1 ] || [ "$((10#$index))" -gt "$count" ]; then
-    warn "序号无效。"
+  if [ "${raw_indices,,}" = "all" ]; then
+    read_line "确认清空全部 ${count} 个已屏蔽域名吗？输入 y 确认: " confirm
+    if [ "${confirm,,}" != "y" ]; then
+      warn "已取消。"
+      return "$CANCEL_RC"
+    fi
+    state_build '.blocked_domains = []'
+    apply_state
+    ok "已清空全部屏蔽域名。"
+    return 0
+  fi
+
+  for idx in $raw_indices; do
+    if [[ "$idx" =~ ^[0-9]{1,6}$ ]] && [ "$((10#$idx))" -ge 1 ] && [ "$((10#$idx))" -le "$count" ]; then
+      real_idx=$((10#$idx - 1))
+      if [[ " ${seen[*]:-} " == *" ${real_idx} "* ]]; then continue; fi
+      seen+=("$real_idx")
+      d_name="$(jq -r --argjson i "$real_idx" '.blocked_domains[$i]' "$STATE_FILE")"
+      remove_domains+=("$d_name")
+    else
+      warn "忽略无效序号: $idx"
+    fi
+  done
+
+  if [ "${#remove_domains[@]}" -eq 0 ]; then
+    warn "未选择有效序号。"
     return 1
   fi
 
-  d_name="$(jq -r --argjson i "$((10#$index - 1))" '.blocked_domains[$i]' "$STATE_FILE")"
-  state_build --argjson i "$((10#$index - 1))" 'del(.blocked_domains[$i])'
+  remove_json="$(printf '%s\n' "${remove_domains[@]}" | jq -R . | jq -s .)"
+  state_build --argjson rm_list "$remove_json" \
+    '.blocked_domains |= map(select(. as $d | $rm_list | index($d) | not))'
   apply_state
-  ok "已解除屏蔽: $d_name"
+  ok "已解除屏蔽 (${#remove_domains[@]} 个): ${remove_domains[*]}"
 }
 
 block_website_menu() {
@@ -2090,11 +2768,10 @@ block_website_menu() {
     fi
 
     echo
-    echo "1) 添加屏蔽域名"
-    echo "2) 解除已屏蔽的域名"
+    echo "1) 添加屏蔽域名 (支持批量)"
+    echo "2) 解除已屏蔽的域名 (支持批量 / all)"
     echo "0) 返回"
-    read -rp "请输入选项: " choice
-
+    read_line "请输入选项: " choice
     case "$choice" in
       1) act block_add ;;
       2) act block_remove ;;
@@ -2108,7 +2785,7 @@ block_website_menu() {
 # 更新内核 / 刷新 IP
 # -------------------------
 update_core_wizard() {
-  local current_ver latest_ver force confirm bin wd rc
+  local current_ver latest_ver force confirm bin wd rc mode new_ver
 
   if command -v sing-box >/dev/null 2>&1; then
     current_ver="$(sing-box version 2>/dev/null | head -n 1 | awk '{print $3}' || true)"
@@ -2129,12 +2806,14 @@ update_core_wizard() {
   echo -e "最新版本: ${C_GREEN}${latest_ver}${C_RESET}"
   echo
 
+  mode="upgrade"
   if [ "$current_ver" = "$latest_ver" ]; then
+    mode="reinstall"
     info "当前已经是最新版本。"
-    read -rp "是否强制重新安装？输入 y 确认: " force
+    read_line "是否强制重新安装？输入 y 确认: " force
     if [ "${force,,}" != "y" ]; then return "$CANCEL_RC"; fi
   else
-    read -rp "确认更新到最新版本？输入 y 确认 [默认 y]: " confirm
+    read_line "确认更新到最新版本？输入 y 确认 [默认 y]: " confirm
     confirm="${confirm:-y}"
     if [ "${confirm,,}" != "y" ]; then return "$CANCEL_RC"; fi
   fi
@@ -2147,12 +2826,17 @@ update_core_wizard() {
   fi
 
   service_stop
-  rm -f /usr/local/bin/sing-box /usr/bin/sing-box
-  hash -r 2>/dev/null || true
 
-  # 子 shell 里运行，保证 install_singbox 里的 die 不会直接结束整个操作
+  # 子 shell 里运行，保证里面的 die 不会直接结束整个操作
   set +e
-  ( set -e; install_singbox )
+  if pkg_managed_singbox; then
+    info "sing-box 由系统包管理器 (${PKG_MANAGER}) 管理，改用包管理器处理（模式：${mode}）。"
+    ( set -e; pkg_upgrade_singbox "$mode" )
+  else
+    rm -f /usr/local/bin/sing-box /usr/bin/sing-box
+    hash -r 2>/dev/null || true
+    ( set -e; install_singbox )
+  fi
   rc=$?
   set -e
 
@@ -2168,6 +2852,12 @@ update_core_wizard() {
   fi
 
   rm -rf "$wd"
+
+  new_ver="$(sing-box version 2>/dev/null | head -n 1 | awk '{print $3}' || true)"
+  if [ "$new_ver" != "$latest_ver" ]; then
+    warn "当前版本 ${new_ver:-未知} 与 GitHub 最新版 ${latest_ver} 不一致（软件源可能尚未同步该版本）。"
+  fi
+
   service_restart || return 1
   ok "更新并重启完成。"
 }
@@ -2187,8 +2877,7 @@ refresh_ip_wizard() {
   echo "1) 切换到 IPv4 并重新检测"
   echo "2) 切换到 IPv6 并重新检测"
   echo "0) 返回"
-  read -rp "请选择: " choice
-
+  read_line "请选择: " choice
   case "$choice" in
     1) new_ver="ipv4"; new_ip="$(detect_public_ip 4)" || new_ip="" ;;
     2) new_ver="ipv6"; new_ip="$(detect_public_ip 6)" || new_ip="" ;;
@@ -2201,80 +2890,104 @@ refresh_ip_wizard() {
   fi
 
   state_build --arg ver "$new_ver" --arg ip "$new_ip" '.ip_version = $ver | .server_ip = $ip'
-  apply_state
-  ok "已更新公网 IP 为 ${new_ip} (${new_ver})。"
+  # server_ip / ip_version 只影响分享链接与 Clash YAML，不影响 config.json（入站固定监听 ::），
+  # 所以只落盘并重新生成链接 / YAML，不重启 sing-box，不会断开现有连接。
+  commit_state_plain
+  render_yaml || warn "生成 Clash YAML 失败。"
+  render_info || warn "生成节点信息文件失败。"
+  ok "已更新公网 IP 为 ${new_ip} (${new_ver})，节点链接与 Clash YAML 已重新生成（sing-box 未重启）。"
 }
 
 # -------------------------
 # 初始节点（安装流程）
 # -------------------------
+# 状态文件是否「有效」：是 JSON 对象，且必需字段齐全、列表字段类型正确
+state_file_valid() {
+  [ -s "$STATE_FILE" ] || return 1
+  jq -e '
+    . as $s
+    | type == "object"
+    and (["uuid","private_key","public_key","short_id","tuic_pass","reality_sni","tuic_sni","server_ip"]
+         | all(.[]; (($s[.] | type) == "string") and (($s[.] | length) > 0)))
+    and ((.nodes // []) | type == "array")
+    and ((.landings // []) | type == "array")
+    and ((.blocked_domains // []) | type == "array")
+  ' "$STATE_FILE" >/dev/null 2>&1
+}
+
+# 沿用旧状态文件时，公网 IP 可能已变（换了服务器）：检测并按需更新
+refresh_ip_if_changed() {
+  local ver old new loc_raw flag loc code ans
+
+  ver="$(state_get '.ip_version // "ipv4"')"
+  old="$(state_get '.server_ip')"
+
+  if [ "$ver" = "ipv6" ]; then
+    new="$(detect_public_ip 6)" || new=""
+  else
+    new="$(detect_public_ip 4)" || new=""
+  fi
+
+  if [ -z "$new" ]; then
+    warn "未能检测到当前公网 ${ver} 地址，保留状态文件里的 ${old}。"
+    return 0
+  fi
+  [ "$new" != "$old" ] || return 0
+
+  warn "当前公网 IP 与状态文件不一致：${old} -> ${new}（可能换了服务器）。"
+  if [ "$CLI_YES" != "1" ]; then
+    read_line "是否更新为当前 IP？输入 y 更新 [默认 y]: " ans
+    ans="${ans:-y}"
+    if [ "${ans,,}" != "y" ]; then
+      info "保留 ${old}。"
+      return 0
+    fi
+  fi
+
+  loc_raw="$(detect_location "$new" self "本机")"
+  code="$(echo "$loc_raw" | cut -d'|' -f1)"
+  flag="$(echo "$loc_raw" | cut -d'|' -f2)"
+  loc="$(echo "$loc_raw" | cut -d'|' -f3)"
+
+  state_build --arg ip "$new" --arg cc "$code" --arg flag "$flag" --arg loc "$loc" \
+    '.server_ip = $ip | .country_code = $cc | .location_flag = $flag | .location_name = $loc'
+  commit_state_plain
+  ok "已更新公网 IP：${new}（${flag}${loc}）。已有节点名称里的地区不会自动改变。"
+}
+
+# 命令行指定的一个直出节点：值为 0 跳过；沿用旧状态时同类型同端口已存在则跳过（幂等）
+add_cli_node() {
+  local type="$1" val="$2" port
+
+  [ -n "$val" ] || return 0
+
+  if [ "$val" = "0" ]; then
+    info "已指定 ${type%%-*}=0，跳过。"
+    return 0
+  fi
+
+  port=$((10#$val))
+  if jq -e --arg t "$type" --argjson p "$port" \
+       '.nodes[]? | select(.type == $t and ((.port | tonumber) == $p))' "$STATE_FILE" >/dev/null 2>&1; then
+    info "节点 ${type} / 端口 ${port} 已存在，跳过。"
+    return 0
+  fi
+
+  info "命令行指定 ${type%%-*} 端口: ${port}"
+  prepare_add_node "$type" "$port" "direct" || die "已取消。"
+  commit_state_plain
+}
+
+# 安装时创建的节点只来自命令行 vless= / tuic=；没有指定就不创建任何节点，也不提问
 choose_initial_nodes() {
-  step "配置初始节点"
-
-  local vport="" tport="" vc tc
-
-  if [ -n "$CLI_VLESS" ]; then
-    vport="$CLI_VLESS"
-    while true; do
-      if [ "$vport" = "0" ]; then
-        info "已指定 vless=0，跳过安装 VLESS 直出节点。"
-        break
-      fi
-      if valid_port "$vport"; then
-        vport=$((10#$vport))
-        info "使用参数指定 VLESS 端口: ${vport}"
-        prepare_add_node "vless-direct" "$vport" "direct"
-        commit_state_plain
-        break
-      fi
-      warn "VLESS 端口 ${vport} 无效（范围 1-65535，输入 0 取消）："
-      read -rp "请重新输入 VLESS 端口: " vport
-      vport="$(trim "$vport")"
-    done
-  else
-    echo "是否创建 VLESS 直出节点？"
-    echo "1) 创建 (默认端口 ${VLESS_DIRECT_PORT})"
-    echo "2) 跳过"
-    read -rp "请选择 [默认 1]: " vc
-    vc="${vc:-1}"
-    if [ "$vc" = "1" ]; then
-      vport="$(ask_port "请输入 VLESS 直出 TCP 端口" "$VLESS_DIRECT_PORT")"
-      prepare_add_node "vless-direct" "$vport" "direct"
-      commit_state_plain
-    fi
+  if [ -z "$CLI_VLESS" ] && [ -z "$CLI_TUIC" ]; then
+    info "未指定 vless= / tuic=，本次不创建任何节点。安装完成后输入 ysq 打开面板添加。"
+    return 0
   fi
 
-  if [ -n "$CLI_TUIC" ]; then
-    tport="$CLI_TUIC"
-    while true; do
-      if [ "$tport" = "0" ]; then
-        info "已指定 tuic=0，跳过安装 TUIC 直出节点。"
-        break
-      fi
-      if valid_port "$tport"; then
-        tport=$((10#$tport))
-        info "使用参数指定 TUIC 端口: ${tport}"
-        prepare_add_node "tuic-direct" "$tport" "direct"
-        commit_state_plain
-        break
-      fi
-      warn "TUIC 端口 ${tport} 无效（范围 1-65535，输入 0 取消）："
-      read -rp "请重新输入 TUIC 端口: " tport
-      tport="$(trim "$tport")"
-    done
-  else
-    echo
-    echo "是否创建 TUIC v5 直出节点？"
-    echo "1) 创建 (默认端口 ${TUIC_DIRECT_PORT})"
-    echo "2) 跳过"
-    read -rp "请选择 [默认 1]: " tc
-    tc="${tc:-1}"
-    if [ "$tc" = "1" ]; then
-      tport="$(ask_port "请输入 TUIC 直出 UDP 端口" "$TUIC_DIRECT_PORT")"
-      prepare_add_node "tuic-direct" "$tport" "direct"
-      commit_state_plain
-    fi
-  fi
+  step "创建初始节点"
+  add_cli_node "vless-direct" "$CLI_VLESS"
+  add_cli_node "tuic-direct" "$CLI_TUIC"
 }
 
 # -------------------------
@@ -2353,11 +3066,10 @@ render_config() {
       }
     };
 
-    def landing_out($n):
-      landing($n) as $l |
+    def landing_out($l):
     {
       "type": "vless",
-      "tag": ("out-" + $n.tag),
+      "tag": ("out-" + $l.id),
       "server": $l.server,
       "server_port": ($l.port | tonumber),
       "uuid": ($l.uuid // $s.uuid),
@@ -2401,16 +3113,23 @@ render_config() {
           }
         ]
         +
-        [
-          $s.nodes[]? |
-          select(.outbound_type == "landing") |
-          landing_out(.)
-        ]
+        (
+          [
+            $s.nodes[]? |
+            select(.outbound_type == "landing") |
+            landing(.)
+          ]
+          | unique_by(.id)
+          | map(landing_out(.))
+        )
       ),
       "route": {
         "rules": (
           (if (($s.blocked_domains // []) | length) > 0 then
             [
+              {
+                "action": "sniff"
+              },
               {
                 "domain_suffix": $s.blocked_domains,
                 "action": "reject"
@@ -2425,7 +3144,7 @@ render_config() {
                 .tag
               ],
               "action": "route",
-              "outbound": (if .outbound_type == "landing" then ("out-" + .tag) else "direct" end)
+              "outbound": (if .outbound_type == "landing" then ("out-" + .landing_id) else "direct" end)
             }
           ]
         ),
@@ -2505,7 +3224,7 @@ INFO
   if [ "$(jq '.nodes | length' "$STATE_FILE")" -eq 0 ]; then
     cat >> "$INFO_FILE" <<INFO
 当前还没有节点。
-输入 ysq 打开面板后，选择“添加节点”。
+输入 ysq 打开面板后，选择「添加节点」。
 
 INFO
     chmod 600 "$INFO_FILE"
@@ -2551,6 +3270,7 @@ render_yaml() {
 
   local uuid public_key short_id tuic_pass reality_sni tuic_sni server_ip
   local type name port
+  local q_server q_uuid q_pass q_rsni q_tsni q_pbk q_sid
 
   uuid="$(state_get '.uuid')"
   public_key="$(state_get '.public_key')"
@@ -2559,6 +3279,15 @@ render_yaml() {
   reality_sni="$(state_get '.reality_sni')"
   tuic_sni="$(state_get '.tuic_sni')"
   server_ip="$(state_get '.server_ip')"
+
+  # 这些值写进 YAML 时统一加引号：纯数字 / 形如 12e45 的 short-id、IPv6 地址等不加引号会被解析成数字或报错
+  q_server="$(yaml_quote "$server_ip")"
+  q_uuid="$(yaml_quote "$uuid")"
+  q_pass="$(yaml_quote "$tuic_pass")"
+  q_rsni="$(yaml_quote "$reality_sni")"
+  q_tsni="$(yaml_quote "$tuic_sni")"
+  q_pbk="$(yaml_quote "$public_key")"
+  q_sid="$(yaml_quote "$short_id")"
 
   cat > "$YAML_FILE" <<YAML
 mixed-port: 7890
@@ -2588,18 +3317,18 @@ YAML
         printf '  - name: %s\n' "$(yaml_quote "$name")"
         cat <<YAML
     type: vless
-    server: ${server_ip}
+    server: ${q_server}
     port: ${port}
-    uuid: ${uuid}
+    uuid: ${q_uuid}
     network: tcp
     udp: true
     tls: true
     flow: xtls-rprx-vision
-    servername: ${reality_sni}
+    servername: ${q_rsni}
     client-fingerprint: chrome
     reality-opts:
-      public-key: ${public_key}
-      short-id: ${short_id}
+      public-key: ${q_pbk}
+      short-id: ${q_sid}
 YAML
       } >> "$YAML_FILE"
     elif [[ "$type" == tuic* ]]; then
@@ -2607,13 +3336,13 @@ YAML
         printf '  - name: %s\n' "$(yaml_quote "$name")"
         cat <<YAML
     type: tuic
-    server: ${server_ip}
+    server: ${q_server}
     port: ${port}
-    uuid: ${uuid}
-    password: ${tuic_pass}
+    uuid: ${q_uuid}
+    password: ${q_pass}
     alpn:
       - h3
-    sni: ${tuic_sni}
+    sni: ${q_tsni}
     skip-cert-verify: true
     congestion-controller: bbr
     udp-relay-mode: native
@@ -2671,14 +3400,65 @@ restart_and_status() {
   service_status
 }
 
+# 重新渲染 config.json（按 ysq-state.db）并重启；渲染失败不重启，重启失败恢复旧配置
+rerender_and_restart() {
+  local bak_conf=""
+
+  if [ -f "$CONFIG_FILE" ]; then
+    bak_conf="$(mktemp "${CONFIG_FILE}.tmp.XXXXXX")" || { err "无法创建备份文件。"; return 1; }
+    cp -p "$CONFIG_FILE" "$bak_conf"
+  fi
+
+  if ! render_all; then
+    [ -z "$bak_conf" ] || rm -f "$bak_conf"
+    err "重新渲染失败，现有配置未被修改，未重启。"
+    return 1
+  fi
+
+  if ! restart_singbox; then
+    err "用新配置重启失败，正在恢复旧配置..."
+    if [ -n "$bak_conf" ]; then
+      mv -f "$bak_conf" "$CONFIG_FILE"
+      restart_singbox || warn "旧配置也启动失败，请在面板里查看状态与日志。"
+    fi
+    return 1
+  fi
+
+  [ -z "$bak_conf" ] || rm -f "$bak_conf"
+  return 0
+}
+
+restart_wizard() {
+  need_state
+  step "重启 sing-box"
+
+  local choice
+
+  echo "1) 直接重启"
+  echo "2) 重新渲染后重启"
+  echo "0) 返回"
+  read_line "请选择 [默认 1]: " choice
+  choice="${choice:-1}"
+
+  case "$choice" in
+    1) restart_and_status ;;
+    2)
+      rerender_and_restart
+      service_status
+      ;;
+    0) return "$CANCEL_RC" ;;
+    *) warn "输入错误。"; return 1 ;;
+  esac
+}
+
 # -------------------------
-# 展示
+# 展示与日志
 # -------------------------
+# 使用 jq 码点宽度计算，解决中文与国旗 Emoji 导致的表格错位
 list_nodes_table() {
   need_state
 
-  local count idx name type protocol port outbound_type landing
-
+  local count
   count="$(jq '.nodes | length' "$STATE_FILE")"
 
   if [ "$count" -eq 0 ]; then
@@ -2686,18 +3466,46 @@ list_nodes_table() {
     return 0
   fi
 
-  printf "%-4s %-28s %-6s %-8s %-20s %s\n" "序号" "节点名" "协议" "端口" "类型" "落地 (国家：ip)"
-  printf "%-4s %-28s %-6s %-8s %-20s %s\n" "----" "----------------------------" "------" "------" "--------------------" "--------------------"
+  jq -r "$JQ_TABLE_LIB"'
+    def tname($type; $out):
+      if ($type | startswith("vless")) then
+        if $out == "landing" then "VLESS -> VLESS 中转" else "VLESS 直出" end
+      elif ($type | startswith("tuic")) then
+        if $out == "landing" then "TUIC v5 -> VLESS 中转" else "TUIC v5 直出" end
+      else $type end;
 
-  while IFS=$'\t' read -r idx name type protocol port outbound_type landing; do
-    printf "%-4s %-28s %-6s %-8s %-20s %s\n" \
-      "$idx" "$name" "${protocol^^}" "$port" "$(node_type_name "$type" "$outbound_type")" "$landing"
-  done < <(jq -r '. as $s | .nodes | to_entries[] | .value as $n
-    | [(.key + 1), $n.name, $n.type, ($n.protocol // "tcp"), ($n.port | tostring),
-       ($n.outbound_type // "direct"),
-       (if ($n.outbound_type // "direct") == "landing"
-        then ((first($s.landings[]? | select(.id == ($n.landing_id // ""))) | .display) // "(落地已丢失)")
-        else "-" end)] | @tsv' "$STATE_FILE")
+    . as $s |
+    ["序号", "节点名", "协议", "端口", "类型", "落地 (国家：ip)"] as $headers |
+    [4, 28, 6, 6, 20, 20] as $mins |
+    [
+      .nodes | to_entries[] | .value as $n |
+      ($n.outbound_type // "direct") as $out |
+      [
+        ((.key + 1) | tostring),
+        ($n.name // "-"),
+        (($n.protocol // "tcp") | ascii_upcase),
+        ($n.port | tostring),
+        tname($n.type; $out),
+        (if $out == "landing" then
+          ((first($s.landings[]? | select(.id == ($n.landing_id // ""))) | .display) // "(落地已丢失)")
+        else "-" end)
+      ]
+    ] as $rows |
+    [
+      range(0; 6) as $c |
+      ([ $mins[$c], ($headers[$c] | dwidth), ($rows[]?[$c] | dwidth) ] | max)
+    ] as $widths |
+    (
+      [ range(0; 5) as $c | ($headers[$c] | pad($widths[$c])) ] + [$headers[5]] | join("  ")
+    ),
+    (
+      [ range(0; 6) as $c | dash($widths[$c]) ] | join("  ")
+    ),
+    (
+      $rows[] | . as $r |
+      [ range(0; 5) as $c | ($r[$c] | pad($widths[$c])) ] + [$r[5]] | join("  ")
+    )
+  ' "$STATE_FILE"
 
   return 0
 }
@@ -2705,19 +3513,31 @@ list_nodes_table() {
 show_ports() {
   if [ -f "$STATE_FILE" ]; then
     local tcp_ports udp_ports
-    tcp_ports="$(jq -r '.nodes[]? | select((.protocol // "tcp") == "tcp") | .port' "$STATE_FILE" | paste -sd'|' -)"
-    udp_ports="$(jq -r '.nodes[]? | select((.protocol // "tcp") == "udp") | .port' "$STATE_FILE" | paste -sd'|' -)"
+    tcp_ports="$(jq -r '.nodes[]? | select((.protocol // "tcp") == "tcp") | .port' "$STATE_FILE" | paste -sd',' -)"
+    udp_ports="$(jq -r '.nodes[]? | select((.protocol // "tcp") == "udp") | .port' "$STATE_FILE" | paste -sd',' -)"
 
     echo "[TCP 监听端口]"
     if [ -n "$tcp_ports" ]; then
-      ss -tlpn 2>/dev/null | grep -E ":(${tcp_ports})\\b" || true
+      ss -tlpn 2>/dev/null | awk -v plist="$tcp_ports" 'BEGIN {
+        n = split(plist, arr, ",")
+        for (i = 1; i <= n; i++) ports[arr[i]] = 1
+      } NR > 1 {
+        loc = $4; sub(/^.*:/, "", loc)
+        if (loc in ports) print $0
+      }' || true
     else
       echo "无"
     fi
 
     echo "[UDP 监听端口]"
     if [ -n "$udp_ports" ]; then
-      ss -ulpn 2>/dev/null | grep -E ":(${udp_ports})\\b" || true
+      ss -ulpn 2>/dev/null | awk -v plist="$udp_ports" 'BEGIN {
+        n = split(plist, arr, ",")
+        for (i = 1; i <= n; i++) ports[arr[i]] = 1
+      } NR > 1 {
+        loc = $4; sub(/^.*:/, "", loc)
+        if (loc in ports) print $0
+      }' || true
     else
       echo "无"
     fi
@@ -2753,6 +3573,42 @@ show_status() {
   show_ports
 }
 
+show_logs() {
+  step "sing-box 运行日志"
+
+  local lines="" out="" file
+
+  read_line "显示最近多少行？[默认 100]: " lines
+  lines="$(trim "$lines")"
+  if ! [[ "$lines" =~ ^[0-9]{1,4}$ ]] || [ "$((10#$lines))" -lt 1 ]; then
+    lines=100
+  else
+    lines=$((10#$lines))
+  fi
+
+  case "$SERVICE_MANAGER" in
+    systemd)
+      out="$(journalctl -u sing-box -n "$lines" --no-pager 2>&1 || true)"
+      if [ -z "$out" ] || [[ "$out" == *"No entries"* ]]; then
+        warn "journal 里暂无 sing-box 日志。"
+      else
+        printf '%s\n' "$out"
+      fi
+      ;;
+    openrc|none)
+      if [ -s "$LOG_FILE" ]; then
+        echo "--- ${LOG_FILE} ---"
+        tail -n "$lines" "$LOG_FILE"
+      else
+        warn "日志文件为空或不存在：${LOG_FILE}"
+      fi
+      ;;
+  esac
+
+  echo
+  info "提示：当前日志级别为 error，只会记录错误；日志为空通常表示运行正常。"
+}
+
 print_summary() {
   step "安装完成"
   ok "节点直链文件：${INFO_FILE}"
@@ -2761,33 +3617,89 @@ print_summary() {
   cat "$INFO_FILE"
   step "Clash YAML"
   cat "$YAML_FILE"
-  ok "输入 ysq 打开管理面板。"
+  if [ "$PANEL_READY" = "1" ]; then
+    ok "输入 ysq 打开管理面板。"
+  else
+    warn "未创建 ysq 快捷命令（脚本没有保存为本地文件，见上方提示）。"
+  fi
 }
 
 install_panel_wrapper() {
   cat > "$PANEL_FILE" <<PANEL
 #!/usr/bin/env bash
-exec "$INSTALLER_FILE" panel "\$@"
+if [ ! -f "$INSTALLER_FILE" ]; then
+  echo "未找到主脚本文件: $INSTALLER_FILE，请重新运行安装脚本。" >&2
+  exit 1
+fi
+exec bash "$INSTALLER_FILE" panel "\$@"
 PANEL
   chmod +x "$PANEL_FILE"
 }
 
-save_self() {
-  if [ -f "$0" ] && ! [ "$0" -ef "$INSTALLER_FILE" ]; then
-    cp "$0" "$INSTALLER_FILE" 2>/dev/null || true
-  fi
-  chmod +x "$INSTALLER_FILE" 2>/dev/null || true
+# 判断一个文件是不是「我们自己的脚本」：
+#   必须是普通文件、以 #! 开头（排除 ELF 二进制，如 /bin/bash）、并含脚本标识
+is_ysq_script() {
+  local f="${1:-}"
+  [ -n "$f" ] && [ -f "$f" ] && [ -r "$f" ] || return 1
+  [ "$(head -c 2 "$f" 2>/dev/null)" = "#!" ] || return 1
+  grep -q "ysq sing-box" "$f" 2>/dev/null
 }
 
-uninstall_all() {
-  step "彻底删除"
+# 是否指向 bash 解释器本身
+is_shell_binary() {
+  local f="${1:-}" b
+  [ -n "$f" ] || return 1
+  b="$(command -v bash 2>/dev/null || true)"
+  [ -n "$b" ] && [ "$f" -ef "$b" ] && return 0
+  [ "$f" -ef /bin/bash ] || [ "$f" -ef /usr/bin/bash ] || [ "$f" -ef /bin/sh ] || [ "$f" -ef /usr/bin/sh ]
+}
 
-  local confirm
+# 把脚本自身保存到 INSTALLER_FILE，成功（得到一个可用的脚本文件）返回 0。
+# 来源按优先级：
+#   1) 本地脚本文件（bash script.sh）
+#   2) 已存在的 INSTALLER_FILE
+#   3) 环境变量 YSQ_SCRIPT_URL 指定的下载地址（适用于 curl | bash / bash <(curl ...)）
+# 管道运行时 BASH_SOURCE[0] 为空或为 /dev/fd/N，$0 可能是 "bash"：
+# 这里既不使用 $0，也要求来源是以 #! 开头且含标识的普通文件，因此绝不会把 bash 二进制复制成脚本。
+save_self() {
+  local src="${BASH_SOURCE[0]:-}" wd tmp
 
-  read -rp "确认彻底卸载 sing-box 及配置？输入 y 确认: " confirm
-  if [ "${confirm,,}" != "y" ]; then
-    warn "已取消。"
-    return "$CANCEL_RC"
+  if [ -n "$src" ] && ! is_shell_binary "$src" && is_ysq_script "$src"; then
+    if ! [ "$src" -ef "$INSTALLER_FILE" ]; then
+      install -m 755 "$src" "$INSTALLER_FILE" 2>/dev/null || { warn "保存脚本到 ${INSTALLER_FILE} 失败。"; return 1; }
+    fi
+    chmod +x "$INSTALLER_FILE" 2>/dev/null || true
+    return 0
+  fi
+
+  if is_ysq_script "$INSTALLER_FILE"; then
+    chmod +x "$INSTALLER_FILE" 2>/dev/null || true
+    return 0
+  fi
+
+  # 管道 / 进程替换运行时没有本地文件：从发布地址（默认 GitHub，可用环境变量 YSQ_SCRIPT_URL 覆盖）下载一份
+  wd="$(new_work_dir)"
+  tmp="${wd}/${INSTALLER_NAME}"
+  if curl -fsSL --connect-timeout 10 --max-time 60 -o "$tmp" "${YSQ_SCRIPT_URL:-$DEFAULT_SCRIPT_URL}" 2>/dev/null && is_ysq_script "$tmp"; then
+    install -m 755 "$tmp" "$INSTALLER_FILE"
+    rm -rf "$wd"
+    return 0
+  fi
+  rm -rf "$wd"
+
+  warn "当前通过管道 / 进程替换运行，没有本地脚本文件，且从 ${YSQ_SCRIPT_URL:-$DEFAULT_SCRIPT_URL} 下载失败，未能保存到 ${INSTALLER_FILE}，因此不会创建 ysq 快捷命令。"
+  warn "如需 ysq 命令：先把脚本保存为文件再执行（curl -fsSLo ${INSTALLER_NAME} <脚本地址> && bash ${INSTALLER_NAME}）。"
+  return 1
+}
+
+# 删除 sing-box。keep=1 时只保留状态文件（UUID / 私钥 / 节点 / 落地 / 屏蔽列表）
+do_uninstall() {
+  local keep="${1:-0}" keep_copy="" p
+
+  if [ "$keep" = "1" ]; then
+    # 包管理器卸载可能清理 /etc/sing-box，先在目录外留一份，最后确认还在
+    keep_copy="$(mktemp /root/.ysq-state.keep.XXXXXX)" || die "无法创建临时备份。"
+    cp -p "$STATE_FILE" "$keep_copy"
   fi
 
   service_stop
@@ -2797,30 +3709,182 @@ uninstall_all() {
   rm -f /usr/local/bin/sing-box /usr/bin/sing-box
   rm -f /etc/systemd/system/sing-box.service
   rm -f /etc/init.d/sing-box
-  rm -rf /etc/sing-box /var/lib/sing-box /var/log/sing-box
-  rm -f "$INFO_FILE" "$YAML_FILE" "$PANEL_FILE" "$INSTALLER_FILE"
+  rm -f /run/sing-box.pid
+  remove_log_trim
+  rm -rf /var/lib/sing-box /var/log/sing-box
+  rm -f "$INFO_FILE" "$YAML_FILE" "$PANEL_FILE"
+
+  if [ "$keep" = "1" ]; then
+    # 配置目录里除状态文件外全部删除（config.json / 证书 / 临时文件）
+    for p in "$CONFIG_DIR"/* "$CONFIG_DIR"/.[!.]*; do
+      [ -e "$p" ] || continue
+      [ "$p" = "$STATE_FILE" ] && continue
+      rm -rf "$p"
+    done
+    if [ ! -s "$STATE_FILE" ]; then
+      mkdir -p "$CONFIG_DIR"
+      install -m 600 "$keep_copy" "$STATE_FILE"
+    fi
+    rm -f "$keep_copy"
+    chmod 600 "$STATE_FILE" 2>/dev/null || true
+  else
+    rm -rf "$CONFIG_DIR"
+    rm -f "$INSTALLER_FILE"
+  fi
 
   service_daemon_reload
-  ok "已彻底删除。"
+}
+
+uninstall_all() {
+  step "删除 sing-box"
+
+  local mode confirm
+
+  echo "1) 彻底删除"
+  echo "2) 保留节点数据"
+  echo "0) 取消"
+  read_line "请选择: " mode
+
+  case "$mode" in
+    1)
+      read_line "确认彻底删除 sing-box 及全部节点数据？输入 y 确认: " confirm
+      if [ "${confirm,,}" != "y" ]; then
+        warn "已取消。"
+        return "$CANCEL_RC"
+      fi
+      do_uninstall 0
+      ok "已彻底删除。"
+      ;;
+    2)
+      if [ ! -f "$STATE_FILE" ]; then
+        warn "未找到 ${STATE_FILE}，没有可保留的节点数据。"
+        return 1
+      fi
+      read_line "确认删除 sing-box 并保留节点数据？输入 y 确认: " confirm
+      if [ "${confirm,,}" != "y" ]; then
+        warn "已取消。"
+        return "$CANCEL_RC"
+      fi
+      do_uninstall 1
+      ok "已删除 sing-box，节点数据已保留：${STATE_FILE}"
+      info "该文件含 UUID / Reality 私钥，请妥善保管（权限 600）。"
+      info "重新安装：bash ${INSTALLER_FILE} [vless=端口 tuic=端口 -y]，会自动沿用该文件，不会覆盖。"
+      ;;
+    0) return "$CANCEL_RC" ;;
+    *) warn "输入错误。"; return 1 ;;
+  esac
+
   exit "$EXIT_PANEL_RC"
+}
+
+# -------------------------
+# 更新面板：下载新脚本 -> 校验 -> 原子替换 -> 用新脚本执行 upgrade（保留数据）
+# -------------------------
+script_version_of() {
+  sed -n 's/^YSQ_VERSION="\(.*\)"$/\1/p' "$1" 2>/dev/null | head -n 1
+}
+
+# 新版脚本执行：沿用状态文件，刷新服务单元 / 日志裁剪，重新渲染并重启
+upgrade_action() {
+  need_root
+  need_state
+  step "升级：应用新版脚本（保留全部节点数据）"
+
+  ensure_state_defaults || die "状态文件规范化失败，请检查 ${STATE_FILE}。"
+  install_deps
+  install_singbox
+  ensure_dirs
+  rerender_and_restart || die "升级后重启失败，已恢复旧配置。"
+  ok "升级完成。"
+}
+
+update_panel_wizard() {
+  need_state
+  step "更新面板"
+
+  local url="${YSQ_SCRIPT_URL:-$DEFAULT_SCRIPT_URL}"
+  local wd tmp new_ver confirm new_file bak
+
+  wd="$(new_work_dir)"
+  tmp="${wd}/${INSTALLER_NAME}"
+
+  info "当前面板版本：${YSQ_VERSION}"
+  info "下载地址：${url}"
+
+  if ! curl -fsSL --connect-timeout 10 --max-time 60 -o "$tmp" "$url"; then
+    rm -rf "$wd"
+    die "下载失败，现有面板未改动。请检查网络或 GitHub 访问。"
+  fi
+  if ! is_ysq_script "$tmp"; then
+    rm -rf "$wd"
+    die "下载的内容不是有效的 ysq 脚本（可能是 404 页面或被拦截），现有面板未改动。"
+  fi
+  if ! bash -n "$tmp" 2>/dev/null; then
+    rm -rf "$wd"
+    die "新脚本语法检查未通过，现有面板未改动。"
+  fi
+
+  new_ver="$(script_version_of "$tmp")"
+  info "远端面板版本：${new_ver:-未标注版本号}"
+
+  if [ -f "$INSTALLER_FILE" ] && cmp -s "$tmp" "$INSTALLER_FILE"; then
+    info "远端脚本与当前脚本完全一致。"
+    read_line "仍要重新安装一遍？输入 y 确认: " confirm
+    confirm="${confirm:-n}"
+  else
+    read_line "确认更新？节点数据（${STATE_FILE}）会保留，更新后会重新渲染并重启 sing-box。输入 y 确认 [默认 y]: " confirm
+    confirm="${confirm:-y}"
+  fi
+  if [ "${confirm,,}" != "y" ]; then
+    rm -rf "$wd"
+    warn "已取消。"
+    return "$CANCEL_RC"
+  fi
+
+  # 先写同目录临时文件再 mv：原子替换；当前正在运行的旧脚本仍持有旧 inode，不会被改乱
+  new_file="${INSTALLER_FILE}.new.$$"
+  bak="${INSTALLER_FILE}.bak"
+  install -m 755 "$tmp" "$new_file"
+  if [ -f "$INSTALLER_FILE" ]; then
+    cp -p "$INSTALLER_FILE" "$bak"
+  fi
+  mv -f "$new_file" "$INSTALLER_FILE"
+  rm -rf "$wd"
+  install_panel_wrapper
+
+  info "正在用新脚本应用升级..."
+  if ! bash "$INSTALLER_FILE" upgrade; then
+    err "新脚本的升级步骤失败，正在恢复旧脚本..."
+    if [ -f "$bak" ]; then
+      mv -f "$bak" "$INSTALLER_FILE"
+    fi
+    return 1
+  fi
+
+  ok "面板已更新（${YSQ_VERSION} -> ${new_ver:-新版}），节点数据已保留。旧脚本备份在 ${bak}。"
+  return "$RESTART_PANEL_RC"
 }
 
 # -------------------------
 # 面板：每个操作都在子 shell 里跑，die / exit 只会中止当前操作
 # -------------------------
+# 注意：这里绝不能写成  run_action ... || xxx 。
+# bash 在 || / && / if 条件里会整体忽略 set -e，子 shell 里再写 set -e 也无效，
+# 结果是 apply_state 失败（已回滚）后向导函数继续往下执行，还会打印“已生效”。
+# 所以 act 用「关 -e → 直接调用 → 取返回码 → 开 -e」的写法，让子 shell 里的 set -e 真正生效。
 run_action() {
   local rc=0
 
-  set +e
   ( set -e; "$@" )
   rc=$?
-  set -e
 
   cleanup_tmp
 
   case "$rc" in
     0|"$CANCEL_RC") ;;
     "$EXIT_PANEL_RC") exit 0 ;;
+    # 此时子 shell 已结束、临时文件已清理；exec 让新面板直接取代当前进程
+    "$RESTART_PANEL_RC") pause; exec bash "$INSTALLER_FILE" panel ;;
     *) warn "操作未完成，已返回菜单。" ;;
   esac
 
@@ -2830,7 +3894,12 @@ run_action() {
 # 运行一个操作，结束后暂停（用户主动取消时不暂停）。pause 统一放在这里，各向导函数内部不再 pause
 act() {
   local rc=0
-  run_action "$@" || rc=$?
+
+  set +e
+  run_action "$@"
+  rc=$?
+  set -e
+
   if [ "$rc" -ne "$CANCEL_RC" ]; then
     pause
   fi
@@ -2847,8 +3916,9 @@ panel_menu() {
   while true; do
     echo
     echo -e "${C_BOLD}==============================${C_RESET}"
-    echo -e "${C_BOLD} ysq sing-box 管理面板${C_RESET}"
+    echo -e "${C_BOLD} ysq sing-box 管理面板  v${YSQ_VERSION}${C_RESET}"
     echo -e "${C_BOLD}==============================${C_RESET}"
+    print_status_bar
     echo "状态文件: ${STATE_FILE}"
     echo "配置文件: ${CONFIG_FILE}"
     echo
@@ -2859,86 +3929,93 @@ panel_menu() {
     echo "1) 查看节点直链"
     echo "2) 查看 Clash YAML"
     echo "3) 查看 sing-box 状态 / 监听端口"
-    echo "4) 添加节点 (直出 / 中转落地)"
-    echo "5) 落地节点池管理 (查看 / 添加 / 修改 / 删除)"
-    echo "6) 删除节点 (支持批量)"
-    echo "7) 修改节点 (端口 / SNI / 出口落地)"
-    echo "8) 屏蔽指定网站管理"
-    echo "9) 更新 sing-box 内核"
-    echo "10) 重启 sing-box"
-    echo "11) 刷新公网 IP (IPv4/IPv6 切换)"
-    echo "12) 彻底删除 sing-box 和脚本"
+    echo "4) 查看 sing-box 日志"
+    echo "5) 添加节点 (直出 / 中转落地)"
+    echo "6) 落地节点池管理 (查看 / 添加 / 修改 / 删除)"
+    echo "7) 删除节点 (支持批量)"
+    echo "8) 修改节点 (端口 / SNI / 出口落地)"
+    echo "9) 屏蔽指定网站管理 (支持批量)"
+    echo "10) 更新 sing-box 内核"
+    echo "11) 重启 sing-box (可选是否重新渲染配置)"
+    echo "12) 刷新公网 IP (IPv4/IPv6 切换)"
+    echo "13) 更新面板 (保留数据)"
+    echo "14) 删除 sing-box (彻底删除 / 保留节点数据)"
     echo "0) 退出"
     echo "=============================="
-    read -rp "请输入选项: " choice
-
+    read_line "请输入选项: " choice
     case "$choice" in
       1) act show_info ;;
       2) act show_yaml ;;
       3) act show_status ;;
-      4) act add_node_wizard ;;
-      5) landing_pool_menu ;;
-      6) act delete_node_wizard ;;
-      7) act modify_node_wizard ;;
-      8) block_website_menu ;;
-      9) act update_core_wizard ;;
-      10) act restart_and_status ;;
-      11) act refresh_ip_wizard ;;
-      12) act uninstall_all ;;
+      4) act show_logs ;;
+      5) act add_node_wizard ;;
+      6) landing_pool_menu ;;
+      7) act delete_node_wizard ;;
+      8) act modify_node_wizard ;;
+      9) block_website_menu ;;
+      10) act update_core_wizard ;;
+      11) act restart_wizard ;;
+      12) act refresh_ip_wizard ;;
+      13) act update_panel_wizard ;;
+      14) act uninstall_all ;;
       0) exit 0 ;;
       *) warn "输入错误。" ;;
     esac
   done
 }
 
+# 命令行端口参数在安装任何东西之前就校验，避免装到一半才发现端口非法
+validate_cli_ports() {
+  local name val
+  for name in vless tuic; do
+    case "$name" in
+      vless) val="$CLI_VLESS" ;;
+      tuic)  val="$CLI_TUIC" ;;
+    esac
+    [ -n "$val" ] || continue
+    [ "$val" = "0" ] && continue
+    if ! valid_node_port "$val"; then
+      die "参数 ${name}=${val} 无效：节点端口必须在 ${MIN_NODE_PORT}-65535 之间（0 表示不创建）。"
+    fi
+  done
+}
+
 install_wizard() {
   need_root
 
-  local existing_choice
-
   echo -e "${C_BOLD}==============================${C_RESET}"
-  echo -e "${C_BOLD} ysq sing-box 一键安装脚本${C_RESET}"
+  echo -e "${C_BOLD} ysq sing-box 一键安装脚本  v${YSQ_VERSION}${C_RESET}"
   echo -e "${C_BOLD}==============================${C_RESET}"
   echo
 
-  if [ -f "$STATE_FILE" ] && [ -z "$CLI_VLESS" ] && [ -z "$CLI_TUIC" ] && [ -z "$CLI_SAFE" ]; then
-    warn "检测到已有安装状态：$STATE_FILE"
-    echo "1) 更新 ysq 面板并打开"
-    echo "2) 覆盖重装"
-    echo "0) 退出"
-    read -rp "请输入选项: " existing_choice
-
-    case "$existing_choice" in
-      1)
-        save_self
-        install_panel_wrapper
-        panel_menu
-        ;;
-      2)
-        warn "将覆盖旧配置。"
-        ;;
-      0)
-        exit 0
-        ;;
-      *)
-        die "输入错误。"
-        ;;
-    esac
-  elif [ -f "$STATE_FILE" ]; then
-    warn "检测到已有安装状态，按命令行参数覆盖重装。"
-  fi
+  validate_cli_ports
 
   install_deps
   install_singbox
   ensure_dirs
 
-  # 覆盖重装前备份旧 state，渲染失败时可恢复
-  local prev="${STATE_FILE}.prev"
+  # 已有状态文件：有效就沿用（不覆盖），无效则改名备份后当作全新安装
+  # 修改前先留一份 .prev，渲染 / 启动失败时恢复
+  local prev="${STATE_FILE}.prev" bad
   if [ -f "$STATE_FILE" ]; then
     cp -p "$STATE_FILE" "$prev"
+    INSTALL_PREV_FILE="$prev"
+    if state_file_valid; then
+      step "沿用已有状态文件"
+      ok "检测到有效的 ${STATE_FILE}：将沿用其中的 UUID / 密钥 / 节点 / 落地 / 屏蔽设置，不会覆盖。"
+      ensure_state_defaults || die "状态文件规范化失败，请检查 ${STATE_FILE}。"
+      refresh_ip_if_changed
+    else
+      bad="${STATE_FILE}.invalid.$(date +%Y%m%d%H%M%S)"
+      mv -f "$STATE_FILE" "$bad"
+      rm -f "$prev"
+      warn "已有的状态文件无效（不是合法 JSON 或缺少必需字段），已改名备份为 ${bad}，将按全新安装处理。"
+      create_state_file
+    fi
+  else
+    create_state_file
   fi
 
-  create_state_file
   choose_initial_nodes
 
   if ! render_all; then
@@ -2958,8 +4035,10 @@ install_wizard() {
   fi
 
   rm -f "$prev"
-  save_self
-  install_panel_wrapper
+  if save_self; then
+    install_panel_wrapper
+    PANEL_READY=1
+  fi
   print_summary
 }
 
@@ -2982,6 +4061,9 @@ main() {
       render_all || die "配置生成失败，现有配置未被修改。"
       restart_singbox || die "sing-box 重启失败。"
       ;;
+    upgrade)
+      upgrade_action
+      ;;
     *)
       usage
       exit 1
@@ -2989,4 +4071,11 @@ main() {
   esac
 }
 
-main
+# ENTRY_POINT
+# curl ... | bash 时 stdin 是脚本内容本身，read 会把脚本剩余部分当输入吞掉。
+# 只对 main 这一条命令把标准输入重定向到终端（脚本源码仍从原管道读取，已经读完，不受影响）。
+if [ ! -t 0 ] && ( : </dev/tty ) 2>/dev/null; then
+  main </dev/tty
+else
+  main
+fi
