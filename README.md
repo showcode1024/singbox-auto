@@ -3,7 +3,7 @@
 ### 1. 默认极速安装（推荐）
 指定端口并使用默认安全参数(默认41454端口)：
 ```bash
-curl -Ls -o install-singbox-ysq.sh https://raw.githubusercontent.com/showcode1024/singbox-auto/main/install-singbox-ysq.sh && bash install-singbox-ysq.sh vless=41454 tuic=41454 safe=0
+curl -Ls -o install-singbox-ysq.sh https://raw.githubusercontent.com/showcode1024/singbox-auto/main/install-singbox-ysq.sh && bash install-singbox-ysq.sh vless=41454 tuic=41454 -y
 ```
 ### 2. 纯交互式菜单安装
 不带任何参数执行，将启动完整交互式向导：
@@ -14,9 +14,9 @@ curl -Ls -o install-singbox-ysq.sh https://raw.githubusercontent.com/showcode102
 
 | 参数名称 | 示例值 | 说明 |
 | :--- | :--- | :--- |
-| `vless` | `vless=41454` | 指定 VLESS 节点端口。端口需在 `10000-65535` 之间；设置为 `0` 表示不安装 VLESS 节点。低于 10000 会要求重新输入。 |
-| `tuic` | `tuic=41454` | 指定 TUIC v5 节点端口。端口需在 `10000-65535` 之间；设置为 `0` 表示不安装 TUIC 节点。低于 10000 会要求重新输入。 |
-| `safe` | `safe=0` | **安全模式开关**：<br>• `0`：静默使用预设默认 UUID、Reality 私钥、公钥及 SNI，跳过提问。<br>• `1`：弹出菜单询问是否全新生成随机 UUID 与密钥对。 |
+| `vless` | `vless=41454` | 指定 VLESS 节点端口。端口需在 `10000-65535` 之间；不填默认表示不安装 VLESS 节点。低于 10000 会要求重新输入。 |
+| `tuic` | `tuic=41454` | 指定 TUIC v5 节点端口。端口需在 `10000-65535` 之间；不填默认表示不安装 TUIC 节点。低于 10000 会要求重新输入。 |
+| `safe` | `-y` | **安全模式开关**：<br>• `-y`：静默使用预设默认 UUID、Reality 私钥、公钥及 SNI，跳过提问。<br>• ` `：弹出菜单询问是否全新生成随机 UUID 与密钥对。 |
 
 ---
 
@@ -89,4 +89,5 @@ ysq
 ## ⚠️ 注意事项
 
 1. **防火墙放行**：如果服务器开启了防火墙（如 `ufw`、`firewalld` 或云厂商安全组），请务必在控制台放行对应的 TCP / UDP 端口。
+2. 最低内存要求128mb。
 
