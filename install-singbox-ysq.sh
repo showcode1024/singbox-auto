@@ -185,7 +185,6 @@ for arg in "$@"; do
       err "未知参数：${arg}"
       case "$arg" in
         vless|tuic) warn "参数格式应为 ${arg}=值，例如 ${arg}=41454（等号两边不要有空格）。" ;;
-        safe=*)     warn "safe= 参数已取消，静默安装请改用 -y。" ;;
       esac
       usage >&2
       exit 1
@@ -3926,21 +3925,21 @@ panel_menu() {
     list_nodes_table || true
     echo
 
-    echo "1) 查看节点直链"
-    echo "2) 查看 Clash YAML"
-    echo "3) 查看 sing-box 状态 / 监听端口"
-    echo "4) 查看 sing-box 日志"
-    echo "5) 添加节点 (直出 / 中转落地)"
-    echo "6) 落地节点池管理 (查看 / 添加 / 修改 / 删除)"
-    echo "7) 删除节点 (支持批量)"
-    echo "8) 修改节点 (端口 / SNI / 出口落地)"
-    echo "9) 屏蔽指定网站管理 (支持批量)"
+    echo "1)  查看节点直链"
+    echo "2)  查看 Clash YAML"
+    echo "3)  查看 sing-box 状态 / 监听端口"
+    echo "4)  查看 sing-box 日志"
+    echo "5)  添加节点 (直出 / 中转落地)"
+    echo "6)  落地节点池管理 (查看 / 添加 / 修改 / 删除)"
+    echo "7)  删除节点 (支持批量)"
+    echo "8)  修改节点 (端口 / SNI / 出口落地)"
+    echo "9)  屏蔽指定网站管理 (支持批量)"
     echo "10) 更新 sing-box 内核"
     echo "11) 重启 sing-box (可选是否重新渲染配置)"
     echo "12) 刷新公网 IP (IPv4/IPv6 切换)"
     echo "13) 更新面板 (保留数据)"
     echo "14) 删除 sing-box (彻底删除 / 保留节点数据)"
-    echo "0) 退出"
+    echo "0)  退出"
     echo "=============================="
     read_line "请输入选项: " choice
     case "$choice" in
@@ -4070,7 +4069,6 @@ main() {
       ;;
   esac
 }
-
 # ENTRY_POINT
 # curl ... | bash 时 stdin 是脚本内容本身，read 会把脚本剩余部分当输入吞掉。
 # 只对 main 这一条命令把标准输入重定向到终端（脚本源码仍从原管道读取，已经读完，不受影响）。
