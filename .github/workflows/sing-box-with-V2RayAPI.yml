@@ -1,0 +1,219 @@
+name: Build sing-box with V2Ray API
+
+on:
+  workflow_dispatch:
+  schedule:
+    # GitHub Actions cron uses UTC. Twice daily, away from the top of the hour.
+    - cron: '17 1,13 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sing-box-six-tags-build
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.latest.outputs.tag }}
+      version: ${{ steps.latest.outputs.version }}
+      should_build: ${{ steps.latest.outputs.should_build }}
+    steps:
+      - name: Find latest stable upstream release
+        id: latest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$(gh api repos/SagerNet/sing-box/releases/latest --jq '.tag_name')"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Unexpected upstream stable release tag: $tag" >&2
+            exit 1
+          fi
+          version="${tag#v}"
+
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            should_build=false
+            echo "Release $tag already exists; skipping."
+          else
+            should_build=true
+            echo "Will build $tag."
+          fi
+
+          printf 'tag=%s\nversion=%s\nshould_build=%s\n' \
+            "$tag" "$version" "$should_build" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: discover
+    if: needs.discover.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: amd64
+            goarch: amd64
+            goarm: ''
+          - name: arm64
+            goarch: arm64
+            goarm: ''
+    steps:
+      - name: Check out exact upstream release tag
+        uses: actions/checkout@v6
+        with:
+          repository: SagerNet/sing-box
+          ref: ${{ needs.discover.outputs.tag }}
+          path: src
+          persist-credentials: false
+
+      - name: Set up required Go toolchain
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: src/go.mod
+          cache-dependency-path: src/go.sum
+
+      - name: Select six required build tags
+        working-directory: src
+        shell: bash
+        run: |
+          set -euo pipefail
+          tags="with_quic,with_utls,with_clash_api,with_v2ray_api,badlinkname,tfogo_checklinkname0"
+          echo "Build tags: $tags"
+          echo "BUILD_TAGS=$tags" >> "$GITHUB_ENV"
+
+      - name: Build static Linux binary
+        working-directory: src
+        shell: bash
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          VERSION: ${{ needs.discover.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p ../out
+          ldflags="$(cat release/LDFLAGS)"
+          go build -trimpath -buildvcs=false \
+            -tags "$BUILD_TAGS" \
+            -ldflags "-X github.com/sagernet/sing-box/constant.Version=${VERSION} ${ldflags} -s -w -buildid=" \
+            -o ../out/sing-box ./cmd/sing-box
+
+      - name: Verify compiled tags and static linking
+        shell: bash
+        run: |
+          set -euo pipefail
+          go version -m out/sing-box | tee out/build-info.txt
+          grep -F 'with_v2ray_api' out/build-info.txt
+          grep -F 'with_quic' out/build-info.txt
+          grep -F 'with_utls' out/build-info.txt
+          grep -F 'with_clash_api' out/build-info.txt
+          grep -F 'badlinkname' out/build-info.txt
+          grep -F 'tfogo_checklinkname0' out/build-info.txt
+          if readelf -l out/sing-box | grep -q 'INTERP'; then
+            echo 'Unexpected ELF dynamic interpreter; binary is not fully static.' >&2
+            exit 1
+          fi
+
+      - name: Smoke-test V2Ray and Clash API config on amd64
+        if: matrix.name == 'amd64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          out/sing-box version | tee out/version.txt
+          grep -F 'with_v2ray_api' out/version.txt
+          grep -F 'with_clash_api' out/version.txt
+          cat > out/v2ray-api-smoke.json <<'JSON'
+          {
+            "log": {"level": "error"},
+            "outbounds": [{"type": "direct", "tag": "direct"}],
+            "experimental": {
+              "clash_api": {
+                "external_controller": "127.0.0.1:9090",
+                "secret": "ci-check-only"
+              },
+              "v2ray_api": {
+                "listen": "127.0.0.1:10085",
+                "stats": {"enabled": true}
+              }
+            }
+          }
+          JSON
+          out/sing-box check -c out/v2ray-api-smoke.json
+
+      - name: Package tar.gz
+        shell: bash
+        env:
+          VERSION: ${{ needs.discover.outputs.version }}
+          SOURCE_TAG: ${{ needs.discover.outputs.tag }}
+          ARCH_NAME: ${{ matrix.name }}
+        run: |
+          set -euo pipefail
+          folder="sing-box-${VERSION}-linux-${ARCH_NAME}"
+          mkdir -p "pkg/$folder" dist
+          install -m 755 out/sing-box "pkg/$folder/sing-box"
+          cp src/LICENSE "pkg/$folder/LICENSE"
+          cp out/build-info.txt "pkg/$folder/go-build-info.txt"
+          printf 'Upstream: https://github.com/SagerNet/sing-box/tree/%s\nTags: %s\nCGO_ENABLED=0\n' \
+            "$SOURCE_TAG" "$BUILD_TAGS" > "pkg/$folder/BUILD_INFO.txt"
+          tar -C pkg -czf "dist/${folder}.tar.gz" "$folder"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-${{ matrix.name }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: [discover, build]
+    if: needs.discover.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: sing-box-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA-256 checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          count="$(find . -maxdepth 1 -name '*.tar.gz' -type f | wc -l)"
+          test "$count" -eq 2
+          sha256sum ./*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.discover.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: sing-box ${{ needs.discover.outputs.version }} + Clash/V2Ray API (unofficial)
+          draft: false
+          prerelease: false
+          make_latest: true
+          fail_on_unmatched_files: true
+          body: |
+            Unofficial builds from the unmodified upstream source at
+            https://github.com/SagerNet/sing-box/tree/${{ needs.discover.outputs.tag }}
+
+            Custom build tags: with_quic,with_utls,with_clash_api,with_v2ray_api,badlinkname,tfogo_checklinkname0.
+            This is a limited-feature build, not the full upstream default-tag set.
+            CGO_ENABLED=0; no glibc or musl dynamic runtime dependency.
+            These builds do not include the optional NaiveProxy outbound.
+
+            Binary archives include upstream LICENSE, build information, and Go metadata.
+            Verify tar.gz files with SHA256SUMS before installing.
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
