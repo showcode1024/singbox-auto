@@ -204,9 +204,8 @@ jobs:
           make_latest: true
           fail_on_unmatched_files: true
           body: |
-            builds from:
-            https://github.com/SagerNet/sing-box/tree/${{ needs.discover.outputs.tag }}
-            build tags: with_quic,with_utls,with_clash_api,with_v2ray_api,badlinkname,tfogo_checklinkname0.
+            build from:https://github.com/SagerNet/sing-box/tree/${{ needs.discover.outputs.tag }}
+            build tags:with_quic,with_utls,with_clash_api,with_v2ray_api,badlinkname,tfogo_checklinkname0.
           files: |
             dist/*.tar.gz
             dist/SHA256SUMS
