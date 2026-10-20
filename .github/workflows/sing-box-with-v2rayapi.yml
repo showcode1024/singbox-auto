@@ -198,7 +198,7 @@ jobs:
         with:
           tag_name: ${{ needs.discover.outputs.tag }}
           target_commitish: ${{ github.sha }}
-          name: sing-box ${{ needs.discover.outputs.version }} + V2rayapi
+          name: sing-box ${{ needs.discover.outputs.version }} with v2rayapi
           draft: false
           prerelease: false
           make_latest: true
