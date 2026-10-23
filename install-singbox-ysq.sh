@@ -27,7 +27,7 @@ set -euo pipefail
 #   - Alpine(OpenRC)：日志写入单个文件，busybox cron 每小时检查，达 9MB 裁剪、保留最后 2MB
 # ============================================================
 
-YSQ_VERSION="2026.10.23.2"
+YSQ_VERSION="2026.10.23.3"
 INSTALLER_NAME="install-singbox-ysq.sh"
 DEFAULT_SCRIPT_URL="https://raw.githubusercontent.com/showcode1024/singbox-auto/main/install-singbox-ysq.sh"
 
@@ -80,10 +80,10 @@ CERT_FILE="${YSQ_TEST_ROOT}/etc/sing-box/cert/tuic.crt"
 KEY_FILE="${YSQ_TEST_ROOT}/etc/sing-box/cert/tuic.key"
 CERT_SNI_FILE="${YSQ_TEST_ROOT}/etc/sing-box/cert/tuic.sni"
 LOG_FILE="${YSQ_TEST_ROOT}/var/log/sing-box/sing-box.log"
-# 日志裁剪（仅 OpenRC / Alpine 使用 busybox cron；systemd 的日志由 journald 管理）
+# 统一 info 文件日志：Agent 连续读取；systemd timer / OpenRC cron 提供容量检查兜底
 LOG_TRIM_MAX_MB=9      # 日志文件达到 9MB 时触发裁剪
 LOG_TRIM_KEEP_MB=2     # 裁剪后保留最后 2MB
-LOG_TRIM_SCRIPT="${YSQ_TEST_ROOT}/etc/periodic/hourly/ysq-singbox-log-trim"
+LOG_TRIM_SCRIPT="${YSQ_TEST_ROOT}/usr/local/libexec/ysq-singbox-log-trim"
 INFO_FILE="${YSQ_TEST_ROOT}/root/singbox-node-info.txt"
 YAML_FILE="${YSQ_TEST_ROOT}/root/singbox-nodes.yaml"
 PANEL_FILE="${YSQ_TEST_ROOT}/usr/local/bin/ysq"
@@ -509,38 +509,62 @@ TRIM
   chmod 755 "$dest"
 }
 
-# OpenRC(Alpine)：安装 busybox cron 的每小时裁剪任务，并确保 crond 已启用
+# Agent 每秒读取后检查容量；定时裁剪在 Agent 停止时仍提供兜底。
 install_log_trim() {
-  [ "$SERVICE_MANAGER" = "openrc" ] || return 0
-
   local wd
-
-  mkdir -p ${PERIODIC_DIR}
   wd="$(new_work_dir)"
+  mkdir -p "$(dirname "$LOG_TRIM_SCRIPT")"
   write_log_trim_script "$wd/trim"
   install_if_changed "$wd/trim" "$LOG_TRIM_SCRIPT" 755 || true
+  rm -f "${YSQ_TEST_ROOT}/etc/periodic/hourly/ysq-singbox-log-trim"
+  case "$SERVICE_MANAGER" in
+    systemd)
+      cat > "$wd/trim-service" <<EOF
+[Unit]
+Description=YSQ sing-box log size guard
+[Service]
+Type=oneshot
+ExecStart=${LOG_TRIM_SCRIPT}
+EOF
+      cat > "$wd/trim-timer" <<'EOF'
+[Unit]
+Description=YSQ sing-box log size guard timer
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30s
+AccuracySec=5s
+[Install]
+WantedBy=timers.target
+EOF
+      install_if_changed "$wd/trim-service" "${YSQ_TEST_ROOT}/etc/systemd/system/ysq-log-trim.service" 644 || true
+      install_if_changed "$wd/trim-timer" "${YSQ_TEST_ROOT}/etc/systemd/system/ysq-log-trim.timer" 644 || true
+      service_daemon_reload
+      systemctl enable --now ysq-log-trim.timer >/dev/null 2>&1 || warn "日志容量检查 timer 启动失败，请检查 ysq-log-trim.timer。"
+      ;;
+    openrc)
+      mkdir -p "${CRONTAB_DIR}"
+      touch "${CRONTAB_FILE}"
+      chmod 600 "${CRONTAB_FILE}"
+      sed -i '/# ysq-log-trim$/d' "${CRONTAB_FILE}"
+      echo "* * * * * ${LOG_TRIM_SCRIPT} # ysq-log-trim" >> "${CRONTAB_FILE}"
+      if [ -x "${CROND_FILE}" ]; then
+        rc-update add crond default >/dev/null 2>&1 || true
+        rc-service crond status >/dev/null 2>&1 || rc-service crond start 9>&- >/dev/null 2>&1 || true
+      else
+        warn "未找到 crond，Agent 停止时日志没有定时裁剪兜底。"
+      fi
+      ;;
+  esac
   rm -rf "$wd"
-
-  # busybox crond 靠 root 的 crontab 调用 run-parts；缺了就补上
-  mkdir -p ${CRONTAB_DIR}
-  if [ ! -f ${CRONTAB_FILE} ]; then
-    : > ${CRONTAB_FILE}
-    chmod 600 ${CRONTAB_FILE}
-  fi
-  if ! grep -q 'periodic/hourly' ${CRONTAB_FILE} 2>/dev/null; then
-    echo "0 * * * * run-parts ${PERIODIC_DIR}" >> ${CRONTAB_FILE}
-  fi
-
-  if [ -x ${CROND_FILE} ]; then
-    rc-update add crond default >/dev/null 2>&1 || true
-    rc-service crond status >/dev/null 2>&1 || rc-service crond start 9>&- >/dev/null 2>&1 || true
-  else
-    warn "未找到 crond 服务，sing-box 日志不会自动裁剪（可手动 apk add busybox-openrc 后重试）。"
-  fi
 }
 
 remove_log_trim() {
-  rm -f "$LOG_TRIM_SCRIPT"
+  if [ "$SERVICE_MANAGER" = "systemd" ]; then
+    systemctl disable --now ysq-log-trim.timer >/dev/null 2>&1 || true
+  fi
+  rm -f "$LOG_TRIM_SCRIPT" "${YSQ_TEST_ROOT}/etc/periodic/hourly/ysq-singbox-log-trim" \
+    "${YSQ_TEST_ROOT}/etc/systemd/system/ysq-log-trim.timer" "${YSQ_TEST_ROOT}/etc/systemd/system/ysq-log-trim.service"
+  [ ! -f "${CRONTAB_FILE}" ] || sed -i '/# ysq-log-trim$/d' "${CRONTAB_FILE}"
 }
 
 # 只在安装 / 更新内核时调用；restart_singbox 不再重写 unit
@@ -578,6 +602,7 @@ EOF
       if install_if_changed "$wd/unit" ${CORE_SYSTEMD_FILE} 644; then
         service_daemon_reload
       fi
+      install_log_trim
       ;;
     openrc)
       cat > "$wd/unit" <<EOF
@@ -678,12 +703,14 @@ service_restart() {
     systemd)
       if ! systemctl restart sing-box 9>&-; then
         err "systemctl restart sing-box 失败。"
+        [ ! -f "$LOG_FILE" ] || tail -n 20 "$LOG_FILE" >&2
         journalctl -u sing-box -n 20 --no-pager 2>/dev/null >&2 || true
         return 1
       fi
       sleep 0.5
       if ! systemctl is-active --quiet sing-box; then
         err "sing-box 启动后异常退出。"
+        [ ! -f "$LOG_FILE" ] || tail -n 20 "$LOG_FILE" >&2
         journalctl -u sing-box -n 20 --no-pager 2>/dev/null >&2 || true
         return 1
       fi
@@ -3355,10 +3382,18 @@ render_config() {
     return 1
   fi
   info "生成 sing-box 配置..."
+  mkdir -p "$CORE_LOG_DIR"
+  touch "$LOG_FILE"
+  chmod 640 "$LOG_FILE"
+  # Legacy OpenRC stdout logs may have been created by root. The new core file
+  # output must be writable by the service account, including on first adoption.
+  if id sing-box >/dev/null 2>&1; then
+    chown sing-box:sing-box "$CORE_LOG_DIR" "$LOG_FILE"
+  fi
 
   tmp="$(mktemp "${CONFIG_FILE}.tmp.${WORK_TAG}.XXXXXX")" || { err "无法创建临时配置文件。"; return 1; }
 
-  if ! jq --arg api_listen "127.0.0.1:${V2RAY_API_PORT}" --arg cert_file "$CERT_FILE" --arg key_file "$KEY_FILE" '
+  if ! jq --arg api_listen "127.0.0.1:${V2RAY_API_PORT}" --arg cert_file "$CERT_FILE" --arg key_file "$KEY_FILE" --arg log_file "$LOG_FILE" '
     (.users |= map(select(.enabled != false))) as $s |
 
     def landing($n):
@@ -3437,7 +3472,8 @@ render_config() {
 
     {
       "log": {
-        "level": "error",
+        "level": "info",
+        "output": $log_file,
         "timestamp": true
       },
       "experimental": {
@@ -3915,6 +3951,9 @@ show_logs() {
 
   local lines=100 out=""
 
+  if [ -s "$LOG_FILE" ]; then
+    tail -n "$lines" "$LOG_FILE"
+  else
   case "$SERVICE_MANAGER" in
     systemd)
       out="$(journalctl -u sing-box -n "$lines" --no-pager 2>&1 || true)"
@@ -3933,6 +3972,7 @@ show_logs() {
   esac
 
   echo
+  fi
   local log_level
   log_level="$(jq -r '.log.level // "未知"' "$CONFIG_FILE" 2>/dev/null || true)"
   info "提示：当前日志级别为 ${log_level:-未知}"
@@ -4472,6 +4512,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import fcntl
+import datetime
 import hashlib
 import http.client
 import ipaddress
@@ -4495,7 +4536,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-VERSION = "2026.10.23.2"
+VERSION = "2026.10.23.3"
 PROTOCOL = 1
 SAMPLE_SECONDS = 10
 SYNC_SECONDS = 15
@@ -4687,7 +4728,7 @@ class Transport:
             urllib.request.HTTPSHandler(context=ssl.create_default_context()), NoRedirect())
 
     def post(self, path, body, authenticated=True):
-        if path not in ("/api/agent/register", "/api/agent/sync", "/api/agent/detach", "/api/agent/wait"):
+        if path not in ("/api/agent/register", "/api/agent/sync", "/api/agent/detach", "/api/agent/wait", "/api/agent/activity"):
             raise AgentError("Unsupported agent endpoint")
         data = canonical(body).encode("utf-8")
         if len(data) > MAX_BODY:
@@ -5078,6 +5119,286 @@ def collect_counters(config):
         integer(value, "statistics byte counter")
         result.setdefault(key, {})[direction] = value
     return result
+
+
+class ActivityCollector:
+    """Bounded durable log queue, independent of the byte-accounting ledger.
+
+    Cursor, connection context and parsed events commit in one transaction. File
+    truncation is detected by inode AND a cursor anchor (copytruncate keeps inode).
+    Raw copytruncate can still race a core write; every trim is reported as a gap.
+    """
+    MAX_PENDING = 20000
+    MAX_QUEUE_BYTES = 16 * 1024 * 1024
+    MAX_RAW_BYTES = 9 * 1024 * 1024
+    KEEP_RAW_BYTES = 2 * 1024 * 1024
+    READ_BYTES = 256 * 1024
+    LINE = re.compile(r"\b(INFO|WARN|ERROR|FATAL)\s+(?:\[(\d+)\s+[^\]]*\]\s+)?(.*)")
+    INBOUND = re.compile(r"inbound/([^\s:]+)\[([^\]]+)\]:\s*(.*)")
+    SOURCE = re.compile(r"inbound (?:packet )?connection from (\S+)")
+    TARGET = re.compile(r"\[([^\]]+)\]\s+inbound (packet )?connection to (\S+)")
+    ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+    def __init__(self, config_path):
+        self.config_path = str(config_path)
+        config = read_json(config_path)
+        # A new enrollment/center receives a fresh activity queue. The byte
+        # ledger intentionally survives detach, whereas activity must not cross it.
+        scope = str(config.get("node_id") or "pending") + "@" + config["center_url"]
+        suffix = hashlib.sha256(scope.encode()).hexdigest()[:12]
+        self.path = config["db_path"] + ".activity-" + suffix + ".db"
+        private_parent(self.path)
+        with self.connect() as db:
+            db.execute("PRAGMA auto_vacuum=INCREMENTAL")
+            db.executescript('''
+                CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS pending(id TEXT PRIMARY KEY,ts INTEGER NOT NULL,payload TEXT NOT NULL,bytes INTEGER NOT NULL);
+                CREATE INDEX IF NOT EXISTS pending_time ON pending(ts);
+                CREATE INDEX IF NOT EXISTS pending_size ON pending(bytes);
+                CREATE TABLE IF NOT EXISTS seen(id TEXT PRIMARY KEY,ts INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS contexts(id TEXT PRIMARY KEY,ts INTEGER NOT NULL,value TEXT NOT NULL);
+            ''')
+        os.chmod(self.path, 0o600)
+
+    @contextlib.contextmanager
+    def connect(self):
+        db = sqlite3.connect(self.path, timeout=3, isolation_level=None)
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA synchronous=FULL")
+        db.execute("PRAGMA busy_timeout=3000")
+        # The queue has a 16 MiB payload budget; this also bounds ancillary pages.
+        db.execute("PRAGMA max_page_count=12288")
+        try:
+            yield db
+        finally:
+            db.close()
+
+    @contextlib.contextmanager
+    def transaction(self):
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                yield db
+                db.execute("COMMIT")
+            except BaseException:
+                db.execute("ROLLBACK")
+                raise
+
+    @staticmethod
+    def endpoint(value):
+        host, port = value, 0
+        try:
+            host, raw_port = value.rsplit(":", 1)
+            port = int(raw_port)
+            if not 0 <= port <= 65535:
+                raise ValueError()
+        except ValueError:
+            return value[:512], 0
+        return host.strip("[]")[:512], port
+
+    @staticmethod
+    def timestamp(line, fallback):
+        match = re.search(r"([+-]\d{4})\s+(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)", line)
+        if match:
+            try:
+                return int(datetime.datetime.strptime(match[2] + match[1], "%Y-%m-%d %H:%M:%S%z").timestamp())
+            except ValueError:
+                pass
+        return fallback
+
+    def aliases(self, config):
+        aliases = {}
+        # Legacy names remain resolvable across a managed credential adoption.
+        with database_connection(config["db_path"]) as db:
+            aliases.update((row["stats_key"], row["user_id"]) for row in db.execute("SELECT stats_key,user_id FROM aliases"))
+        state = read_json(config.get("state_path", DEFAULT_STATE))
+        imported = config.get("registration_aliases", {})
+        for name, uid in imported.items():
+            if isinstance(uid, str) and USER_ID_RE.fullmatch(uid):
+                aliases[name] = uid
+        managed_here = state.get("management", {}).get("node_id") == config.get("node_id")
+        for user in state.get("users", []):
+            uid = str(user.get("id", "") if managed_here else imported.get(user.get("name"), ""))
+            if USER_ID_RE.fullmatch(uid):
+                aliases[uid] = uid
+                aliases[user.get("stats_key") or user.get("name")] = uid
+        return aliases
+
+    def enqueue(self, db, event):
+        # One malformed log field must not poison an otherwise valid upload batch.
+        for key, limit in (("source_ip", 64), ("target", 512), ("inbound", 100), ("message", 500)):
+            if key in event:
+                event[key] = re.sub(r"[\x00-\x1f\x7f]", " ", str(event[key])).strip()[:limit]
+        payload = canonical(event)
+        if db.execute("INSERT OR IGNORE INTO seen VALUES(?,?)", (event["id"], event["ts"])).rowcount:
+            db.execute("INSERT OR IGNORE INTO pending VALUES(?,?,?,?)", (event["id"], event["ts"], payload, len(payload.encode("utf-8"))))
+
+    def gap(self, db, reason, ts):
+        Ledger.put(db, "gaps", Ledger.get(db, "gaps", 0) + 1)
+        event = {"id": uuid.uuid4().hex + uuid.uuid4().hex, "ts": ts, "user_id": None,
+                 "kind": "gap", "message": reason}
+        self.enqueue(db, event)
+
+    def parse(self, db, raw, session, aliases, fallback):
+        line = self.ANSI.sub("", raw.decode("utf-8", "replace")).strip()
+        match = self.LINE.search(line)
+        if not match:
+            return
+        level, cid, message = match.groups()
+        ts = self.timestamp(line, fallback)
+        if ts < 1577836800 or ts > int(time.time()) + 300:
+            return
+        context_id = session + ":" + str(cid) if cid else None
+        row = db.execute("SELECT value FROM contexts WHERE id=?", (context_id,)).fetchone() if context_id else None
+        context = json.loads(row[0]) if row else {}
+        inbound = self.INBOUND.search(message)
+        if inbound:
+            context["inbound"] = inbound[2][:100]
+        source = self.SOURCE.search(message)
+        if source:
+            # A reused connection ID starts a NEW authentication context. Never
+            # attach an early handshake failure to that ID's previous user.
+            context = {"source_ip": self.endpoint(source[1])[0][:64]}
+            if inbound:
+                context["inbound"] = inbound[2][:100]
+        target = self.TARGET.search(message)
+        event = None
+        if target and inbound:
+            context.update(user_id=aliases.get(target[1]), target=self.endpoint(target[3])[0],
+                           port=self.endpoint(target[3])[1], network="udp" if target[2] else "tcp")
+            event = dict(context, kind="connection")
+        elif level in ("ERROR", "FATAL"):
+            # Only a previously authenticated context can attribute an error.
+            # Never guess a user from source IP or an unauthenticated scan.
+            event = dict(context, kind="error", message=" ".join(message.split())[:500])
+        if context_id and context:
+            db.execute("INSERT INTO contexts VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET ts=excluded.ts,value=excluded.value",
+                       (context_id, ts, canonical(context)))
+        if event:
+            event.update(id=hashlib.sha256((session + line).encode()).hexdigest(), ts=ts)
+            self.enqueue(db, event)
+
+    def bound_queue(self, db, ts):
+        # Expired/offline data cannot fill the disk indefinitely. Make the loss
+        # explicit in status as well as a gap event; byte accounting is separate.
+        dropped = db.execute("DELETE FROM pending WHERE ts<?", (ts - 7 * 86400,)).rowcount
+        count, size = db.execute("SELECT COUNT(*),COALESCE(SUM(bytes),0) FROM pending").fetchone()
+        if count > self.MAX_PENDING or size > self.MAX_QUEUE_BYTES:
+            for row in db.execute("SELECT id,bytes FROM pending ORDER BY ts,rowid").fetchall():
+                if count <= self.MAX_PENDING - 1 and size <= self.MAX_QUEUE_BYTES - 2048:
+                    break
+                db.execute("DELETE FROM pending WHERE id=?", (row["id"],))
+                dropped += 1
+                count -= 1
+                size -= row["bytes"]
+        if dropped:
+            Ledger.put(db, "dropped", Ledger.get(db, "dropped", 0) + dropped)
+            self.gap(db, "本地行为缓存达到容量或 7 天期限，丢弃 %d 条记录" % dropped, ts)
+        db.execute("DELETE FROM seen WHERE rowid IN (SELECT rowid FROM seen ORDER BY rowid DESC LIMIT -1 OFFSET 40000)")
+        db.execute("DELETE FROM contexts WHERE ts<?", (ts - 900,))
+        db.execute("DELETE FROM contexts WHERE rowid IN (SELECT rowid FROM contexts ORDER BY ts DESC LIMIT -1 OFFSET 4000)")
+
+    def collect_once(self):
+        config = read_json(self.config_path)
+        if config.get("detached") or config.get("detaching") or config.get("status") != "active":
+            return False
+        aliases = self.aliases(config)
+        path = config.get("activity_log_path", system_path("/var/log/sing-box/sing-box.log"))
+        ts = int(time.time())
+        core_path = config.get("activity_core_config_path", system_path("/etc/sing-box/config.json"))
+        if os.path.isfile(core_path):
+            log_config = read_json(core_path).get("log", {})
+            if (log_config.get("disabled") or log_config.get("level", "info") not in ("info", "debug", "trace")
+                    or log_config.get("output") != path or log_config.get("timestamp") is not True):
+                raise AgentError("行为日志未启用：请升级 VPS 脚本，使用 info 文件日志并开启 timestamp")
+        with file_lock(self.path + ".read.lock", timeout=0.2):
+            with open(path, "rb") as stream, self.transaction() as db:
+                stat = os.fstat(stream.fileno())
+                identity = [stat.st_dev, stat.st_ino, path]
+                cursor = Ledger.get(db, "cursor", {})
+                offset = cursor.get("offset", 0)
+                same_file = cursor.get("identity") == identity
+                session = cursor.get("session") if same_file else uuid.uuid4().hex
+                changed = bool(cursor) and (not same_file or stat.st_size < offset)
+                if same_file and not changed and offset:
+                    stream.seek(max(0, offset - 128))
+                    changed = hashlib.sha256(stream.read(min(offset, 128))).hexdigest() != cursor.get("anchor")
+                if not cursor or not same_file or changed:
+                    offset = 0
+                    if cursor:
+                        self.gap(db, "原始日志被裁剪、替换或轮转，已重新续读", ts)
+                stream.seek(offset)
+                block = stream.read(self.READ_BYTES)
+                # Offset only crosses complete lines, except a malformed >64 KiB
+                # line which is explicitly skipped and cannot stall the reader.
+                complete = block.rfind(b"\n") + 1
+                if not complete and len(block) >= 65536:
+                    complete = len(block)
+                    self.gap(db, "跳过超长或损坏的日志行", ts)
+                for raw in block[:complete].splitlines():
+                    if len(raw) <= 65536:
+                        self.parse(db, raw, session, aliases, ts)
+                    else:
+                        self.gap(db, "跳过超长或损坏的日志行", ts)
+                offset += complete
+                stream.seek(max(0, offset - 128))
+                anchor = hashlib.sha256(stream.read(min(offset, 128))).hexdigest()
+                Ledger.put(db, "cursor", {"identity": identity, "session": session, "offset": offset, "anchor": anchor})
+                Ledger.put(db, "collected_at", ts)
+                Ledger.put(db, "error", "")
+                self.bound_queue(db, ts)
+                caught_up = offset >= stat.st_size
+            # Parsed records are durable before raw bytes are discarded. The
+            # writer can race copytruncate; disclose this conservative gap.
+            if caught_up and stat.st_size >= self.MAX_RAW_BYTES:
+                self.trim(path, identity)
+        return not caught_up
+
+    def trim(self, path, identity):
+        with open(path, "r+b") as stream:
+            stat = os.fstat(stream.fileno())
+            if [stat.st_dev, stat.st_ino, path] != identity or stat.st_size < self.MAX_RAW_BYTES:
+                return
+            stream.seek(max(0, stat.st_size - self.KEEP_RAW_BYTES))
+            tail = stream.read(self.KEEP_RAW_BYTES)
+            tail = tail.partition(b"\n")[2]
+            # Persist a gap BEFORE copytruncate, including across a process crash.
+            with self.transaction() as db:
+                self.gap(db, "原始日志达到 9 MiB，已保留最近 2 MiB；裁剪瞬间可能存在缺口", int(time.time()))
+            stream.seek(0)
+            stream.write(tail)
+            stream.truncate(len(tail))
+            stream.flush()
+            os.fsync(stream.fileno())
+
+    def set_error(self, error):
+        with self.transaction() as db:
+            Ledger.put(db, "error", " ".join(str(error).split())[:1000])
+
+    def status(self):
+        with self.connect() as db:
+            return {"pending": db.execute("SELECT COUNT(*) FROM pending").fetchone()[0],
+                    **{key: Ledger.get(db, key, "" if key == "error" else 0)
+                       for key in ("collected_at", "dropped", "gaps", "error")}}
+
+    def upload_once(self, transport=None, allow_loopback_http=False):
+        config = read_json(self.config_path)
+        if config.get("detached") or config.get("detaching") or config.get("status") != "active":
+            return 0
+        with self.connect() as db:
+            events = [json.loads(row[0]) for row in db.execute("SELECT payload FROM pending ORDER BY ts,rowid LIMIT 400")]
+        transport = transport or Transport(config["center_url"], config.get("node_token"), allow_loopback_http)
+        response = transport.post("/api/agent/activity", {"protocol": PROTOCOL, "node_id": config["node_id"],
+                                                        "events": events, "status": self.status()})
+        ack = response.get("ack")
+        sent = {event["id"] for event in events}
+        if not isinstance(ack, list) or any(not isinstance(eid, str) or eid not in sent for eid in ack):
+            raise TransportError("Invalid activity acknowledgement")
+        with self.transaction() as db:
+            db.executemany("DELETE FROM pending WHERE id=?", ((eid,) for eid in ack))
+        with self.connect() as db:
+            db.execute("PRAGMA incremental_vacuum(128)")
+        return len(ack)
 
 
 class Agent:
@@ -5517,6 +5838,44 @@ class Agent:
                         log("Change listener: " + str(exc), self.config)
                         stop.wait(3)
 
+            def activity_worker(upload=False):
+                activity = None
+                while not stop.is_set():
+                    delay = SYNC_SECONDS if upload else 1
+                    try:
+                        current = read_json(self.config_path)
+                        if current.get("detached") or current.get("detaching"):
+                            break
+                        if current.get("status") != "active" or not current.get("node_id"):
+                            stop.wait(1)
+                            continue
+                        if activity is None:
+                            activity = ActivityCollector(self.config_path)
+                        if upload:
+                            sent = activity.upload_once(self.transport_override, self.allow_loopback_http)
+                            if sent == 400:
+                                delay = 0.25
+                        elif activity.collect_once():
+                            delay = 0.05
+                    except TransportError as exc:
+                        if exc.status == 410:
+                            center_detached.set()
+                            change.set()
+                            break
+                        if exc.status in (404, 405):
+                            delay = 60
+                        # A network failure cannot stop the continuous reader.
+                    except (AgentError, OSError, ValueError, sqlite3.Error) as exc:
+                        if activity is not None and not upload:
+                            with contextlib.suppress(sqlite3.Error):
+                                activity.set_error(redact(exc, current))
+                        delay = 3
+                    stop.wait(delay)
+
+            activity_reader = threading.Thread(target=activity_worker, name="ysq-activity-reader", daemon=True)
+            activity_uploader = threading.Thread(target=lambda: activity_worker(True), name="ysq-activity-uploader", daemon=True)
+            activity_reader.start()
+            activity_uploader.start()
             thread = threading.Thread(target=sampler, name="ysq-sampler", daemon=True)
             listener = threading.Thread(target=watch_changes, name="ysq-change-listener", daemon=True)
             thread.start()
@@ -5551,6 +5910,8 @@ class Agent:
                 change.set()
                 thread.join(timeout=8)
                 listener.join(timeout=1)
+                activity_reader.join(timeout=4)
+                activity_uploader.join(timeout=1)
                 for sig, handler in old_handlers.items():
                     signal.signal(sig, handler)
 
