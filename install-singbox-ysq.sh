@@ -27,7 +27,7 @@ set -euo pipefail
 #   - Alpine(OpenRC)：日志写入单个文件，busybox cron 每小时检查，达 9MB 裁剪、保留最后 2MB
 # ============================================================
 
-YSQ_VERSION="2026.10.24.4"
+YSQ_VERSION="2026.10.24.5"
 INSTALLER_NAME="install-singbox-ysq.sh"
 DEFAULT_SCRIPT_URL="https://raw.githubusercontent.com/showcode1024/singbox-auto/main/install-singbox-ysq.sh"
 
@@ -6904,7 +6904,7 @@ agent_join_wizard() {
   ( acquire_config_lock; install_agent_bundle ) || return 1
   # Agent joins without holding the config lock; it reads local inventory.
   if ! python3 "$AGENT_FILE" --config "$AGENT_CONFIG_FILE" join \
-    --url "$url" --code "$code" --script "$INSTALLER_FILE" >/dev/null; then
+    --url="$url" --code="$code" --script="$INSTALLER_FILE" >/dev/null; then
     if agent_binding_present; then
       agent_service_start || true
       warn "注册身份已在本机保存。如果是暂时的网络错误，Agent 会后台自动重试；请查看详细状态。"
