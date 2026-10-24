@@ -14,7 +14,7 @@ set -euo pipefail
 #   - 卸载可选「彻底删除」或「保留节点数据」；安装时发现有效的 ysq-state.db 会直接沿用，不覆盖
 #   - 面板内一键「更新面板」（从 GitHub 下载新脚本，保留全部数据）
 #   - 面板随时添加 / 删除 / 修改节点端口及落地出口
-#   - 屏蔽指定网站管理（支持批量添加与批量删除，自动启用 sniff 保证规则生效）
+#   - 分流管理（域名 / Rule Set 直连与屏蔽）；中转节点支持主备落地自动切换和回切
 #   - 支持 IPv4 / IPv6 入口地址选择与纯 IPv6 环境（地区检测多源 + 手动兜底）
 #   - 节点入站端口要求 10000 及以上（落地节点的远端端口不受此限制）
 #   - 支持 Debian / Ubuntu / CentOS / Rocky / AlmaLinux / Alpine
@@ -27,7 +27,7 @@ set -euo pipefail
 #   - Alpine(OpenRC)：日志写入单个文件，busybox cron 每小时检查，达 9MB 裁剪、保留最后 2MB
 # ============================================================
 
-YSQ_VERSION="2026.10.23.3"
+YSQ_VERSION="2026.10.24.3"
 INSTALLER_NAME="install-singbox-ysq.sh"
 DEFAULT_SCRIPT_URL="https://raw.githubusercontent.com/showcode1024/singbox-auto/main/install-singbox-ysq.sh"
 
@@ -44,6 +44,8 @@ VLESS_DIRECT_PORT=20001
 TUIC_DIRECT_PORT=20002
 # V2Ray API 仅绑定本机回环地址，不向公网开放 gRPC。
 V2RAY_API_PORT=41453
+# 主备落地切换只通过本机鉴权 API 控制，不对公网开放。
+FAILOVER_API_PORT=41452
 GRPCURL_VERSION="1.9.4"
 # YSQ_TEST_ROOT isolates helper tests; never repurpose HOME or system environment paths.
 YSQ_TEST_ROOT="${YSQ_TEST_ROOT:-}"
@@ -103,6 +105,11 @@ CORE_PID_FILE="${YSQ_TEST_ROOT}/run/sing-box.pid"
 CORE_BIN_FILE="${YSQ_TEST_ROOT}/usr/local/bin/sing-box"
 CORE_SYSTEMD_FILE="${YSQ_TEST_ROOT}/etc/systemd/system/sing-box.service"
 CORE_OPENRC_FILE="${YSQ_TEST_ROOT}/etc/init.d/sing-box"
+FAILOVER_FILE="${YSQ_TEST_ROOT}/usr/local/libexec/ysq-failover.py"
+FAILOVER_SYSTEMD_FILE="${YSQ_TEST_ROOT}/etc/systemd/system/ysq-failover.service"
+FAILOVER_OPENRC_FILE="${YSQ_TEST_ROOT}/etc/init.d/ysq-failover"
+FAILOVER_PID_FILE="${YSQ_TEST_ROOT}/run/ysq-failover.pid"
+FAILOVER_STATUS_FILE="${YSQ_TEST_ROOT}/var/lib/ysq-failover/status.json"
 PERIODIC_DIR="${YSQ_TEST_ROOT}/etc/periodic/hourly"
 CRONTAB_DIR="${YSQ_TEST_ROOT}/etc/crontabs"
 CRONTAB_FILE="${YSQ_TEST_ROOT}/etc/crontabs/root"
@@ -753,6 +760,7 @@ service_restart() {
       fi
       ;;
   esac
+  sync_failover_service || warn "主备切换服务启动失败，请查看 ysq-failover 状态；sing-box 仍按当前落地运行。"
   return 0
 }
 
@@ -957,18 +965,24 @@ def table($headers; $mins; $rows):
 
 # 节点类型文案、自动命名与去重共用同一份 jq 规则。
 JQ_NODE_LIB='
-def node_labels($type; $out):
+def node_labels($type; $out; $landing_type):
+  (if $landing_type == "tuic" then "tuic5" else "vless" end) as $target |
+  (if $landing_type == "tuic" then "TUIC v5" else "VLESS" end) as $target_display |
   if ($type | startswith("vless")) then
-    if $out == "landing" then {suffix:"vless转vless", display:"VLESS -> VLESS 中转"}
+    if $out == "landing" then {suffix:("vless转"+$target), display:("VLESS -> "+$target_display+" 中转")}
     else {suffix:"vless", display:"VLESS 直出"} end
   elif ($type | startswith("tuic")) then
-    if $out == "landing" then {suffix:"tuic5转vless", display:"TUIC v5 -> VLESS 中转"}
+    if $out == "landing" then {suffix:("tuic5转"+$target), display:("TUIC v5 -> "+$target_display+" 中转")}
     else {suffix:"tuic5", display:"TUIC v5 直出"} end
   else
     {suffix:(if $out == "landing" then "relay" else "node" end), display:$type}
   end;
 
+def node_labels($type; $out): node_labels($type; $out; "vless");
 def node_type_name($type; $out): node_labels($type; $out).display;
+def landing_type_for($s; $n):
+  ((first($s.landings[]? | select(.id == ($n.landing_id // ""))) | .type) // "vless");
+def node_type_name_for($s; $n): node_labels($n.type; ($n.outbound_type // "direct"); landing_type_for($s; $n)).display;
 
 def node_auto_name($s; $n; $region):
   ($n.outbound_type // "direct") as $out |
@@ -976,7 +990,7 @@ def node_auto_name($s; $n; $region):
    else ((first($s.landings[]? | select(.id == ($n.landing_id // ""))) | .display) // ""
          | split("：")[0]) end) as $landing_region |
   (($s.location_flag // "🌐") + ($s.location_name // "未知地区") + "-"
-   + node_labels($n.type; $out).suffix
+   + node_labels($n.type; $out; landing_type_for($s; $n)).suffix
    + (if $out == "landing" and $landing_region != "" then "-" + $landing_region else "" end)) as $base |
   ($base + "-" + ($n.port | tostring)) as $with_port |
   ($with_port + "-" + ($n.type | split("-")[0])) as $with_type |
@@ -1560,8 +1574,12 @@ detect_location() {
 }
 
 node_type_name() {
-  jq -nr --arg type "$1" --arg out "${2:-direct}" \
-    "$JQ_NODE_LIB"'node_type_name($type; $out)'
+  if [ -n "${3:-}" ] && [ -f "$STATE_FILE" ]; then
+    jq -r --arg tag "$3" "$JQ_NODE_LIB"'. as $s | first(.nodes[]? | select(.tag==$tag)) | node_type_name_for($s; .)' "$STATE_FILE"
+  else
+    jq -nr --arg type "$1" --arg out "${2:-direct}" \
+      "$JQ_NODE_LIB"'node_type_name($type; $out)'
+  fi
 }
 
 # 生成节点名称：
@@ -1777,12 +1795,14 @@ apply_state() {
 
 # 规范化 state，并把旧版本“节点内冗余拷贝的落地信息”迁移到落地池
 ensure_state_defaults() {
-  local tmp
+  local tmp secret
 
   [ -f "$STATE_FILE" ] || { err "未找到状态文件：$STATE_FILE"; return 1; }
+  secret="$(jq -r '.failover_secret // empty' "$STATE_FILE")"
+  [ -n "$secret" ] || secret="$(openssl rand -hex 24)"
 
   tmp="$(mktemp "${STATE_FILE}.tmp.${WORK_TAG}.XXXXXX")" || return 1
-  if ! jq '
+  if ! jq --arg secret "$secret" '
     def lid($n; $ls):
       ( first($ls[] | select(.id == ($n.landing_id // ""))) | .id ) //
       ( first($ls[] | select(.server == ($n.landing_server // "")
@@ -1791,6 +1811,9 @@ ensure_state_defaults() {
 
     del(.sub_port, .sub_token) |
     (if has("blocked_domains") then . else .blocked_domains = [] end) |
+    (if has("direct_domains") then . else .direct_domains = [] end) |
+    (if has("routing_rule_sets") then . else .routing_rule_sets = [] end) |
+    .failover_secret = $secret |
     (if has("ip_version") then . else .ip_version = "ipv4" end) |
     (if has("landings") then . else .landings = [] end) |
     (if has("nodes") then . else .nodes = [] end) |
@@ -1804,6 +1827,7 @@ ensure_state_defaults() {
     # 根字段永久保留旧安装身份，供旧落地池兜底使用；增删改用户不覆盖根密钥。
     # 实际入站用户全部从 .users[] 读取，二者相互独立。
     .landings |= map(
+      .type = (.type // "vless") |
       if ((.id // "") | tostring | length) > 0 then .
       else .id = ("landing_" + ((.server | tostring) | gsub("[^a-zA-Z0-9]"; "_")) + "_" + ((.port // 0) | tostring))
       end
@@ -2042,6 +2066,8 @@ create_state_file() {
       location_flag: $flag,
       location_name: $loc,
       blocked_domains: [],
+      direct_domains: [],
+      routing_rule_sets: [],
       landings: [],
       users: [{name: "myself", uuid: $uuid, tuic_pass: $tuic_pass}],
       nodes: []
@@ -2061,179 +2087,319 @@ landing_count() {
   jq '.landings | length' "$STATE_FILE"
 }
 
+# 分享链接明确携带协议；域名/端口本身不携带协议信息，不能据此猜测。
+write_landing_uri_parser() {
+  cat <<'YSQ_LANDING_PY'
+# BEGIN_EMBEDDED_LANDING_PARSER
+import base64
+import ipaddress
+import json
+import re
+import sys
+import urllib.parse
+import uuid
+
+
+def text(value, field, limit=4096, empty=False):
+    if not isinstance(value, str) or len(value) > limit or (not empty and not value) or any(ord(c) < 32 or ord(c) == 127 for c in value):
+        raise ValueError(field + " 格式无效")
+    return value
+
+
+def host(value):
+    value = text(value, "地址", 253)
+    try:
+        return str(ipaddress.ip_address(value))
+    except ValueError:
+        if ":" in value or not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?", value) or ".." in value:
+            raise ValueError("地址格式无效")
+        return value
+
+
+def boolean(value, field):
+    if isinstance(value, bool):
+        return value
+    if str(value).lower() in ("1", "true"):
+        return True
+    if str(value).lower() in ("0", "false"):
+        return False
+    raise ValueError(field + " 必须为 0/1 或 true/false")
+
+
+def normalize_landing(value):
+    if not isinstance(value, dict):
+        raise ValueError("落地配置必须为 JSON 对象")
+    kind = value.get("type", "vless")
+    if kind not in ("vless", "tuic"):
+        raise ValueError("仅支持 VLESS Reality 和 TUIC v5")
+    port = value.get("port")
+    if isinstance(port, bool) or not str(port).isdigit() or not 1 <= int(port) <= 65535:
+        raise ValueError("端口必须为 1-65535")
+    try:
+        user = str(uuid.UUID(text(value.get("uuid"), "UUID", 36)))
+    except (ValueError, AttributeError):
+        raise ValueError("UUID 格式无效") from None
+    server = host(value.get("server"))
+    sni = host(value.get("sni") or server)
+    result = {"type": kind, "server": server, "port": int(port), "uuid": user, "sni": sni}
+    if kind == "vless":
+        key = text(value.get("public_key"), "Reality PublicKey", 43)
+        try:
+            if not re.fullmatch(r"[A-Za-z0-9_-]{43}", key) or len(base64.urlsafe_b64decode(key + "=")) != 32:
+                raise ValueError()
+        except ValueError:
+            raise ValueError("Reality PublicKey 格式无效") from None
+        short = text(value.get("short_id", ""), "Reality ShortID", 16, empty=True)
+        if len(short) % 2 or not re.fullmatch(r"[0-9A-Fa-f]*", short):
+            raise ValueError("Reality ShortID 必须为最多16位的偶数长度十六进制")
+        fingerprint = value.get("fingerprint", "chrome")
+        if fingerprint not in ("chrome", "firefox", "edge", "safari", "ios", "android", "random", "randomized", "360", "qq"):
+            raise ValueError("不支持此 TLS 指纹")
+        result.update(public_key=key, short_id=short.lower(), fingerprint=fingerprint)
+    else:
+        password = text(value.get("password"), "TUIC 密码")
+        control = value.get("congestion_control", "bbr")
+        if control not in ("bbr", "cubic", "new_reno"):
+            raise ValueError("拥塞控制仅支持 bbr/cubic/new_reno")
+        alpn = value.get("alpn", ["h3"])
+        if not isinstance(alpn, list) or not 1 <= len(alpn) <= 16:
+            raise ValueError("ALPN 格式无效")
+        alpn = [text(item, "ALPN", 64) for item in alpn]
+        if any(any(c.isspace() for c in item) for item in alpn):
+            raise ValueError("ALPN 不能含空白")
+        stream = boolean(value.get("udp_over_stream", False), "udp_over_stream")
+        mode = value.get("udp_relay_mode", "native")
+        if mode not in ("native", "quic"):
+            raise ValueError("UDP 转发仅支持 native/quic")
+        if stream and "udp_relay_mode" in value:
+            raise ValueError("udp_over_stream 与 udp_relay_mode 不能同时指定")
+        result.update(password=password, congestion_control=control, alpn=alpn,
+                      insecure=boolean(value.get("insecure", False), "insecure"), udp_over_stream=stream)
+        if not stream:
+            result["udp_relay_mode"] = mode
+    return result
+
+
+def parse_landing_link(raw):
+    raw = text(raw, "分享链接", 16384)
+    if re.search(r"%(?![0-9a-fA-F]{2})", raw):
+        raise ValueError("分享链接含无效百分号编码")
+    try:
+        link = urllib.parse.urlsplit(raw)
+        kind, server, port = link.scheme.lower(), link.hostname, link.port
+    except ValueError:
+        raise ValueError("分享链接地址或端口无效") from None
+    if kind not in ("tuic", "vless") or not server or port is None or link.path not in ("", "/"):
+        raise ValueError("仅支持带端口的 tuic:// 或 vless:// 分享链接")
+    values = urllib.parse.parse_qs(link.query, keep_blank_values=True, strict_parsing=True)
+    if any(len(value) != 1 for value in values.values()):
+        raise ValueError("分享链接含重复参数")
+    used = set()
+
+    def option(*names, default=None):
+        found = [name for name in names if name in values]
+        used.update(found)
+        if len(found) > 1:
+            raise ValueError("分享链接同义参数重复")
+        return values[found[0]][0] if found else default
+
+    def require_option(names, supported, default=None):
+        selected = option(*names, default=default)
+        if selected not in supported:
+            raise ValueError("分享链接的 " + names[0] + " 不受支持")
+
+    result = {"type": kind, "server": server, "port": port,
+              "uuid": urllib.parse.unquote(link.username or "", errors="strict"),
+              "sni": option("sni", "serverName", "servername", default=server)}
+    if kind == "vless":
+        if link.password is not None:
+            raise ValueError("VLESS 分享链接认证格式无效")
+        require_option(("security",), ("reality",))
+        require_option(("type", "transport"), ("tcp",), "tcp")
+        require_option(("flow",), ("xtls-rprx-vision",))
+        require_option(("encryption",), ("none",), "none")
+        require_option(("headerType",), ("none", ""), "none")
+        result.update(public_key=option("pbk", "publicKey", "public_key"),
+                      short_id=option("sid", "shortId", "short_id", default=""),
+                      fingerprint=option("fp", "fingerprint", default="chrome"))
+    else:
+        result["password"] = urllib.parse.unquote(link.password or "", errors="strict")
+        require_option(("version", "v"), ("5",), "5")
+        result["congestion_control"] = option("congestion_control", "congestion-controller", "congestion-control", default="bbr")
+        result["insecure"] = option("allow_insecure", "allowInsecure", "insecure", "skip-cert-verify", "skip_cert_verify", default="0")
+        result["alpn"] = option("alpn", default="h3").split(",")
+        if boolean(option("disable_sni", "disable-sni", default="0"), "disable_sni"):
+            raise ValueError("不支持 disable_sni=1，请使用 SNI")
+        if boolean(option("zero_rtt_handshake", "zero-rtt-handshake", default="0"), "zero_rtt_handshake"):
+            raise ValueError("不支持启用 0-RTT")
+        stream = option("udp_over_stream", "udp-over-stream", default="0")
+        result["udp_over_stream"] = boolean(stream, "udp_over_stream")
+        mode = option("udp_relay_mode", "udp-relay-mode")
+        if mode is not None:
+            result["udp_relay_mode"] = mode
+    if set(values) - used:
+        raise ValueError("分享链接包含当前不支持的连接参数，请改为手动填写")
+    return normalize_landing(result)
+
+
+def main():
+    try:
+        raw = sys.stdin.read(16385)
+        result = normalize_landing(json.loads(raw)) if "--json" in sys.argv else parse_landing_link(raw.strip())
+        print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+        return 0
+    except (ValueError, TypeError, UnicodeError, KeyError):
+        # Never echo the supplied link, credentials or decoded password.
+        print("落地参数无效或含不支持的选项，请检查协议、UUID、密码、TLS 与分享链接参数。", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+# END_EMBEDDED_LANDING_PARSER
+YSQ_LANDING_PY
+}
+
+parse_landing_uri() {
+  python3 -c "$(write_landing_uri_parser)" "$@"
+}
+
+# 密码不套用本机用户密码字符限制，保留冒号、@、+、空格等原始字符。
+ask_landing_secret() {
+  local prompt="$1" previous="${2:-}" answer=""
+  while true; do
+    IFS= read -rsp "${prompt}${previous:+ [已设置，留空保持]}: " answer || die "无法读取落地认证信息。"
+    printf '\n' >&2
+    answer="${answer:-$previous}"
+    if [ -n "$answer" ]; then printf '%s' "$answer"; return 0; fi
+    warn "这里不能为空。"
+  done
+}
+
+LANDING_CONFIG_JSON=""
+collect_landing_config() {
+  local previous="${1:-}" source old_type type choice server port user password sni pbk sid fp insecure cc mode alpn json address_hint=""
+  [ -n "$previous" ] || previous='{}'
+  ensure_agent_python || return 1
+  [ -z "$(printf '%s' "$previous" | jq -r '.server // empty')" ] || address_hint="（留空沿用原地址）"
+  read_line "落地 IP/域名或 tuic://、vless:// 分享链接${address_hint}，0 返回: " source
+  source="$(trim "$source")"
+  [ "$source" != "0" ] || return "$CANCEL_RC"
+  case "$source" in
+    *://*)
+      if ! LANDING_CONFIG_JSON="$(printf '%s' "$source" | parse_landing_uri)"; then return 1; fi
+      info "已从分享链接识别 $(printf '%s' "$LANDING_CONFIG_JSON" | jq -r '.type|ascii_upcase') 落地。"
+      return 0
+      ;;
+  esac
+  server="${source:-$(printf '%s' "$previous" | jq -r '.server // ""')}"
+  server="${server#[}"; server="${server%]}"
+  valid_host "$server" || { err "请输入有效 IP/域名或完整分享链接。"; return 1; }
+  old_type="$(printf '%s' "$previous" | jq -r '.type // "vless"')"
+  if [ "$old_type" = "tuic" ]; then choice=2; else choice=1; fi
+  echo "1) VLESS Reality (TCP)  2) TUIC v5 (QUIC/UDP)" >&2
+  read_line "落地协议 [默认 ${choice}]: " type
+  type="${type:-$choice}"
+  case "$type" in 1|vless) type=vless ;; 2|tuic) type=tuic ;; *) err "落地协议无效。"; return 1 ;; esac
+  # 切换协议保留通用地址；认证/TLS设置按新协议重新填写。
+  if [ "$old_type" != "$type" ]; then previous="$(printf '%s' "$previous" | jq 'del(.uuid,.password,.sni,.public_key,.short_id,.fingerprint,.insecure,.congestion_control,.udp_relay_mode,.udp_over_stream,.alpn)')"; fi
+  port="$(ask_port "落地远端端口 (1-65535)" "$(printf '%s' "$previous" | jq -r '.port // 443')")"
+  if [ "$type" = "vless" ]; then
+    user="$(ask_landing_secret "落地 VLESS UUID" "$(jq -r --argjson previous "$previous" '$previous.uuid // .uuid' "$STATE_FILE")")"
+    [ -n "$user" ] || return 1
+    pbk="$(ask_text_default "落地 Reality PublicKey" "$(jq -r --argjson previous "$previous" '$previous.public_key // .public_key' "$STATE_FILE")")"
+    read_line "落地 Reality ShortID [默认 $(jq -r --argjson previous "$previous" '$previous.short_id // .short_id' "$STATE_FILE")]: " sid
+    sid="${sid:-$(jq -r --argjson previous "$previous" '$previous.short_id // .short_id' "$STATE_FILE")}"
+    sni="$(ask_text_default "落地 Reality SNI" "$(jq -r --argjson previous "$previous" '$previous.sni // .reality_sni' "$STATE_FILE")")"
+    fp="$(ask_text_default "TLS 指纹" "$(printf '%s' "$previous" | jq -r '.fingerprint // "chrome"')")"
+    json="$(jq -nc --arg type "$type" --arg server "$server" --argjson port "$port" --arg uuid "$user" --arg public_key "$pbk" --arg short_id "$sid" --arg sni "$sni" --arg fingerprint "$fp" '{type:$type,server:$server,port:$port,uuid:$uuid,public_key:$public_key,short_id:$short_id,sni:$sni,fingerprint:$fingerprint}')"
+  else
+    user="$(ask_landing_secret "落地 TUIC UUID" "$(printf '%s' "$previous" | jq -r '.uuid // empty')")"
+    password="$(ask_landing_secret "落地 TUIC 密码" "$(printf '%s' "$previous" | jq -r '.password // empty')")"
+    sni="$(ask_text_default "落地 TUIC SNI" "$(printf '%s' "$previous" | jq -r --arg server "$server" '.sni // $server')")"
+    if [ "$(printf '%s' "$previous" | jq -r '.insecure // false')" = true ]; then choice=2; else choice=1; fi
+    echo "1) 校验证书  2) 跳过校验（自签证书）" >&2
+    read_line "TLS 证书验证 [默认 ${choice}]: " insecure
+    insecure="${insecure:-$choice}"
+    case "$insecure" in 1) insecure=false ;; 2) insecure=true ;; *) err "证书验证选项无效。"; return 1 ;; esac
+    cc="$(ask_text_default "拥塞控制 bbr / cubic / new_reno" "$(printf '%s' "$previous" | jq -r '.congestion_control // "bbr"')")"
+    mode="$(ask_text_default "UDP 转发 native / quic / stream" "$(printf '%s' "$previous" | jq -r 'if .udp_over_stream == true then "stream" else (.udp_relay_mode // "native") end')")"
+    alpn="$(ask_text_default "ALPN（多个用逗号分隔）" "$(printf '%s' "$previous" | jq -r '(.alpn // ["h3"]) | join(",")')")"
+    json="$(jq -nc --arg type "$type" --arg server "$server" --argjson port "$port" --arg uuid "$user" --arg password "$password" --arg sni "$sni" --argjson insecure "$insecure" --arg congestion_control "$cc" --arg mode "$mode" --arg alpn "$alpn" '{type:$type,server:$server,port:$port,uuid:$uuid,password:$password,sni:$sni,insecure:$insecure,congestion_control:$congestion_control,alpn:($alpn|split(","))} + (if $mode=="stream" then {udp_over_stream:true} else {udp_relay_mode:$mode,udp_over_stream:false} end)')"
+  fi
+  if ! LANDING_CONFIG_JSON="$(printf '%s' "$json" | parse_landing_uri --json)"; then return 1; fi
+  if [ "$type" = "vless" ]; then
+    check_landing_connectivity "$server" "$port" || return $?
+  else
+    info "TUIC 使用 QUIC/UDP；TCP 端口状态不能验证 TUIC。绑定到中转节点后由实际代理探测检查。"
+  fi
+}
+
 add_landing_wizard() {
   need_state
   step "添加落地节点"
-
-  local l_server l_port l_uuid l_public_key l_short_id l_sni flag loc l_display l_id
-  local d_uuid d_pbk d_sid d_sni
-
-  l_server="$(ask_landing_host "请输入落地节点 IP 或域名" "")"
-  l_port="$(ask_port "请输入落地节点 VLESS 端口 (远端端口，1-65535)" "$VLESS_DIRECT_PORT")"
-
-  check_landing_connectivity "$l_server" "$l_port"
-
-  state_read '.uuid, .public_key, .short_id, .reality_sni' d_uuid d_pbk d_sid d_sni
-  l_uuid="$(ask_text_default "请输入落地 VLESS UUID" "$d_uuid")"
-  l_public_key="$(ask_text_default "请输入落地 Reality PublicKey" "$d_pbk")"
-  l_short_id="$(ask_text_default "请输入落地 Reality ShortID" "$d_sid")"
-  l_sni="$(ask_sni "请输入落地 Reality SNI" "$d_sni")"
-
+  local server port type flag loc display id
+  collect_landing_config || return $?
+  server="$(printf '%s' "$LANDING_CONFIG_JSON" | jq -r '.server')"
+  port="$(printf '%s' "$LANDING_CONFIG_JSON" | jq -r '.port')"
+  type="$(printf '%s' "$LANDING_CONFIG_JSON" | jq -r '.type')"
   info "正在检测落地节点地区..."
-  IFS='|' read -r _ flag loc <<<"$(detect_location "$l_server" "" "落地节点")"
-  l_display="${flag}${loc}：${l_server}"
-
-  l_id="landing_$(date +%s)_${RANDOM}"
-
-  state_build \
-    --arg id "$l_id" \
-    --arg server "$l_server" \
-    --argjson port "$l_port" \
-    --arg uuid "$l_uuid" \
-    --arg pbk "$l_public_key" \
-    --arg sid "$l_short_id" \
-    --arg sni "$l_sni" \
-    --arg display "$l_display" \
-    '.landings += [{
-      "id": $id,
-      "server": $server,
-      "port": $port,
-      "uuid": $uuid,
-      "public_key": $pbk,
-      "short_id": $sid,
-      "sni": $sni,
-      "display": $display
-    }]'
-  # 新增的落地没有被任何节点引用，不影响 sing-box 配置，无需重启
+  IFS='|' read -r _ flag loc <<<"$(detect_location "$server" "" "落地节点")"
+  display="${flag}${loc}：${server}"
+  id="landing_$(date +%s)_${RANDOM}"
+  state_build --argjson landing "$LANDING_CONFIG_JSON" --arg id "$id" --arg display "$display" \
+    '.landings += [($landing + {id:$id,display:$display})]'
   commit_state_plain
-
-  ok "落地节点添加成功：${l_display} (端口: ${l_port})"
+  ok "落地节点添加成功：${display} (${type^^} / ${port})"
 }
 
-# 使用 jq 码点宽度计算，解决中文与国旗 Emoji 在终端表格中的错位问题
 list_landings_table() {
-  if [ "$(landing_count)" -eq 0 ]; then
-    warn "当前无任何落地节点。"
-    return 1
-  fi
-
+  if [ "$(landing_count)" -eq 0 ]; then warn "当前无任何落地节点。"; return 1; fi
   jq -r "$JQ_TABLE_LIB"'
     . as $s |
-    ["序号", "落地节点 (国家：ip)", "端口", "被引用", "SNI"] as $headers |
-    [4, 28, 6, 6, 16] as $mins |
-    [
-      .landings | to_entries[] | .value as $l |
-      [
-        ((.key + 1) | tostring),
-        ($l.display // "-"),
-        ($l.port | tostring),
-        (([ $s.nodes[]? | select(.landing_id == $l.id) ] | length) | tostring),
-        ($l.sni // "-")
-      ]
-    ] as $rows |
-    table($headers; $mins; $rows)
-  ' "$STATE_FILE"
-
-  return 0
+    ["序号", "落地节点 (国家：ip)", "协议", "端口", "被引用", "SNI"] as $headers |
+    [4, 28, 10, 6, 6, 16] as $mins |
+    [.landings | to_entries[] | .value as $l |
+      [((.key+1)|tostring),($l.display // "-"),
+       (if ($l.type // "vless")=="tuic" then "TUIC v5" else "VLESS" end),($l.port|tostring),
+       (([$s.nodes[]? | select(.landing_id==$l.id or .backup_landing_id==$l.id)]|length)|tostring),($l.sni // "-")]
+    ] as $rows | table($headers;$mins;$rows)' "$STATE_FILE"
 }
 
-# 修改落地池中第 idx（从 0 开始）个条目；若落地地区变化则同步更新引用该落地的节点名称
 edit_landing() {
-  local idx="$1"
-  local l_id old_server old_port old_uuid old_pbk old_sid old_sni old_disp used
-  local new_server new_port new_uuid new_pbk new_sid new_sni new_disp old_region new_region flag loc
-  local rename_nodes=false
-
-  # 一次 jq 取出全部字段；用 \x1f 分隔（非空白分隔符，空字段不会被吞掉）
-  IFS=$'\x1f' read -r l_id old_server old_port old_uuid old_pbk old_sid old_sni old_disp used < <(
-    jq -r --argjson i "$idx" '
-      . as $s | $s.landings[$i] as $l
-      | [ $l.id, $l.server, ($l.port | tostring), ($l.uuid // ""), ($l.public_key // ""),
-          ($l.short_id // ""), ($l.sni // ""), ($l.display // ""),
-          ([ $s.nodes[]? | select(.landing_id == $l.id) ] | length | tostring) ]
-      | join("\u001f")' "$STATE_FILE"
-  )
-
-  echo
-  echo "--- 当前落地信息 ---"
-  echo "显示标识 : ${old_disp}"
-  echo "IP/域名  : ${old_server}"
-  echo "端口     : ${old_port}"
-  echo "UUID     : ${old_uuid}"
-  echo "PublicKey: ${old_pbk}"
-  echo "ShortID  : ${old_sid}"
-  echo "SNI      : ${old_sni}"
-  echo "被引用   : ${used} 个节点"
-  echo "--------------------"
-  if [ "$used" -gt 0 ]; then
-    warn "该落地被 ${used} 个节点使用，修改后会同步生效并重启 sing-box。"
+  local idx="$1" previous previous_config id old_server old_type old_display server type display flag loc used rename=false
+  previous="$(jq -c --argjson i "$idx" '.landings[$i]' "$STATE_FILE")"
+  id="$(printf '%s' "$previous" | jq -r '.id')"
+  old_server="$(printf '%s' "$previous" | jq -r '.server')"
+  old_type="$(printf '%s' "$previous" | jq -r '.type // "vless"')"
+  old_display="$(printf '%s' "$previous" | jq -r '.display // .server')"
+  used="$(jq --arg id "$id" '[.nodes[]? | select(.landing_id==$id or .backup_landing_id==$id)] | length' "$STATE_FILE")"
+  echo "落地：${old_display} (${old_type^^})，被 ${used} 个节点引用。"
+  if [ "$used" -gt 0 ]; then warn "修改后会重启 sing-box 并同步生效。"; fi
+  # 旧 VLESS 条目可能依赖根凭据；编辑时先补齐显示默认值，不覆盖原身份。
+  if [ "$old_type" = "vless" ]; then
+    previous="$(jq -c --argjson i "$idx" '. as $s | .landings[$i] | .type="vless" | .uuid=(.uuid // $s.uuid) | .public_key=(.public_key // $s.public_key) | .short_id=(.short_id // $s.short_id) | .sni=(.sni // $s.reality_sni)' "$STATE_FILE")"
   fi
-  echo "请直接输入新值，按回车保持当前默认："
-
-  new_server="$(ask_landing_host "落地 IP 或域名" "$old_server")"
-  new_port="$(ask_port "落地 VLESS 端口 (远端端口，1-65535)" "$old_port")"
-
-  # 只有地址或端口发生变化时才重新预检
-  if [ "$new_server" != "$old_server" ] || [ "$new_port" != "$old_port" ]; then
-    check_landing_connectivity "$new_server" "$new_port"
-  fi
-
-  new_uuid="$(ask_text_default "落地 UUID" "$old_uuid")"
-  new_pbk="$(ask_text_default "落地 Reality PublicKey" "$old_pbk")"
-  new_sid="$(ask_text_default "落地 Reality ShortID" "$old_sid")"
-  new_sni="$(ask_sni "落地 Reality SNI" "$old_sni")"
-
-  if [ "$new_server" != "$old_server" ]; then
-    info "检测到 IP/域名变动，正在重新解析地区..."
-    IFS='|' read -r _ flag loc <<<"$(detect_location "$new_server" "" "落地节点")"
-    new_disp="${flag}${loc}：${new_server}"
-  else
-    new_disp="$old_disp"
-  fi
-  if [ "$new_server" = "$old_server" ] && [ "$new_port" = "$old_port" ] \
-      && [ "$new_uuid" = "$old_uuid" ] && [ "$new_pbk" = "$old_pbk" ] \
-      && [ "$new_sid" = "$old_sid" ] && [ "$new_sni" = "$old_sni" ] \
-      && [ "$new_disp" = "$old_disp" ]; then
+  collect_landing_config "$previous" || return $?
+  previous_config="$(printf '%s' "$previous" | parse_landing_uri --json 2>/dev/null || true)"
+  if [ -n "$previous_config" ] && [ "$LANDING_CONFIG_JSON" = "$previous_config" ]; then
     info "落地信息没有变化。"
     return "$CANCEL_RC"
   fi
-  old_region="${old_disp%%：*}"
-  new_region="${new_disp%%：*}"
-  if [ "$new_region" != "$old_region" ]; then rename_nodes=true; fi
-
-  state_build \
-    --argjson i "$idx" \
-    --arg id "$l_id" \
-    --arg server "$new_server" \
-    --argjson port "$new_port" \
-    --arg uuid "$new_uuid" \
-    --arg pbk "$new_pbk" \
-    --arg sid "$new_sid" \
-    --arg sni "$new_sni" \
-    --arg disp "$new_disp" \
-    --argjson rename_nodes "$rename_nodes" \
-    "$JQ_NODE_LIB"'
-    .landings[$i] |= (
-      .server = $server | .port = $port | .uuid = $uuid |
-      .public_key = $pbk | .short_id = $sid | .sni = $sni | .display = $disp
-    ) |
-    if $rename_nodes then
-      reduce (
-        .nodes | to_entries[] |
-        select(.value.outbound_type == "landing" and .value.landing_id == $id) | .key
-      ) as $ni (.;
-        . as $s | .nodes[$ni].name = node_auto_name($s; $s.nodes[$ni]; "")
-      )
-    else . end
-    '
-
-  if [ "$used" -gt 0 ]; then
-    apply_state
-  else
-    commit_state_plain
+  server="$(printf '%s' "$LANDING_CONFIG_JSON" | jq -r '.server')"
+  type="$(printf '%s' "$LANDING_CONFIG_JSON" | jq -r '.type')"
+  display="$old_display"
+  if [ "$server" != "$old_server" ]; then
+    IFS='|' read -r _ flag loc <<<"$(detect_location "$server" "" "落地节点")"
+    display="${flag}${loc}：${server}"
   fi
-
-  ok "落地节点已更新：${new_disp}"
+  if [ "$type" != "$old_type" ] || [ "${display%%：*}" != "${old_display%%：*}" ]; then rename=true; fi
+  state_build --argjson i "$idx" --argjson landing "$LANDING_CONFIG_JSON" --arg id "$id" --arg display "$display" --argjson rename "$rename" "$JQ_NODE_LIB"'
+    .landings[$i] = ($landing + {id:$id,display:$display}) |
+    if $rename then reduce (.nodes | to_entries[] | select(.value.outbound_type=="landing" and .value.landing_id==$id) | .key) as $ni (.;
+      . as $s | .nodes[$ni].name = node_auto_name($s;$s.nodes[$ni];"")) else . end'
+  if [ "$used" -gt 0 ]; then apply_state; else commit_state_plain; fi
+  ok "落地节点已更新：${display} (${type^^})"
 }
 
 modify_landing_wizard() {
@@ -2289,15 +2455,15 @@ delete_landing_wizard() {
   IFS=$'\x1f' read -r l_id disp used < <(
     jq -r --argjson i "$idx" '
       . as $s | $s.landings[$i] as $l
-      | [ $l.id, $l.display, ([ $s.nodes[]? | select(.landing_id == $l.id) ] | length | tostring) ]
+      | [ $l.id, $l.display, ([ $s.nodes[]? | select(.landing_id == $l.id or .backup_landing_id == $l.id) ] | length | tostring) ]
       | join("\u001f")' "$STATE_FILE"
   )
 
   if [ "$used" -gt 0 ]; then
-    users="$(jq -r --arg id "$l_id" '.nodes[]? | select(.landing_id == $id) | "  - " + .name' "$STATE_FILE")"
+    users="$(jq -r --arg id "$l_id" '.nodes[]? | select(.landing_id == $id or .backup_landing_id == $id) | "  - " + .name' "$STATE_FILE")"
     warn "落地 [${disp}] 正被以下 ${used} 个节点使用，无法删除："
     echo "$users" >&2
-    warn "请先到「修改节点」把这些节点改为直出或换成其他落地，或直接删除这些节点。"
+    warn "请先到「修改节点」更换主落地、设置 / 取消备用落地，或删除引用它的节点。"
     return 1
   fi
 
@@ -2370,6 +2536,23 @@ select_landing() {
   done
 }
 
+SEL_BACKUP_LANDING_ID=""
+select_backup_landing() {
+  local primary="$1" pick count idx
+  SEL_BACKUP_LANDING_ID=""
+  count="$(landing_count)"
+  echo
+  echo "备用落地 (主落地故障后切换，恢复后自动回切)："
+  list_landings_table || true
+  read_line "选择备用落地序号，0 表示不启用 [默认 0]: " pick
+  pick="$(trim "$pick")"
+  [ -n "$pick" ] && [ "$pick" != "0" ] || return 0
+  valid_index "$pick" "$count" || { err "备用落地序号无效。"; return 1; }
+  idx=$((10#$pick - 1))
+  SEL_BACKUP_LANDING_ID="$(jq -r --argjson i "$idx" '.landings[$i].id' "$STATE_FILE")"
+  [ "$SEL_BACKUP_LANDING_ID" != "$primary" ] || { err "备用落地不能与主落地相同。"; return 1; }
+}
+
 # -------------------------
 # 节点增删操作
 # -------------------------
@@ -2379,6 +2562,7 @@ prepare_add_node() {
   local port="$2"
   local outbound_type="${3:-direct}"
   local landing_id="${4:-}"
+  local backup_landing_id="${5:-}"
   local protocol tag name
 
   if [[ "$type" == tuic* ]]; then
@@ -2400,6 +2584,7 @@ prepare_add_node() {
     --arg name "$name" \
     --argjson port "$port" \
     --arg landing_id "$landing_id" \
+    --arg backup_landing_id "$backup_landing_id" \
     '.nodes += [
        ({
          "type": $type,
@@ -2408,7 +2593,8 @@ prepare_add_node() {
          "tag": $tag,
          "name": $name,
          "port": $port
-       } + (if $landing_id != "" then {"landing_id": $landing_id} else {} end))
+       } + (if $landing_id != "" then {"landing_id": $landing_id} else {} end)
+         + (if $backup_landing_id != "" then {"backup_landing_id": $backup_landing_id} else {} end))
      ]'
 
   info "新增节点：${name} / 协议: ${protocol^^} / 端口: ${port}"
@@ -2418,7 +2604,7 @@ add_node_wizard() {
   need_state
   step "添加节点"
 
-  local choice port outbound_choice type_base landing_id=""
+  local choice port outbound_choice type_base landing_id="" backup_landing_id=""
 
   echo "1) 添加 VLESS 节点 (TCP)"
   echo "2) 添加 TUIC v5 节点 (UDP)"
@@ -2444,7 +2630,9 @@ add_node_wizard() {
     2)
       select_landing
       landing_id="$SEL_LANDING_ID"
-      info "已选择落地：${SEL_LANDING_DISPLAY}"
+      info "已选择主落地：${SEL_LANDING_DISPLAY}"
+      select_backup_landing "$landing_id"
+      backup_landing_id="$SEL_BACKUP_LANDING_ID"
       ;;
     *) warn "输入错误。"; return 1 ;;
   esac
@@ -2456,7 +2644,7 @@ add_node_wizard() {
   fi
 
   if [ -n "$landing_id" ]; then
-    prepare_add_node "${type_base}-relay" "$port" "landing" "$landing_id"
+    prepare_add_node "${type_base}-relay" "$port" "landing" "$landing_id" "$backup_landing_id"
   else
     prepare_add_node "${type_base}-direct" "$port" "direct"
   fi
@@ -2570,17 +2758,26 @@ modify_node_wizard() {
   echo
   echo "--- 节点当前信息 ---"
   echo "名称: ${name}"
-  echo "类型: $(node_type_name "$type" "$outbound_type")"
+  echo "类型: $(node_type_name "$type" "$outbound_type" "$old_tag")"
   echo "协议: ${protocol^^}"
   echo "端口: ${old_port}"
   echo "出口: $([ "$outbound_type" = "landing" ] && echo "落地中转 (${landing_display})" || echo "直出")"
+  echo "备用: $(jq -r --argjson i "$real_idx" '. as $s | .nodes[$i].backup_landing_id as $id | if $id==null then "未启用" else ([.landings[]|select(.id==$id)|.display][0]//"落地已丢失") end' "$STATE_FILE")"
+  if [ -f "$FAILOVER_STATUS_FILE" ]; then
+    jq -r --arg t "failover-${old_tag}" '
+      if (now - (.checked_at//0)) > 90 then "主备检测状态已超过 90 秒未更新，请检查 ysq-failover 服务。"
+      elif (.error//"")!="" then "主备检测异常: \(.error)"
+      else .groups[]? | select(.tag==$t) |
+        "当前出口: \(.selected) (主: \(.primary_ok), 备: \(.backup_ok))" end' "$FAILOVER_STATUS_FILE"
+  fi
   echo "--------------------"
   echo
 
   echo "请选择要修改的内容："
   echo "1) 修改端口"
   echo "2) 修改入站 SNI (同协议所有节点共用)"
-  echo "3) 修改出口方式 (切换直出 / 更换为落地池里的其他落地)"
+  echo "3) 修改出口方式 (切换直出 / 更换主落地)"
+  echo "4) 设置 / 取消备用落地 (故障切换、主落地恢复后回切)"
   echo "0) 返回"
   read_line "请输入选项: " mod_choice
   case "$mod_choice" in
@@ -2636,7 +2833,7 @@ modify_node_wizard() {
           --arg type "$new_type" \
           --arg tag "$new_tag" \
           --arg name "$new_name" \
-          '.nodes[$i] |= (.type = $type | .tag = $tag | .name = $name | .outbound_type = "direct" | del(.landing_id))'
+          '.nodes[$i] |= (.type = $type | .tag = $tag | .name = $name | .outbound_type = "direct" | del(.landing_id, .backup_landing_id))'
       elif [ "$out_target" = "2" ]; then
         select_landing
         if [ "$outbound_type" = "landing" ] && [ "$landing_id" = "$SEL_LANDING_ID" ]; then
@@ -2651,10 +2848,19 @@ modify_node_wizard() {
           --arg tag "$new_tag" \
           --arg name "$new_name" \
           --arg lid "$SEL_LANDING_ID" \
-          '.nodes[$i] |= (.type = $type | .tag = $tag | .name = $name | .outbound_type = "landing" | .landing_id = $lid)'
+          '.nodes[$i] |= (.type = $type | .tag = $tag | .name = $name | .outbound_type = "landing" | .landing_id = $lid | if .backup_landing_id == $lid then del(.backup_landing_id) else . end)'
       else
         return "$CANCEL_RC"
       fi
+      ;;
+    4)
+      if [ "$outbound_type" != "landing" ]; then
+        warn "请先把此节点的出口改为落地中转。"
+        return "$CANCEL_RC"
+      fi
+      select_backup_landing "$landing_id"
+      state_build --argjson i "$real_idx" --arg backup "$SEL_BACKUP_LANDING_ID" \
+        '.nodes[$i] |= (if $backup == "" then del(.backup_landing_id) else .backup_landing_id=$backup end)'
       ;;
     0)
       return "$CANCEL_RC"
@@ -3034,6 +3240,94 @@ normalize_domain() {
   printf '%s' "$d"
 }
 
+direct_add() {
+  need_state
+
+  local raw_input item domain domains_json
+  local -a new_domains=()
+
+  read_line "请输入要直连的域名 (多个用空格或逗号隔开，输入 0 返回): " raw_input
+  raw_input="$(split_input "$raw_input")"
+  if [ -z "$raw_input" ] || [ "$raw_input" = "0" ]; then return "$CANCEL_RC"; fi
+
+  for item in $raw_input; do
+    domain="$(normalize_domain "$item")"
+    if [ -z "$domain" ]; then continue; fi
+    if ! [[ "$domain" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]]; then
+      warn "忽略无效域名格式：${item}（中文域名请填写 punycode 形式）"
+      continue
+    fi
+    if jq -e --arg d "$domain" '.direct_domains | index($d)' "$STATE_FILE" >/dev/null 2>&1; then
+      info "域名已在直连列表中，跳过：$domain"
+      continue
+    fi
+    if [[ " ${new_domains[*]:-} " == *" ${domain} "* ]]; then
+      continue
+    fi
+    new_domains+=("$domain")
+  done
+
+  if [ "${#new_domains[@]}" -eq 0 ]; then
+    warn "没有新增任何有效域名。"
+    return "$CANCEL_RC"
+  fi
+
+  domains_json="$(printf '%s\n' "${new_domains[@]}" | jq -R . | jq -s .)"
+  state_build --argjson ds "$domains_json" '.direct_domains += $ds | .direct_domains |= unique | .blocked_domains = ((.blocked_domains//[]) - $ds)'
+  apply_state
+  ok "已批量直连 ${#new_domains[@]} 个域名: ${new_domains[*]}"
+}
+
+direct_remove() {
+  need_state
+
+  local count raw_indices idx real_idx remove_json
+  local -a all_domains=()
+  local -a remove_domains=()
+  local -a seen=()
+
+  mapfile -t all_domains < <(jq -r '.direct_domains[]?' "$STATE_FILE")
+  count="${#all_domains[@]}"
+  if [ "$count" -eq 0 ]; then
+    warn "直连列表为空。"
+    return "$CANCEL_RC"
+  fi
+
+  read_line "请输入要解除直连的序号 (多个用空格或逗号隔开，输入 all 清空全部，输入 0 取消): " raw_indices
+  raw_indices="$(split_input "$raw_indices")"
+  if [ -z "$raw_indices" ] || [ "$raw_indices" = "0" ]; then return "$CANCEL_RC"; fi
+
+  if [ "${raw_indices,,}" = "all" ]; then
+    confirm_or_cancel "确认清空全部 ${count} 个已直连域名吗？输入 y 确认: " || return $?
+    state_build '.direct_domains = []'
+    apply_state
+    ok "已清空全部直连域名。"
+    return 0
+  fi
+
+  for idx in $raw_indices; do
+    if valid_index "$idx" "$count"; then
+      real_idx=$((10#$idx - 1))
+      if [[ " ${seen[*]:-} " == *" ${real_idx} "* ]]; then continue; fi
+      seen+=("$real_idx")
+      remove_domains+=("${all_domains[$real_idx]}")
+    else
+      warn "忽略无效序号: $idx"
+    fi
+  done
+
+  if [ "${#remove_domains[@]}" -eq 0 ]; then
+    warn "未选择有效序号。"
+    return 1
+  fi
+
+  remove_json="$(printf '%s\n' "${remove_domains[@]}" | jq -R . | jq -s .)"
+  state_build --argjson rm_list "$remove_json" \
+    '.direct_domains |= map(select(. as $d | $rm_list | index($d) | not))'
+  apply_state
+  ok "已解除直连 (${#remove_domains[@]} 个): ${remove_domains[*]}"
+}
+
 block_add() {
   need_state
 
@@ -3067,7 +3361,7 @@ block_add() {
   fi
 
   domains_json="$(printf '%s\n' "${new_domains[@]}" | jq -R . | jq -s .)"
-  state_build --argjson ds "$domains_json" '.blocked_domains += $ds | .blocked_domains |= unique'
+  state_build --argjson ds "$domains_json" '.blocked_domains += $ds | .blocked_domains |= unique | .direct_domains = ((.direct_domains//[]) - $ds)'
   apply_state
   ok "已批量屏蔽 ${#new_domains[@]} 个域名: ${new_domains[*]}"
 }
@@ -3122,35 +3416,87 @@ block_remove() {
   ok "已解除屏蔽 (${#remove_domains[@]} 个): ${remove_domains[*]}"
 }
 
-block_website_menu() {
+# 直连指此 VPS 本机出口；未匹配的流量仍使用各节点原本的出口。
+routing_menu() {
   need_state
-
-  local count choice
-
+  local choice
   while true; do
-    step "屏蔽指定网站 (域名) 管理"
-    count="$(jq '.blocked_domains | length' "$STATE_FILE")"
-
-    if [ "$count" -eq 0 ]; then
-      echo "当前没有屏蔽任何网站。"
-    else
-      echo "当前已屏蔽的域名后缀 (reject)："
-      jq -r '.blocked_domains | to_entries[] | "\(.key + 1)) \(.value)"' "$STATE_FILE"
-    fi
-
+    step "分流管理"
+    echo "屏蔽域名："
+    jq -r 'if (.blocked_domains|length)==0 then "  (无)" else .blocked_domains|to_entries[]|"  \(.key+1)) \(.value)" end' "$STATE_FILE"
+    echo "直连域名："
+    jq -r 'if ((.direct_domains//[])|length)==0 then "  (无)" else .direct_domains|to_entries[]|"  \(.key+1)) \(.value)" end' "$STATE_FILE"
+    echo "Rule Set："
+    jq -r 'if ((.routing_rule_sets//[])|length)==0 then "  (无)" else .routing_rule_sets|to_entries[]|"  \(.key+1)) \(.value.tag) [\(if .value.action=="block" then "屏蔽" else "直连" end), \(.value.format)] \(.value.url)" end' "$STATE_FILE"
     echo
-    echo "1) 添加屏蔽域名 (支持批量)"
-    echo "2) 解除已屏蔽的域名 (支持批量 / all)"
+    echo "1) 添加屏蔽域名"
+    echo "2) 删除屏蔽域名"
+    echo "3) 添加直连域名"
+    echo "4) 删除直连域名"
+    echo "5) 添加 Rule Set (sing-box JSON / SRS)"
+    echo "6) 删除 Rule Set"
     echo "0) 返回"
-    read_line "请输入选项: " choice
+    info "优先级：屏蔽 > 直连 > 节点原出口；直连使用此 VPS 的公网出口。"
+    read_line "请选择: " choice
     case "$choice" in
       1) act block_add ;;
       2) act block_remove ;;
+      3) act direct_add ;;
+      4) act direct_remove ;;
+      5) act rule_set_add ;;
+      6) act rule_set_remove ;;
       0) return 0 ;;
       *) warn "输入错误。" ;;
     esac
   done
 }
+
+rule_set_add() {
+  need_state
+  local tag url choice action format interval
+  read_line "规则集名称 (字母开头，字母数字 / - / _，0 返回): " tag
+  tag="$(trim "$tag")"
+  [ -n "$tag" ] && [ "$tag" != "0" ] || return "$CANCEL_RC"
+  [[ "$tag" =~ ^[a-zA-Z][a-zA-Z0-9_-]{0,63}$ ]] || { err "规则集名称格式错误。"; return 1; }
+  tag="rs-${tag}"
+  if jq -e --arg t "$tag" '.routing_rule_sets[]? | select(.tag==$t)' "$STATE_FILE" >/dev/null; then
+    warn "此名称已存在，请删除原规则集后重新添加。"; return "$CANCEL_RC"
+  fi
+  read_line "sing-box 规则集下载链接 (https://): " url
+  url="$(trim "$url")"
+  [[ "$url" =~ ^https://[^[:space:]]+$ ]] || { err "请输入 HTTPS 下载链接。"; return 1; }
+  echo "1) 直连  2) 屏蔽"
+  read_line "规则动作 [默认 1]: " choice
+  case "${choice:-1}" in 1) action="direct" ;; 2) action="block" ;; *) return 1 ;; esac
+  echo "1) Source JSON (.json)  2) Binary (.srs)"
+  read_line "格式 [默认 2]: " choice
+  case "${choice:-2}" in 1) format="source" ;; 2) format="binary" ;; *) return 1 ;; esac
+  read_line "自动更新周期 [默认 1d，可填 1h / 12h / 1d]: " interval
+  interval="${interval:-1d}"
+  [[ "$interval" =~ ^[1-9][0-9]{0,4}[hm]$ || "$interval" =~ ^[1-9][0-9]{0,3}d$ ]] || { err "更新周期格式错误。"; return 1; }
+  state_build --arg t "$tag" --arg u "$url" --arg a "$action" --arg f "$format" --arg i "$interval" \
+    '.routing_rule_sets += [{tag:$t,type:"remote",url:$u,action:$a,format:$f,update_interval:$i}]'
+  apply_state
+  ok "规则集已添加：${tag}。首次使用需要能下载该规则集；以后使用本地缓存。"
+}
+
+rule_set_remove() {
+  need_state
+  local count pick idx
+  count="$(jq '(.routing_rule_sets//[])|length' "$STATE_FILE")"
+  [ "$count" -gt 0 ] || { warn "暂无 Rule Set。"; return "$CANCEL_RC"; }
+  jq -r '.routing_rule_sets|to_entries[]|"\(.key+1)) \(.value.tag) [\(.value.action)]"' "$STATE_FILE"
+  read_line "删除序号 (0 返回): " pick
+  [ "$pick" != "0" ] || return "$CANCEL_RC"
+  valid_index "$pick" "$count" || { err "序号无效。"; return 1; }
+  idx=$((10#$pick - 1))
+  state_build --argjson i "$idx" 'del(.routing_rule_sets[$i])'
+  apply_state
+  ok "规则集已删除。"
+}
+
+# 保留旧函数入口，已升级脚本调用时统一进入新菜单。
+block_website_menu() { routing_menu; }
 
 # -------------------------
 # 更新内核 / 刷新 IP
@@ -3270,6 +3616,8 @@ state_file_valid() {
     and ((.nodes // []) | type == "array")
     and ((.landings // []) | type == "array")
     and ((.blocked_domains // []) | type == "array")
+    and ((.direct_domains // []) | type == "array")
+    and ((.routing_rule_sets // []) | type == "array")
   ' "$STATE_FILE" >/dev/null 2>&1
 }
 
@@ -3381,6 +3729,11 @@ render_config() {
     err "旧 VLESS 节点使用了 TCP ${V2RAY_API_PORT}，与新 V2Ray API 冲突。请先将这个节点改到其他端口。"
     return 1
   fi
+  if failover_configured && jq -e --argjson p "$FAILOVER_API_PORT" \
+      '.nodes[]? | select(.type | startswith("vless")) | select((.port|tonumber)==$p)' "$STATE_FILE" >/dev/null; then
+    err "VLESS 节点占用主备切换 API 端口 ${FAILOVER_API_PORT}，请先修改该节点端口。"
+    return 1
+  fi
   info "生成 sing-box 配置..."
   mkdir -p "$CORE_LOG_DIR"
   touch "$LOG_FILE"
@@ -3393,12 +3746,21 @@ render_config() {
 
   tmp="$(mktemp "${CONFIG_FILE}.tmp.${WORK_TAG}.XXXXXX")" || { err "无法创建临时配置文件。"; return 1; }
 
-  if ! jq --arg api_listen "127.0.0.1:${V2RAY_API_PORT}" --arg cert_file "$CERT_FILE" --arg key_file "$KEY_FILE" --arg log_file "$LOG_FILE" '
+  if ! jq --arg api_listen "127.0.0.1:${V2RAY_API_PORT}" --arg cert_file "$CERT_FILE" --arg key_file "$KEY_FILE" --arg log_file "$LOG_FILE" --arg cache_file "${CORE_DATA_DIR}/route-rule-cache.db" --arg failover_listen "127.0.0.1:${FAILOVER_API_PORT}" '
     (.users |= map(select(.enabled != false))) as $s |
 
-    def landing($n):
-      first($s.landings[]? | select(.id == ($n.landing_id // "")))
-      // error("节点 [" + ($n.name // $n.tag) + "] 引用的落地节点不存在 (landing_id=" + ($n.landing_id // "") + ")");
+    def landing_id($id):
+      first($s.landings[]? | select(.id == $id))
+      // error("引用的落地节点不存在: " + $id);
+    def relay_nodes: [$s.nodes[]? | select(.outbound_type == "landing")];
+    def failover_nodes: [relay_nodes[] | select((.backup_landing_id // "") != "")];
+    def landing_ids: [relay_nodes[] | .landing_id, (.backup_landing_id // empty) | select(. != "")] | unique;
+    def policy_rule($field; $action):
+      if (($s[$field] // []) | length) == 0 then []
+      else [{domain_suffix:$s[$field]} + $action] end;
+    def set_rule($action; $rule):
+      [$s.routing_rule_sets[]? | select(.action == $action) | .tag] as $tags |
+      if ($tags|length)==0 then [] else [{rule_set:$tags} + $rule] end;
 
     def vless_in($n):
     {
@@ -3447,7 +3809,15 @@ render_config() {
     };
 
     def landing_out($l):
-    {
+    if ($l.type // "vless") == "tuic" then
+      if (($l.uuid // "")|length)==0 or (($l.password // "")|length)==0 then error("TUIC 落地缺少 UUID 或密码") else
+      {type:"tuic",tag:("out-"+$l.id),server:$l.server,server_port:($l.port|tonumber),
+       uuid:$l.uuid,password:$l.password,congestion_control:($l.congestion_control // "bbr"),
+       zero_rtt_handshake:false,heartbeat:"10s",
+       tls:{enabled:true,server_name:($l.sni // $l.server),insecure:($l.insecure // false),alpn:($l.alpn // ["h3"])}}
+       + (if $l.udp_over_stream == true then {udp_over_stream:true}
+          else {udp_relay_mode:($l.udp_relay_mode // "native")} end) end
+    elif ($l.type // "vless") == "vless" then {
       "type": "vless",
       "tag": ("out-" + $l.id),
       "server": $l.server,
@@ -3459,7 +3829,7 @@ render_config() {
         "server_name": ($l.sni // $s.reality_sni),
         "utls": {
           "enabled": true,
-          "fingerprint": "chrome"
+          "fingerprint": ($l.fingerprint // "chrome")
         },
         "reality": {
           "enabled": true,
@@ -3468,7 +3838,7 @@ render_config() {
         }
       },
       "packet_encoding": "xudp"
-    };
+    } else error("落地协议不支持: " + ($l.type|tostring)) end;
 
     {
       "log": {
@@ -3476,17 +3846,20 @@ render_config() {
         "output": $log_file,
         "timestamp": true
       },
-      "experimental": {
+      "experimental": ({
         "v2ray_api": {
           "listen": $api_listen,
           "stats": {
             "enabled": true,
             "users": [$s.users[] | (.stats_key // .name)],
             "inbounds": [$s.nodes[]? | .tag],
-            "outbounds": (["direct"] + ([$s.nodes[]? | select(.outbound_type == "landing") | "out-" + .landing_id] | unique))
+            "outbounds": (["direct"] + [landing_ids[] | "out-" + .] + [failover_nodes[] | "failover-" + .tag])
           }
         }
-      },
+      } + (if (($s.routing_rule_sets // []) | length) > 0 then
+         {cache_file:{enabled:true,path:$cache_file}} else {} end)
+        + (if (failover_nodes|length)>0 then
+         {clash_api:{external_controller:$failover_listen,secret:$s.failover_secret}} else {} end)),
       "inbounds": [
         $s.nodes[]? | select(($s.users | length) > 0) |
         if (.type | startswith("vless")) then
@@ -3506,38 +3879,28 @@ render_config() {
         ]
         +
         (
-          [
-            $s.nodes[]? |
-            select(.outbound_type == "landing") |
-            landing(.)
-          ]
-          | unique_by(.id)
-          | map(landing_out(.))
+          [landing_ids[] | landing_id(.) | landing_out(.)]
+          + [failover_nodes[] |
+            if .landing_id == .backup_landing_id then error("主备落地不能相同: " + .tag) else
+              {type:"selector",tag:("failover-"+.tag),
+               outbounds:[("out-"+.landing_id),("out-"+.backup_landing_id)],
+               default:("out-"+.landing_id),interrupt_exist_connections:false} end]
         )
       ),
       "route": {
+        "rule_set": [ $s.routing_rule_sets[]? |
+          if (.action != "direct" and .action != "block") then error("规则集动作无效") else
+          {type:"remote",tag:.tag,format:.format,url:.url,
+           update_interval:(.update_interval // "1d"),http_client:{detour:"direct"}} end ],
         "rules": (
-          (if (($s.blocked_domains // []) | length) > 0 then
-            [
-              {
-                "action": "sniff"
-              },
-              {
-                "domain_suffix": $s.blocked_domains,
-                "action": "reject"
-              }
-            ]
-          else [] end)
-          +
-          (
-            [$s.nodes[]? | select(.outbound_type == "landing")]
-            | group_by(.landing_id)
-            | map({
-              "inbound": map(.tag),
-              "action": "route",
-              "outbound": ("out-" + .[0].landing_id)
-            })
-          )
+          (if ((($s.blocked_domains//[])|length)+(($s.direct_domains//[])|length)+(($s.routing_rule_sets//[])|length))>0
+           then [{action:"sniff",timeout:"300ms"}] else [] end)
+          + policy_rule("blocked_domains"; {action:"reject"})
+          + set_rule("block"; {action:"reject"})
+          + policy_rule("direct_domains"; {action:"route",outbound:"direct"})
+          + set_rule("direct"; {action:"route",outbound:"direct"})
+          + [relay_nodes[] | {inbound:[.tag],action:"route",
+             outbound:(if (.backup_landing_id//"")!="" then "failover-"+.tag else "out-"+.landing_id end)}]
         ),
         "final": "direct"
       }
@@ -3634,7 +3997,7 @@ INFO
       echo "=============================="
       echo "节点: ${name}"
       echo "用户: ${user}"
-      echo "类型: $(node_type_name "$type" "$outbound_type")"
+      echo "类型: $(node_type_name "$type" "$outbound_type" "$tag")"
       echo "传输协议: ${protocol^^} / 端口: ${port}"
       if [ "$outbound_type" = "landing" ]; then
         echo "落地出口: ${landing_disp} (端口: ${landing_port})"
@@ -3787,6 +4150,11 @@ YAML
 render_all() {
   ensure_state_defaults || return 1
   ensure_tuic_cert || return 1
+  if failover_configured; then
+    ensure_agent_python || return 1
+    # Install all fallible helper assets before replacing the active core config.
+    install_failover_bundle || return 1
+  fi
   render_config || return 1
   render_yaml || warn "生成 Clash YAML 失败（不影响 sing-box 运行）。"
   render_info || warn "生成节点信息文件失败（不影响 sing-box 运行）。"
@@ -3814,12 +4182,20 @@ rerender_and_restart() {
 
   if [ -f "$CONFIG_FILE" ]; then
     bak_conf="$(mktemp "${CONFIG_FILE}.tmp.${WORK_TAG}.XXXXXX")" || { err "无法创建备份文件。"; return 1; }
-    cp -p "$CONFIG_FILE" "$bak_conf"
+    if ! cp -p "$CONFIG_FILE" "$bak_conf"; then
+      rm -f "$bak_conf"
+      err "备份现有配置失败，未修改配置。"
+      return 1
+    fi
   fi
 
   if ! render_all; then
-    [ -z "$bak_conf" ] || rm -f "$bak_conf"
-    err "重新渲染失败，现有配置未被修改，未重启。"
+    if [ -n "$bak_conf" ]; then
+      mv -f "$bak_conf" "$CONFIG_FILE" || { err "恢复配置备份失败：${bak_conf}"; return 1; }
+    else
+      rm -f "$CONFIG_FILE"
+    fi
+    err "重新渲染失败，已恢复原配置，未重启。"
     return 1
   fi
 
@@ -3876,8 +4252,8 @@ list_nodes_table() {
 
   jq -r "$JQ_TABLE_LIB$JQ_NODE_LIB"'
     . as $s |
-    ["序号", "节点名", "协议", "端口", "类型", "落地 (国家：ip)"] as $headers |
-    [4, 28, 6, 6, 20, 20] as $mins |
+    ["序号", "节点名", "协议", "端口", "类型", "主落地", "备用落地"] as $headers |
+    [4, 28, 6, 6, 20, 20, 20] as $mins |
     [
       .nodes | to_entries[] | .value as $n |
       ($n.outbound_type // "direct") as $out |
@@ -3886,9 +4262,12 @@ list_nodes_table() {
         ($n.name // "-"),
         (($n.protocol // "tcp") | ascii_upcase),
         ($n.port | tostring),
-        node_type_name($n.type; $out),
+        node_type_name_for($s; $n),
         (if $out == "landing" then
           ((first($s.landings[]? | select(.id == ($n.landing_id // ""))) | .display) // "(落地已丢失)")
+        else "-" end),
+        (if $out == "landing" and (($n.backup_landing_id//"")!="") then
+          ((first($s.landings[]? | select(.id == $n.backup_landing_id)) | .display) // "(落地已丢失)")
         else "-" end)
       ]
     ] as $rows |
@@ -4062,12 +4441,13 @@ save_self() {
   return 1
 }
 
-# 删除 sing-box。keep=1 时只保留状态文件（UUID / 私钥 / 节点 / 落地 / 屏蔽列表）
+# 删除 sing-box。keep=1 时只保留状态文件（UUID / 私钥 / 节点 / 主备落地 / 分流设置）
 do_uninstall() {
   local keep="${1:-0}" p
 
   flush_agent_traffic
   agent_service_disable
+  stop_failover_service
   service_stop
   service_disable
 
@@ -4077,6 +4457,8 @@ do_uninstall() {
   rm -f ${CORE_OPENRC_FILE}
   rm -f ${CORE_PID_FILE}
   remove_log_trim
+  rm -f "$FAILOVER_FILE" "$FAILOVER_SYSTEMD_FILE" "$FAILOVER_OPENRC_FILE" "$FAILOVER_PID_FILE"
+  rm -rf "$(dirname "$FAILOVER_STATUS_FILE")"
   rm -rf ${CORE_DATA_DIR} ${CORE_LOG_DIR}
   rm -f "$INFO_FILE" "$YAML_FILE" "$PANEL_FILE"
   rm -f "$AGENT_FILE" "$AGENT_SYSTEMD_FILE" "$AGENT_OPENRC_FILE" "$AGENT_PID_FILE"
@@ -4318,7 +4700,7 @@ panel_menu() {
     echo "7)  落地节点池管理"
     echo "8)  用户管理"
     echo "9)  流量统计"
-    echo "10) 屏蔽指定网站管理"
+    echo "10) 分流管理"
     echo "11) 更新 sing-box 内核"
     echo "12) 重启 sing-box"
     echo "13) 刷新公网 IP"
@@ -4392,7 +4774,7 @@ install_wizard() {
     INSTALL_PREV_FILE="$prev"
     if state_file_valid; then
       step "沿用已有状态文件"
-      ok "检测到有效的 ${STATE_FILE}：将沿用其中的 UUID / 密钥 / 节点 / 落地 / 屏蔽设置，不会覆盖。"
+      ok "检测到有效的 ${STATE_FILE}：将沿用其中的 UUID / 密钥 / 节点 / 主备落地 / 分流设置，不会覆盖。"
       ensure_state_defaults || die "状态文件规范化失败，请检查 ${STATE_FILE}。"
       refresh_ip_if_changed
     else
@@ -4433,8 +4815,288 @@ install_wizard() {
   print_summary
 }
 
+# 主备切换独立于中控 Agent；单机使用也会安装此本地 worker。
+failover_configured() {
+  jq -e '.nodes[]? | select(.outbound_type=="landing" and ((.backup_landing_id//"")!=""))' "$STATE_FILE" >/dev/null
+}
+
+write_failover_worker() {
+  cat <<'YSQ_FAILOVER_PY'
+#!/usr/bin/env python3
+# BEGIN_EMBEDDED_FAILOVER
+"""Keep the preferred landing selected, switching only after confirmed failures."""
+import concurrent.futures
+import contextlib
+import json
+import os
+from pathlib import Path
+import signal
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+INTERVAL = 10
+THRESHOLD = 2
+PROBE_TIMEOUT_MS = 4000
+PROBE_URLS = ("https://www.gstatic.com/generate_204", "https://cp.cloudflare.com/generate_204")
+
+
+class ControllerError(RuntimeError):
+    pass
+
+
+class Monitor:
+    def __init__(self, config_path, status_path):
+        self.config_path, self.status_path = Path(config_path), Path(status_path)
+        self.counters = {}
+        self.fingerprint = None
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        self.base = ""
+        self.secret = ""
+        self.last_error = None
+
+    def api(self, path, method="GET", payload=None):
+        raw = None if payload is None else json.dumps(payload).encode()
+        request = urllib.request.Request(self.base + path, data=raw, method=method,
+                headers={"Authorization": "Bearer " + self.secret, "Content-Type": "application/json"})
+        try:
+            with self.opener.open(request, timeout=PROBE_TIMEOUT_MS / 1000 + 2) as response:
+                body = response.read(1024 * 1024 + 1)
+                if len(body) > 1024 * 1024:
+                    raise ControllerError("local controller response too large")
+                return json.loads(body) if body else {}
+        except urllib.error.HTTPError as exc:
+            if "/delay?" in path and exc.code in (503, 504):
+                return {"delay": 0}
+            raise ControllerError("local controller HTTP " + str(exc.code)) from None
+        except (OSError, ValueError, urllib.error.URLError) as exc:
+            raise ControllerError("local controller unavailable: " + type(exc).__name__) from None
+
+    def healthy(self, tag):
+        for url in PROBE_URLS:
+            query = urllib.parse.urlencode({"url": url, "timeout": PROBE_TIMEOUT_MS})
+            result = self.api("/proxies/" + urllib.parse.quote(tag, safe="") + "/delay?" + query)
+            delay = result.get("delay")
+            if isinstance(delay, (int, float)) and not isinstance(delay, bool) and delay > 0:
+                return True
+        return False
+
+    def write_status(self, status):
+        path = self.status_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, name = tempfile.mkstemp(prefix=".status-", dir=str(path.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(status, stream, ensure_ascii=False, separators=(",", ":"))
+            os.replace(name, path)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(name)
+
+    def cycle(self):
+        config = json.loads(self.config_path.read_text(encoding="utf-8"))
+        selectors = [item for item in config.get("outbounds", [])
+                     if item.get("type") == "selector" and item.get("tag", "").startswith("failover-")]
+        if not selectors:
+            self.counters.clear()
+            self.write_status({"checked_at": int(time.time()), "groups": [], "error": ""})
+            return []
+        api = config.get("experimental", {}).get("clash_api", {})
+        controller = api.get("external_controller", "")
+        host, separator, port = controller.rpartition(":")
+        if not separator or host != "127.0.0.1" or not port.isdigit() or not api.get("secret"):
+            raise ControllerError("missing authenticated loopback controller")
+        self.base, self.secret = "http://" + controller, api["secret"]
+        fingerprint = json.dumps(config, sort_keys=True, separators=(",", ":"))
+        if fingerprint != self.fingerprint:
+            self.counters.clear()
+            self.fingerprint = fingerprint
+        # Read the core's current selection every time: restart/cache may change it.
+        current = self.api("/proxies/").get("proxies", {})
+        tags = set()
+        for selector in selectors:
+            members = selector.get("outbounds", [])
+            if len(members) != 2 or selector.get("default") not in members:
+                raise ControllerError("invalid failover selector")
+            tags.update(members)
+            if current.get(selector["tag"], {}).get("now") not in members:
+                raise ControllerError("selector unavailable in running core")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            health = dict(zip(sorted(tags), pool.map(self.healthy, sorted(tags))))
+        for tag, healthy in health.items():
+            old = self.counters.get(tag, {"good": 0, "bad": 0})
+            self.counters[tag] = {"good": min(THRESHOLD, old["good"] + 1) if healthy else 0,
+                                  "bad": min(THRESHOLD, old["bad"] + 1) if not healthy else 0}
+        groups = []
+        for selector in selectors:
+            tag, primary = selector["tag"], selector["default"]
+            backup = next(member for member in selector["outbounds"] if member != primary)
+            selected = current[tag]["now"]
+            desired = selected
+            if selected == primary and self.counters[primary]["bad"] >= THRESHOLD and health[backup]:
+                desired = backup
+            elif selected != primary and self.counters[primary]["good"] >= THRESHOLD:
+                desired = primary
+            if desired != selected:
+                self.api("/proxies/" + urllib.parse.quote(tag, safe=""), "PUT", {"name": desired})
+                print(time.strftime("%Y-%m-%d %H:%M:%S"), tag, selected, "->", desired, flush=True)
+                selected = desired
+            groups.append({"tag": tag, "primary": primary, "backup": backup, "selected": selected,
+                           "primary_ok": health[primary], "backup_ok": health[backup],
+                           "primary_failures": self.counters[primary]["bad"],
+                           "primary_successes": self.counters[primary]["good"],
+                           "all_down": not any((health[primary], health[backup]))})
+        self.write_status({"checked_at": int(time.time()), "groups": groups, "error": ""})
+        return groups
+
+    def run(self, stop):
+        while not stop.is_set():
+            started = time.monotonic()
+            try:
+                self.cycle()
+                self.last_error = None
+            except (OSError, ValueError, KeyError, ControllerError) as exc:
+                error = str(exc)[:240]
+                if self.last_error != error:
+                    print("failover:", error, file=sys.stderr, flush=True)
+                self.last_error = error
+                with contextlib.suppress(OSError):
+                    self.write_status({"checked_at": int(time.time()), "groups": [], "error": error})
+            stop.wait(max(1, INTERVAL - (time.monotonic() - started)))
+
+
+def main():
+    if len(sys.argv) != 3:
+        return 2
+    stop = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    signal.signal(signal.SIGINT, lambda *_: stop.set())
+    Monitor(sys.argv[1], sys.argv[2]).run(stop)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+# END_EMBEDDED_FAILOVER
+YSQ_FAILOVER_PY
+}
+
+install_failover_bundle() {
+  local wd py
+  wd="$(new_work_dir)"
+  py="$(command -v python3)"
+  mkdir -p "$(dirname "$FAILOVER_FILE")" "$(dirname "$FAILOVER_STATUS_FILE")" || return 1
+  chmod 700 "$(dirname "$FAILOVER_STATUS_FILE")" || return 1
+  write_failover_worker > "$wd/worker" || return 1
+  python3 -c 'import sys; compile(open(sys.argv[1],encoding="utf-8").read(),sys.argv[1],"exec")' "$wd/worker" || return 1
+  if ! install_if_changed "$wd/worker" "$FAILOVER_FILE" 700; then
+    [ -s "$FAILOVER_FILE" ] && cmp -s "$wd/worker" "$FAILOVER_FILE" || return 1
+  fi
+  case "$SERVICE_MANAGER" in
+    systemd)
+      cat > "$wd/unit" <<EOF
+[Unit]
+Description=YSQ preferred landing failover monitor
+After=network-online.target sing-box.service
+Wants=network-online.target
+[Service]
+Type=simple
+User=root
+UMask=0077
+ExecStart=${py} ${FAILOVER_FILE} ${CONFIG_FILE} ${FAILOVER_STATUS_FILE}
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+NoNewPrivileges=true
+[Install]
+WantedBy=multi-user.target
+EOF
+      if install_if_changed "$wd/unit" "$FAILOVER_SYSTEMD_FILE" 644; then
+        service_daemon_reload
+      else
+        cmp -s "$wd/unit" "$FAILOVER_SYSTEMD_FILE" || return 1
+      fi
+      ;;
+    openrc)
+      cat > "$wd/unit" <<EOF
+#!/sbin/openrc-run
+description="YSQ preferred landing failover monitor"
+command="${py}"
+command_args="${FAILOVER_FILE} ${CONFIG_FILE} ${FAILOVER_STATUS_FILE}"
+command_background="yes"
+pidfile="${FAILOVER_PID_FILE}"
+output_log="/dev/null"
+error_log="/dev/null"
+umask="0077"
+retry="TERM/15/KILL/5"
+depend() {
+  need net
+  after sing-box
+}
+EOF
+      if ! install_if_changed "$wd/unit" "$FAILOVER_OPENRC_FILE" 755; then
+        cmp -s "$wd/unit" "$FAILOVER_OPENRC_FILE" || return 1
+      fi
+      ;;
+    none|test) ;;
+  esac
+  rm -rf "$wd"
+}
+
+stop_failover_service() {
+  case "$SERVICE_MANAGER" in
+    systemd) systemctl disable --now ysq-failover >/dev/null 2>&1 || true ;;
+    openrc) rc-service ysq-failover stop >/dev/null 2>&1 || true; rc-update del ysq-failover default >/dev/null 2>&1 || true ;;
+    none)
+      if [ -f "$FAILOVER_PID_FILE" ]; then
+        local pid
+        pid="$(cat "$FAILOVER_PID_FILE")"
+        case "$pid" in
+          ''|*[!0-9]*) ;;
+          *)
+            # A stale pid file must not stop an unrelated process after PID reuse.
+            if [ -r "/proc/${pid}/cmdline" ] && tr '\0' ' ' < "/proc/${pid}/cmdline" | grep -Fq "$FAILOVER_FILE"; then
+              kill "$pid" 2>/dev/null || true
+              for _ in $(seq 1 15); do
+                kill -0 "$pid" 2>/dev/null || break
+                sleep 1
+              done
+              if [ -r "/proc/${pid}/cmdline" ] && tr '\0' ' ' < "/proc/${pid}/cmdline" | grep -Fq "$FAILOVER_FILE"; then
+                kill -9 "$pid" 2>/dev/null || true
+              fi
+            fi
+            ;;
+        esac
+      fi
+      ;;
+  esac
+  rm -f "$FAILOVER_PID_FILE"
+}
+
+sync_failover_service() {
+  if ! failover_configured; then
+    stop_failover_service
+    rm -f "$FAILOVER_STATUS_FILE"
+    return 0
+  fi
+  case "$SERVICE_MANAGER" in
+    systemd) systemctl enable ysq-failover >/dev/null 2>&1; systemctl restart ysq-failover 9>&- ;;
+    openrc) rc-update add ysq-failover default >/dev/null 2>&1; rc-service ysq-failover restart 9>&- ;;
+    none)
+      stop_failover_service
+      nohup python3 "$FAILOVER_FILE" "$CONFIG_FILE" "$FAILOVER_STATUS_FILE" 9>&- >/dev/null 2>&1 &
+      echo $! > "$FAILOVER_PID_FILE"
+      ;;
+    test) ;;
+  esac
+}
+
 # -------------------------
-# 可选中控：单机模式不依赖 Python；只有连接中控时安装 Agent。
+# 可选中控：基础单机模式不依赖 Python；主备切换或中控功能按需安装 Python。
 # -------------------------
 acquire_config_lock() {
   local inherited="${YSQ_CONFIG_LOCK_FD:-}"
@@ -4536,7 +5198,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-VERSION = "2026.10.23.3"
+VERSION = "2026.10.24.2"
 PROTOCOL = 1
 SAMPLE_SECONDS = 10
 SYNC_SECONDS = 15
@@ -6037,7 +6699,7 @@ ensure_agent_python() {
     pkg_install python3 || return 1
   fi
   if ! python3 -c 'import sys, sqlite3, ssl; raise SystemExit(0 if sys.version_info >= (3,9) else 1)' >/dev/null 2>&1; then
-    err "中控 Agent 需要 Python 3.9 或更新版本，以及 sqlite3/ssl 标准库；当前单机功能不受影响。"
+    err "中控 Agent / 主备切换需要 Python 3.9 或更新版本，以及 sqlite3/ssl 标准库；其他单机功能不受影响。"
     return 1
   fi
 }
