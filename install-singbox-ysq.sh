@@ -27,7 +27,7 @@ set -euo pipefail
 #   - Alpine(OpenRC)：日志写入单个文件，busybox cron 每小时检查，达 9MB 裁剪、保留最后 2MB
 # ============================================================
 
-YSQ_VERSION="2026.10.24.5"
+YSQ_VERSION="2026.10.24.6"
 INSTALLER_NAME="install-singbox-ysq.sh"
 DEFAULT_SCRIPT_URL="https://raw.githubusercontent.com/showcode1024/singbox-auto/main/install-singbox-ysq.sh"
 
@@ -664,6 +664,7 @@ service_disable() {
 }
 
 service_stop() {
+  state_write_guard || return $?
   flush_agent_traffic
   if [ "$SERVICE_MANAGER" = "test" ]; then
     rm -f "${YSQ_TEST_ROOT}/run/test-singbox-running"
@@ -694,6 +695,7 @@ service_stop() {
 
 # 失败返回 1（不 die），方便上层回滚
 service_restart() {
+  state_write_guard || return $?
   flush_agent_traffic
   if [ "$SERVICE_MANAGER" = "test" ]; then
     if [ -f "${YSQ_TEST_ROOT}/run/test-restart-fail-once" ]; then
@@ -1714,7 +1716,40 @@ state_read() {
 # 用法：state_build <jq 参数...> '<filter>'
 # 结果写入新的临时文件，路径保存在 NEW_STATE；jq 失败直接 die，不会碰原 state
 NEW_STATE=""
+YSQ_ACTION_STATE_BASELINE=""
+YSQ_ACTION_WRITE_LOCKED=0
+
+state_fingerprint() {
+  local result
+  if [ ! -e "$STATE_FILE" ]; then printf '%s\n' absent; return 0; fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    result="$(sha256sum < "$STATE_FILE")" || return 1
+    printf '%s\n' "${result%% *}"
+  else
+    result="$(openssl dgst -sha256 < "$STATE_FILE")" || return 1
+    printf '%s\n' "${result##* }"
+  fi
+}
+
+# Gather input without a write lock. Once a write is ready, verify the original
+# snapshot before using its indexes and keep FD 9 through apply and rollback.
+state_write_guard() {
+  local current
+  [ "$YSQ_ACTION_WRITE_LOCKED" != 1 ] || return 0
+  acquire_config_lock || return $?
+  if [ -n "$YSQ_ACTION_STATE_BASELINE" ]; then
+    current="$(state_fingerprint)" || { err "无法读取配置状态，请重试。"; return 1; }
+    if [ "$current" != "$YSQ_ACTION_STATE_BASELINE" ]; then
+      warn "配置已被另一项操作更新，本次修改已取消；请重新打开该操作并选择。"
+      return "$CANCEL_RC"
+    fi
+  fi
+  YSQ_ACTION_WRITE_LOCKED=1
+}
+
 state_build() {
+  # Never let a failed guard continue into a commit of an older staged state.
+  state_write_guard || exit $?
   [ -f "$STATE_FILE" ] || die "未找到状态文件：$STATE_FILE"
   NEW_STATE="$(mktemp "${STATE_FILE}.tmp.${WORK_TAG}.XXXXXX")" || die "无法创建临时文件。"
   if ! jq "$@" "$STATE_FILE" > "$NEW_STATE"; then
@@ -1799,6 +1834,7 @@ apply_state() {
 ensure_state_defaults() {
   local tmp secret
 
+  state_write_guard || return $?
   [ -f "$STATE_FILE" ] || { err "未找到状态文件：$STATE_FILE"; return 1; }
   secret="$(jq -r '.failover_secret // empty' "$STATE_FILE")"
   [ -n "$secret" ] || secret="$(openssl rand -hex 24)"
@@ -1957,8 +1993,6 @@ create_state_file() {
   local uuid private_key public_key short_id tuic_pass server_ip
   local country_code flag loc ip_version key_choice ipv_choice keypair tmp
 
-  mkdir -p "$CONFIG_DIR"
-
   step "基础参数设置"
 
   if [ "$CLI_YES" = "1" ]; then
@@ -2040,6 +2074,8 @@ create_state_file() {
   ok "公网 IP (${ip_version})：${server_ip}"
   ok "自动命名地区：${flag}${loc}"
 
+  state_write_guard || return $?
+  mkdir -p "$CONFIG_DIR" || return 1
   tmp="$(mktemp "${STATE_FILE}.tmp.${WORK_TAG}.XXXXXX")" || die "无法创建临时文件。"
   if ! jq -n \
     --arg uuid "$uuid" \
@@ -3532,6 +3568,7 @@ update_core_wizard() {
     confirm_or_cancel "确认更新到最新版本？输入 y 确认 [默认 y]: " y "" || return $?
   fi
 
+  state_write_guard || return $?
   # 先备份旧二进制，安装失败时恢复，避免把服务搞成“没有可执行文件”
   bin="$(command -v sing-box 2>/dev/null || true)"
   wd="$(new_work_dir)"
@@ -3723,6 +3760,7 @@ check_config_file() {
 render_config() {
   local tmp
 
+  state_write_guard || return $?
   [ -f "$STATE_FILE" ] || { err "未找到状态文件：$STATE_FILE"; return 1; }
   # 若旧 VLESS 节点正好使用了 API 预留的 TCP 端口，应先调整该节点，而非生成必然抢占端口的配置。
   if jq -e --argjson p "$V2RAY_API_PORT" \
@@ -3936,6 +3974,7 @@ render_config() {
 render_info() {
   # 可选参数：用户名、输出路径。未指定时仍导出所有用户的完整节点文件。
   local selected_user="${1:-}" out_file="${2:-$INFO_FILE}" user_label="默认用户"
+  if [ "$out_file" = "$INFO_FILE" ]; then state_write_guard || return $?; fi
   [ -f "$STATE_FILE" ] || return 1
   if [ -n "$selected_user" ] && ! jq -e --arg name "$selected_user" \
     '[.users[]? | select(.enabled != false and .name == $name)] | length == 1' "$STATE_FILE" >/dev/null 2>&1; then
@@ -4026,6 +4065,7 @@ INFO
 render_yaml() {
   # 可选参数：用户名、输出路径。用于按用户查看，不改变磁盘上的全量 Clash 文件。
   local selected_user="${1:-}" out_file="${2:-$YAML_FILE}"
+  if [ "$out_file" = "$YAML_FILE" ]; then state_write_guard || return $?; fi
   [ -f "$STATE_FILE" ] || return 1
   if [ -n "$selected_user" ] && ! jq -e --arg name "$selected_user" \
     '[.users[]? | select(.enabled != false and .name == $name)] | length == 1' "$STATE_FILE" >/dev/null 2>&1; then
@@ -4164,6 +4204,7 @@ render_all() {
 }
 
 restart_singbox() {
+  state_write_guard || return $?
   step "重启 sing-box"
   service_enable
   if service_restart; then
@@ -4182,6 +4223,7 @@ restart_and_status() {
 rerender_and_restart() {
   local bak_conf=""
 
+  state_write_guard || return $?
   if [ -f "$CONFIG_FILE" ]; then
     bak_conf="$(mktemp "${CONFIG_FILE}.tmp.${WORK_TAG}.XXXXXX")" || { err "无法创建备份文件。"; return 1; }
     if ! cp -p "$CONFIG_FILE" "$bak_conf"; then
@@ -4229,7 +4271,7 @@ restart_wizard() {
   case "$choice" in
     1) restart_and_status ;;
     2)
-      rerender_and_restart
+      rerender_and_restart || return $?
       service_status
       ;;
     0) return "$CANCEL_RC" ;;
@@ -4447,6 +4489,7 @@ save_self() {
 do_uninstall() {
   local keep="${1:-0}" p
 
+  state_write_guard || return $?
   flush_agent_traffic
   agent_service_disable
   stop_failover_service
@@ -4494,7 +4537,7 @@ uninstall_all() {
   case "$mode" in
     1)
       confirm_or_cancel "确认彻底删除 sing-box 及全部节点数据？输入 y 确认: " || return $?
-      do_uninstall 0
+      do_uninstall 0 || return $?
       ok "已彻底删除。"
       ;;
     2)
@@ -4503,7 +4546,7 @@ uninstall_all() {
         return 1
       fi
       confirm_or_cancel "确认删除 sing-box 并保留节点数据？输入 y 确认: " || return $?
-      do_uninstall 1
+      do_uninstall 1 || return $?
       ok "已删除 sing-box，节点数据已保留：${STATE_FILE}"
       info "该文件含 UUID / Reality 私钥，请妥善保管（权限 600）。"
       info "重新安装：bash ${INSTALLER_FILE} [vless=端口 tuic=端口 -y]，会自动沿用该文件，不会覆盖。"
@@ -4600,6 +4643,7 @@ update_panel_wizard() {
     return "$CANCEL_RC"
   fi
 
+  state_write_guard || return $?
   # 先写同目录临时文件再 mv：原子替换；当前正在运行的旧脚本仍持有旧 inode，不会被改乱
   new_file="${INSTALLER_FILE}.new.$$"
   bak="${INSTALLER_FILE}.bak"
@@ -4636,10 +4680,8 @@ run_action() {
 
   (
     set -e
-    case "$1" in
-      agent_join_wizard|agent_status_wizard|agent_sync_wizard|agent_detach_wizard) ;;
-      *) acquire_config_lock ;;
-    esac
+    YSQ_ACTION_WRITE_LOCKED=0
+    YSQ_ACTION_STATE_BASELINE="$(state_fingerprint)" || die "无法读取操作开始时的配置状态。"
     "$@"
   )
   rc=$?
@@ -4675,7 +4717,7 @@ act() {
 panel_menu() {
   need_root
   need_state
-  ( acquire_config_lock; ensure_state_defaults ) || die "状态文件规范化失败，请检查 ${STATE_FILE}。"
+  ( acquire_config_lock && ensure_state_defaults ) || die "状态文件规范化失败，请检查 ${STATE_FILE}。"
 
   local choice
 
@@ -6901,7 +6943,7 @@ agent_join_wizard() {
     err "接入码格式不正确，请重新从中控网页复制完整连接信息。"
     return 1
   fi
-  ( acquire_config_lock; install_agent_bundle ) || return 1
+  ( acquire_config_lock && install_agent_bundle ) || return 1
   # Agent joins without holding the config lock; it reads local inventory.
   if ! python3 "$AGENT_FILE" --config "$AGENT_CONFIG_FILE" join \
     --url="$url" --code="$code" --script="$INSTALLER_FILE" >/dev/null; then
@@ -7043,7 +7085,7 @@ central_management_menu() {
 agent_inventory_action() {
   need_root
   need_state
-  acquire_config_lock || return 1
+  # One jq read sees a complete state snapshot because writers replace it atomically.
   local running=false
   is_singbox_running && running=true
   jq -c --argjson running "$running" '{
