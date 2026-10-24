@@ -27,7 +27,7 @@ set -euo pipefail
 #   - Alpine(OpenRC)：日志写入单个文件，busybox cron 每小时检查，达 9MB 裁剪、保留最后 2MB
 # ============================================================
 
-YSQ_VERSION="2026.10.24.3"
+YSQ_VERSION="2026.10.24.4"
 INSTALLER_NAME="install-singbox-ysq.sh"
 DEFAULT_SCRIPT_URL="https://raw.githubusercontent.com/showcode1024/singbox-auto/main/install-singbox-ysq.sh"
 
@@ -1615,7 +1615,9 @@ install_deps() {
   command -v jq      >/dev/null 2>&1 || missing+=(jq)
   command -v tar     >/dev/null 2>&1 || missing+=(tar)
   command -v gzip    >/dev/null 2>&1 || missing+=(gzip)
-  command -v flock   >/dev/null 2>&1 || missing+=(util-linux)
+  if ! command -v flock >/dev/null 2>&1; then
+    missing+=("$(config_lock_package)")
+  fi
 
   if ! command -v ss >/dev/null 2>&1 || ! command -v ip >/dev/null 2>&1; then
     case "$PKG_MANAGER" in
@@ -5098,28 +5100,66 @@ sync_failover_service() {
 # -------------------------
 # 可选中控：基础单机模式不依赖 Python；主备切换或中控功能按需安装 Python。
 # -------------------------
-acquire_config_lock() {
-  local inherited="${YSQ_CONFIG_LOCK_FD:-}"
-  if [ "$inherited" = "9" ] && [ "${YSQ_CONFIG_LOCK_PATH:-}" = "$CONFIG_LOCK_FILE" ]; then
-    if flock -n 9 2>/dev/null; then
-      return 0
-    fi
-  fi
+config_lock_package() {
+  if [ "$PKG_MANAGER" = "apk" ]; then printf '%s\n' flock; else printf '%s\n' util-linux; fi
+}
+
+ensure_config_lock_tool() {
   if ! command -v flock >/dev/null 2>&1; then
     [ -z "$YSQ_TEST_ROOT" ] || { err "隔离测试需要 flock。"; return 1; }
     need_root
-    info "安装跨进程配置锁依赖 util-linux..." >&2
-    pkg_install util-linux >&2 || return 1
+    local package
+    package="$(config_lock_package)"
+    info "安装跨进程配置锁依赖 ${package}..." >&2
+    pkg_install "$package" >&2 || { err "配置锁依赖安装失败：${package}。"; return 1; }
   fi
-  mkdir -p "$(dirname "$CONFIG_LOCK_FILE")"
-  exec 9>>"$CONFIG_LOCK_FILE"
-  chmod 600 "$CONFIG_LOCK_FILE"
-  if ! flock -x -w "${YSQ_LOCK_TIMEOUT:-30}" 9; then
-    err "另一项面板操作正在修改配置，请稍后重试。"
+  command -v flock >/dev/null 2>&1 || { err "未找到 flock，请安装配置锁依赖后重试。"; return 1; }
+}
+
+acquire_config_lock() {
+  local inherited="${YSQ_CONFIG_LOCK_FD:-}" timeout="${YSQ_LOCK_TIMEOUT:-30}"
+  local ticks=0 max_ticks message rc inherited_fd=false
+  # BusyBox flock lacks -w. Use the common -n operation, preserving a bounded
+  # wait instead of confusing an unsupported option with lock contention.
+  case "$timeout" in ''|*[!0-9]*) err "YSQ_LOCK_TIMEOUT 必须为 0-86400 的整数秒数。"; return 1 ;; esac
+  if [ "${#timeout}" -gt 5 ] || [ "$((10#$timeout))" -gt 86400 ]; then
+    err "YSQ_LOCK_TIMEOUT 必须为 0-86400 的整数秒数。"
     return 1
   fi
-  export YSQ_CONFIG_LOCK_FD=9
-  export YSQ_CONFIG_LOCK_PATH="$CONFIG_LOCK_FILE"
+  max_ticks=$((10#$timeout * 5))
+  ensure_config_lock_tool || return 1
+  if [ "$inherited" = 9 ] && [ "${YSQ_CONFIG_LOCK_PATH:-}" = "$CONFIG_LOCK_FILE" ] \
+      && ( : >&9 ) 2>/dev/null; then
+    inherited_fd=true
+  fi
+  if [ "$inherited_fd" != true ]; then
+    mkdir -p "$(dirname "$CONFIG_LOCK_FILE")" || { err "无法创建配置锁目录。"; return 1; }
+    if ! exec 9>>"$CONFIG_LOCK_FILE"; then err "无法打开配置锁文件。"; return 1; fi
+    if ! chmod 600 "$CONFIG_LOCK_FILE"; then exec 9>&-; err "无法设置配置锁权限。"; return 1; fi
+  fi
+  while true; do
+    if message="$(LC_ALL=C flock -n 9 2>&1)"; then
+      export YSQ_CONFIG_LOCK_FD=9
+      export YSQ_CONFIG_LOCK_PATH="$CONFIG_LOCK_FILE"
+      return 0
+    else
+      rc=$?
+    fi
+    # Both BusyBox and util-linux return silent status 1 for contention.
+    # Usage/FD/command failures are actionable tool errors, never "busy".
+    if [ "$rc" -ne 1 ] || [ -n "$message" ]; then
+      exec 9>&-
+      err "配置锁工具执行失败（退出码 ${rc}）：${message:0:240}"
+      return 1
+    fi
+    if [ "$ticks" -ge "$max_ticks" ]; then
+      exec 9>&-
+      err "另一项面板操作正在修改配置，等待 ${timeout} 秒仍未释放，请稍后重试。"
+      return 1
+    fi
+    sleep 0.2 || { exec 9>&-; err "等待配置锁失败。"; return 1; }
+    ticks=$((ticks + 1))
+  done
 }
 
 agent_binding_present() {
@@ -6822,6 +6862,15 @@ restore_agent_if_configured() {
   agent_service_start || warn "Agent 启动失败，请在「中控连接管理」中检查状态。"
 }
 
+valid_agent_join_code() {
+  # musl limits ERE repetitions to 255; {32,256} is an invalid expression.
+  # Keep the protocol's full 256-character allowance using separate checks.
+  local value="${1:-}" LC_ALL=C
+  [ "${#value}" -ge 32 ] && [ "${#value}" -le 256 ] || return 1
+  case "$value" in *[!A-Za-z0-9_-]*) return 1 ;; esac
+  return 0
+}
+
 agent_join_wizard() {
   need_state
   if agent_binding_present; then
@@ -6848,7 +6897,7 @@ agent_join_wizard() {
   url="$(trim "$url")"
   code="$(trim "$code")"
   case "$url" in https://*) ;; *) err "中控地址必须使用 HTTPS。"; return 1 ;; esac
-  if [[ ! "$code" =~ ^[A-Za-z0-9_-]{32,256}$ ]]; then
+  if ! valid_agent_join_code "$code"; then
     err "接入码格式不正确，请重新从中控网页复制完整连接信息。"
     return 1
   fi
