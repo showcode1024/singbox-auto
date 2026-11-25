@@ -8,6 +8,7 @@ set -euo pipefail
 # 支持：
 #   - VLESS Reality 直出 / 中转
 #   - TUIC v5 直出 / 中转
+#   - 落地协议支持 VLESS Reality / TUIC v5 / SOCKS5 / Shadowsocks (含 SS-2022)
 #   - TCP / UDP 端口支持复用（同端口可分别运行 VLESS 和 TUIC）
 #   - 独立落地节点池（查看 / 添加 / 修改 IP 端口 / 删除，显示为“国家：ip”）
 #   - 命令行安装参数（vless=端口 tuic=端口 -y）：无参数只装 sing-box 不建节点；-y 静默使用预设密钥
@@ -24,10 +25,16 @@ set -euo pipefail
 #   - 所有修改先写临时文件；配置通过 sing-box check 后才替换（低内存机器上 check 被杀时改用 jq 校验 JSON，由启动服务验证）；失败自动回滚 state
 #   - 面板里每个操作都在子 shell 中运行，die 只会中止当前操作，不会退出面板
 #   - 节点管理与落地管理解耦：落地的增删改只在「落地节点池管理」里做，节点只能选择已有落地
-#   - Alpine(OpenRC)：日志写入单个文件，busybox cron 每小时检查，达 9MB 裁剪、保留最后 2MB
+#   - 日志容量守护：Agent 运行时由 Agent 持锁裁剪；systemd timer (30s) / OpenRC cron (每分钟) 在 Agent 未运行时持同一共享锁兜底裁剪，达 9MB 裁剪、保留最后 2MB
 # ============================================================
 
-YSQ_VERSION="2026.10.24.6"
+# 确保在 CentOS/Rocky/AlmaLinux sudo secure_path 下也能找到 /usr/local/bin 内的 sing-box / ysq
+case ":${PATH:-}:" in
+  *:/usr/local/bin:*) ;;
+  *) export PATH="/usr/local/bin:${PATH:-/usr/sbin:/usr/bin:/sbin:/bin}" ;;
+esac
+
+YSQ_VERSION="2026.11.25.1"
 INSTALLER_NAME="install-singbox-ysq.sh"
 DEFAULT_SCRIPT_URL="https://raw.githubusercontent.com/showcode1024/singbox-auto/main/install-singbox-ysq.sh"
 
@@ -82,10 +89,12 @@ CERT_FILE="${YSQ_TEST_ROOT}/etc/sing-box/cert/tuic.crt"
 KEY_FILE="${YSQ_TEST_ROOT}/etc/sing-box/cert/tuic.key"
 CERT_SNI_FILE="${YSQ_TEST_ROOT}/etc/sing-box/cert/tuic.sni"
 LOG_FILE="${YSQ_TEST_ROOT}/var/log/sing-box/sing-box.log"
-# 统一 info 文件日志：Agent 连续读取；systemd timer / OpenRC cron 提供容量检查兜底
-LOG_TRIM_MAX_MB=9      # 日志文件达到 9MB 时触发裁剪
-LOG_TRIM_KEEP_MB=2     # 裁剪后保留最后 2MB
+# 单机模式默认 warn 减少无意义落盘；接入中控时自动切换 info 供 Agent 连续读取，定时裁剪与硬上限兜底防爆盘
+LOG_TRIM_MAX_MB=9       # 日志文件达到 9MB 时触发常规裁剪
+LOG_TRIM_HARD_MAX_MB=18 # Agent 进程存活但未激活/异常时达 18MB 强制持锁裁剪兜底
+LOG_TRIM_KEEP_MB=2      # 裁剪后保留最后 2MB
 LOG_TRIM_SCRIPT="${YSQ_TEST_ROOT}/usr/local/libexec/ysq-singbox-log-trim"
+LOG_TRIM_PID_FILE="${YSQ_TEST_ROOT}/run/ysq-log-trim.pid"
 INFO_FILE="${YSQ_TEST_ROOT}/root/singbox-node-info.txt"
 YAML_FILE="${YSQ_TEST_ROOT}/root/singbox-nodes.yaml"
 PANEL_FILE="${YSQ_TEST_ROOT}/usr/local/bin/ysq"
@@ -99,6 +108,7 @@ AGENT_SYSTEMD_FILE="${YSQ_TEST_ROOT}/etc/systemd/system/ysq-agent.service"
 AGENT_OPENRC_FILE="${YSQ_TEST_ROOT}/etc/init.d/ysq-agent"
 AGENT_PID_FILE="${YSQ_TEST_ROOT}/run/ysq-agent.pid"
 CONFIG_LOCK_FILE="${YSQ_TEST_ROOT}/run/ysq-config.lock"
+LOG_LOCK_FILE="${YSQ_TEST_ROOT}/run/ysq-log.lock"
 CORE_DATA_DIR="${YSQ_TEST_ROOT}/var/lib/sing-box"
 CORE_LOG_DIR="${YSQ_TEST_ROOT}/var/log/sing-box"
 CORE_PID_FILE="${YSQ_TEST_ROOT}/run/sing-box.pid"
@@ -170,13 +180,19 @@ WORK_DIR="${YSQ_TEST_ROOT}/var/tmp/ysq-work.${WORK_TAG}"
 # 安装流程里为“覆盖状态文件前”留的备份；安装成功会删除它，退出时它还在就说明安装中途失败，
 # 此时把状态恢复到安装前，并且不留下 .prev 残留
 INSTALL_PREV_FILE=""
+INSTALL_PREV_CONFIG=""
 
 cleanup_tmp() {
   if [ -n "$INSTALL_PREV_FILE" ] && [ -f "$INSTALL_PREV_FILE" ]; then
     mv -f "$INSTALL_PREV_FILE" "$STATE_FILE" 2>/dev/null || true
   fi
+  if [ -n "$INSTALL_PREV_CONFIG" ] && [ -f "$INSTALL_PREV_CONFIG" ]; then
+    mv -f "$INSTALL_PREV_CONFIG" "$CONFIG_FILE" 2>/dev/null || true
+  fi
   rm -rf "$WORK_DIR" 2>/dev/null || true
-  rm -f "${STATE_FILE}.tmp.${WORK_TAG}."* "${CONFIG_FILE}.tmp.${WORK_TAG}."* 2>/dev/null || true
+  rm -f "${STATE_FILE}.tmp.${WORK_TAG}."* "${CONFIG_FILE}.tmp.${WORK_TAG}."* \
+        "${INSTALLER_FILE}.new.${WORK_TAG}" "${AGENT_FILE}.new.${WORK_TAG}" \
+        "${CORE_BIN_FILE}.new.${WORK_TAG}" 2>/dev/null || true
 }
 trap cleanup_tmp EXIT
 trap 'exit 130' INT
@@ -244,17 +260,6 @@ done
 
 ACTION="${ACTION:-install}"
 
-# 显式写了 vless= / tuic= 但值为空
-for arg in "$@"; do
-  case "$arg" in
-    vless=|tuic=)
-      err "参数 ${arg} 的值不能为空。"
-      usage >&2
-      exit 1
-      ;;
-  esac
-done
-
 if [ "$ACTION" != "install" ] && { [ -n "$CLI_VLESS" ] || [ -n "$CLI_TUIC" ] || [ -n "$CLI_YES" ]; }; then
   err "vless= / tuic= / -y 只能用于安装模式。"
   usage >&2
@@ -321,11 +326,11 @@ pkg_update() {
   case "$PKG_MANAGER" in
     apt)
       export DEBIAN_FRONTEND=noninteractive
-      apt update
+      apt update 9>&-
       ;;
-    dnf) dnf makecache -y || true ;;
-    yum) yum makecache -y || true ;;
-    apk) apk update ;;
+    dnf) dnf makecache -y 9>&- || true ;;
+    yum) yum makecache -y 9>&- || true ;;
+    apk) apk update 9>&- ;;
   esac
 }
 
@@ -337,10 +342,10 @@ pkg_install() {
 
   for pkg in "$@"; do
     case "$PKG_MANAGER" in
-      apt) apt install -y "$pkg" ;;
-      dnf) dnf install -y "$pkg" ;;
-      yum) yum install -y "$pkg" ;;
-      apk) apk add --no-cache "$pkg" ;;
+      apt) apt install -y "$pkg" 9>&- ;;
+      dnf) dnf install -y "$pkg" 9>&- ;;
+      yum) yum install -y "$pkg" 9>&- ;;
+      apk) apk add --no-cache "$pkg" 9>&- ;;
     esac || return 1
   done
 }
@@ -382,24 +387,65 @@ normalize_arch() {
   esac
 }
 
+singbox_bin_path() {
+  if [ -x "$CORE_BIN_FILE" ]; then
+    printf '%s\n' "$CORE_BIN_FILE"
+    return 0
+  fi
+  command -v sing-box 2>/dev/null || true
+}
+
+version_ge() {
+  local a="$1" b="$2"
+  local -a va=() vb=()
+  local i max x y
+  IFS=. read -r -a va <<< "${a%%-*}"
+  IFS=. read -r -a vb <<< "${b%%-*}"
+  max="${#va[@]}"
+  [ "${#vb[@]}" -gt "$max" ] && max="${#vb[@]}"
+  for ((i = 0; i < max; i++)); do
+    x="${va[$i]:-0}"
+    y="${vb[$i]:-0}"
+    [[ "$x" =~ ^[0-9]+$ ]] && [[ "$y" =~ ^[0-9]+$ ]] || return 1
+    if [ "$((10#$x))" -gt "$((10#$y))" ]; then return 0; fi
+    if [ "$((10#$x))" -lt "$((10#$y))" ]; then return 1; fi
+  done
+  return 0
+}
+
 singbox_bin_works() {
-  local bin
-  bin="${1:-$(command -v sing-box 2>/dev/null || true)}"
+  local bin out ver tags
+  bin="${1:-$(singbox_bin_path)}"
   [ -n "$bin" ] || return 1
   [ -x "$bin" ] || return 1
-  "$bin" version >/dev/null 2>&1
+  out="$("$bin" version 2>/dev/null)" || return 1
+  # 隔离测试或显式跳过标签检查时仅验证可执行
+  [ -z "$YSQ_TEST_ROOT" ] || return 0
+  ver="$(printf '%s\n' "$out" | awk 'NR==1 {print $3}')"
+  ver="${ver#v}"
+  tags="$(printf '%s\n' "$out" | awk -F'Tags:[[:space:]]*' '/^Tags:/ {print $2; exit}')"
+  if ! version_ge "$ver" "1.14.0"; then
+    return 1
+  fi
+  for req in with_quic with_utls with_clash_api with_v2ray_api; do
+    case ",${tags}," in
+      *",${req},"*) ;;
+      *) return 1 ;;
+    esac
+  done
+  return 0
 }
 
 remove_broken_singbox_bins() {
   local bin
   bin="$(command -v sing-box 2>/dev/null || true)"
-  if [ -n "$bin" ] && ! singbox_bin_works "$bin"; then
+  if [ -n "$bin" ] && [ -x "$bin" ] && ! "$bin" version >/dev/null 2>&1; then
     warn "检测到 sing-box 可执行文件存在但无法运行：$bin"
     rm -f "$bin"
   fi
 
-  bin=${CORE_BIN_FILE}
-  if [ -e "$bin" ] && ! singbox_bin_works "$bin"; then
+  bin="$CORE_BIN_FILE"
+  if [ -e "$bin" ] && ! "$bin" version >/dev/null 2>&1; then
     warn "删除无法运行的 sing-box：$bin"
     rm -f "$bin"
   fi
@@ -449,22 +495,30 @@ install_singbox_release() {
   sums_file="${tmp_dir}/SHA256SUMS"
 
   info "正在下载自编译 sing-box ${version} / ${arch}"
-  curl -fL --connect-timeout 10 --retry 3 -o "$tar_file" "${base}/${tar_name}" \
+  curl -fL --connect-timeout 10 --max-time 300 --speed-time 30 --speed-limit 1024 --retry 3 -o "$tar_file" "${base}/${tar_name}" \
     || die "sing-box 下载失败：${base}/${tar_name}"
 
-  # SHA256 校验（Release 里有 SHA256SUMS 才校验；下载不到只警告）
-  if curl -fsSL --connect-timeout 10 --retry 2 -o "$sums_file" "${base}/SHA256SUMS" 2>/dev/null; then
+  # 默认 fail-closed 严格校验 SHA256（仅显式设置 YSQ_ALLOW_UNVERIFIED=1 时放行）
+  if curl -fsSL --connect-timeout 10 --max-time 30 --retry 2 -o "$sums_file" "${base}/SHA256SUMS" 2>/dev/null; then
     expect="$(awk -v f="$tar_name" '{n=$2; sub(/^\.\//,"",n); sub(/^\*/,"",n); if (n==f) print $1}' "$sums_file" | head -n 1)"
     actual="$(sha256sum "$tar_file" | awk '{print $1}')"
-    if [ -z "$expect" ]; then
-      warn "SHA256SUMS 中没有 ${tar_name}，跳过校验。"
-    elif [ "$expect" != "$actual" ]; then
+    if ! [[ "$expect" =~ ^[0-9a-fA-F]{64}$ ]]; then
+      if [ "${YSQ_ALLOW_UNVERIFIED:-0}" = "1" ]; then
+        warn "SHA256SUMS 中缺少 ${tar_name} 的有效哈希，因 YSQ_ALLOW_UNVERIFIED=1 跳过校验。"
+      else
+        die "SHA256SUMS 中缺少 ${tar_name} 的有效 SHA256 哈希，已拒绝安装（可设置 YSQ_ALLOW_UNVERIFIED=1 强制跳过）。"
+      fi
+    elif [ "${expect,,}" != "${actual,,}" ]; then
       die "sing-box 压缩包 SHA256 校验失败（期望 ${expect}，实际 ${actual}）。"
     else
       ok "SHA256 校验通过。"
     fi
   else
-    warn "未能下载 SHA256SUMS，跳过完整性校验。"
+    if [ "${YSQ_ALLOW_UNVERIFIED:-0}" = "1" ]; then
+      warn "未能下载 SHA256SUMS，因 YSQ_ALLOW_UNVERIFIED=1 跳过完整性校验。"
+    else
+      die "未能下载 SHA256SUMS，已拒绝安装（可设置 YSQ_ALLOW_UNVERIFIED=1 强制跳过）。"
+    fi
   fi
 
   tar -xzf "$tar_file" -C "$tmp_dir" || die "sing-box 解压失败。"
@@ -472,7 +526,9 @@ install_singbox_release() {
   found_bin="$(find "$tmp_dir" -type f -name sing-box | head -n 1)"
   [ -n "$found_bin" ] || die "下载包里未找到 sing-box 可执行文件。"
 
-  install -m 755 "$found_bin" ${CORE_BIN_FILE}
+  mkdir -p "$(dirname "$CORE_BIN_FILE")"
+  install -m 755 "$found_bin" "${CORE_BIN_FILE}.new.${WORK_TAG}" || die "安装 sing-box 临时文件失败。"
+  mv -f "${CORE_BIN_FILE}.new.${WORK_TAG}" "$CORE_BIN_FILE" || die "替换 sing-box 可执行文件失败。"
   rm -rf "$tmp_dir"
   hash -r 2>/dev/null || true
 }
@@ -487,38 +543,122 @@ install_if_changed() {
 }
 
 # 生成日志裁剪脚本：文件 >= MAX 字节时只保留最后 KEEP 字节
+# 与 ysq-agent 共享同一把 flock 锁；Agent 正常运行时优先由 Agent 在 9MB 处读取后裁剪，
+# 但若 Agent 卡在注册/异常导致日志涨到 HARD_MAX (18MB)，定时脚本仍持同一把锁强制裁剪防写满磁盘。
 write_log_trim_script() {
   local dest="$1"
   local max_bytes=$((LOG_TRIM_MAX_MB * 1024 * 1024))
+  local hard_max_bytes=$((LOG_TRIM_HARD_MAX_MB * 1024 * 1024))
   local keep_bytes=$((LOG_TRIM_KEEP_MB * 1024 * 1024))
 
   cat > "$dest" <<'TRIM'
 #!/bin/sh
-# ysq: sing-box 日志裁剪。由 install-singbox-ysq.sh 生成，重新安装 / 升级时会被覆盖。
-# 日志文件达到 MAX 字节时，只保留最后 KEEP 字节。
+# ysq: sing-box 及辅助日志容量裁剪。由 install-singbox-ysq.sh 生成，重新安装 / 升级时会被覆盖。
 LOG="@LOG@"
+LOCK="@LOCK@"
+FAILOVER_LOG="@FAILOVER_LOG@"
+AGENT_LOG="@AGENT_LOG@"
+AGENT_PID="@AGENT_PID@"
 MAX=@MAX@
+HARD_MAX=@HARD_MAX@
 KEEP=@KEEP@
 
-[ -f "$LOG" ] || exit 0
-size=$(wc -c < "$LOG" 2>/dev/null | tr -d ' ')
-[ "${size:-0}" -ge "$MAX" ] || exit 0
+is_agent_active() {
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet ysq-agent 2>/dev/null; then
+    return 0
+  fi
+  if command -v rc-service >/dev/null 2>&1 && rc-service ysq-agent status >/dev/null 2>&1; then
+    return 0
+  fi
+  if [ -f "$AGENT_PID" ]; then
+    apid=$(tr -d ' \r\n' < "$AGENT_PID" 2>/dev/null)
+    case "$apid" in
+      ''|*[!0-9]*) ;;
+      *) kill -0 "$apid" 2>/dev/null && return 0 ;;
+    esac
+  fi
+  return 1
+}
 
-tmp="${LOG}.trim.$$"
-# 取最后 KEEP 字节；开头那一行大概率被截断，丢掉它
-if tail -c "$KEEP" "$LOG" | sed '1d' > "$tmp"; then
-  # 原地覆盖，不能 mv：sing-box 以追加模式持有这个文件，inode 不能换
-  cat "$tmp" > "$LOG"
+trim_file() {
+  target="$1"
+  limit="$2"
+  [ -f "$target" ] || return 0
+  size=$(wc -c < "$target" 2>/dev/null | tr -d ' ')
+  [ "${size:-0}" -ge "$limit" ] || return 0
+
+  tmp="${target}.trim.$$"
+  # 取最后 KEEP 字节；开头那一行大概率被截断，丢掉它
+  if tail -c "$KEEP" "$target" | sed '1d' > "$tmp"; then
+    new_size=$(wc -c < "$tmp" 2>/dev/null | tr -d ' ')
+    # 原地覆盖不能 mv（sing-box 以追加模式持有 inode）；优先 conv=notrunc + truncate 避免 O_TRUNC 交错写坏行
+    if command -v truncate >/dev/null 2>&1 && dd if="$tmp" of="$target" bs=65536 conv=notrunc 2>/dev/null; then
+      truncate -s "${new_size:-0}" "$target" 2>/dev/null || cat "$tmp" > "$target"
+    else
+      cat "$tmp" > "$target"
+    fi
+  fi
+  rm -f "$tmp"
+}
+
+if [ -f "$LOG" ]; then
+  sb_size=$(wc -c < "$LOG" 2>/dev/null | tr -d ' ')
+  if [ "${sb_size:-0}" -ge "$MAX" ]; then
+    sb_limit="$MAX"
+    if is_agent_active; then
+      sb_limit="$HARD_MAX"
+    fi
+    if [ "${sb_size:-0}" -ge "$sb_limit" ]; then
+      if command -v flock >/dev/null 2>&1; then
+        mkdir -p "$(dirname "$LOCK")" 2>/dev/null || true
+        (
+          exec 8>>"$LOCK" || exit 0
+          flock -n 8 || exit 0
+          trim_file "$LOG" "$sb_limit"
+        )
+      else
+        trim_file "$LOG" "$sb_limit"
+      fi
+    fi
+  fi
 fi
-rm -f "$tmp"
+
+# OpenRC / 后台辅助日志容量兜底（达 9MB 直接裁剪保留最后 2MB）
+trim_file "$FAILOVER_LOG" "$MAX"
+trim_file "$AGENT_LOG" "$MAX"
 TRIM
-  sed -i -e "s|@LOG@|${LOG_FILE}|" -e "s|@MAX@|${max_bytes}|" -e "s|@KEEP@|${keep_bytes}|" "$dest"
+  sed -i \
+    -e "s|@LOG@|${LOG_FILE}|" \
+    -e "s|@LOCK@|${LOG_LOCK_FILE}|" \
+    -e "s|@FAILOVER_LOG@|${CORE_LOG_DIR}/ysq-failover.log|" \
+    -e "s|@AGENT_LOG@|${AGENT_DATA_DIR}/agent.log|" \
+    -e "s|@AGENT_PID@|${AGENT_PID_FILE}|" \
+    -e "s|@MAX@|${max_bytes}|" \
+    -e "s|@HARD_MAX@|${hard_max_bytes}|" \
+    -e "s|@KEEP@|${keep_bytes}|" \
+    "$dest"
   chmod 755 "$dest"
 }
 
-# Agent 每秒读取后检查容量；定时裁剪在 Agent 停止时仍提供兜底。
+stop_log_trim_guard() {
+  if [ -f "$LOG_TRIM_PID_FILE" ]; then
+    local tpid
+    tpid="$(cat "$LOG_TRIM_PID_FILE" 2>/dev/null || true)"
+    case "$tpid" in
+      ''|*[!0-9]*) ;;
+      *)
+        if [ -r "/proc/${tpid}/cmdline" ] && tr '\0' ' ' < "/proc/${tpid}/cmdline" | grep -Fq "$LOG_TRIM_SCRIPT"; then
+          kill "$tpid" 2>/dev/null || true
+        fi
+        ;;
+    esac
+    rm -f "$LOG_TRIM_PID_FILE"
+  fi
+}
+
+# Agent 每秒读取后检查容量；定时裁剪在 Agent 停止或异常堆积时提供兜底。
 install_log_trim() {
-  local wd
+  local wd sd_ver="" log_level_line=""
   wd="$(new_work_dir)"
   mkdir -p "$(dirname "$LOG_TRIM_SCRIPT")"
   write_log_trim_script "$wd/trim"
@@ -526,27 +666,29 @@ install_log_trim() {
   rm -f "${YSQ_TEST_ROOT}/etc/periodic/hourly/ysq-singbox-log-trim"
   case "$SERVICE_MANAGER" in
     systemd)
-      cat > "$wd/trim-service" <<EOF
-[Unit]
-Description=YSQ sing-box log size guard
-[Service]
-Type=oneshot
-ExecStart=${LOG_TRIM_SCRIPT}
-EOF
+      sd_ver="$(systemctl --version 2>/dev/null | awk 'NR==1 {for(i=1;i<=NF;i++) if($i~/^[0-9]+$/){print $i; exit}}' || true)"
+      if [[ "$sd_ver" =~ ^[0-9]+$ ]] && [ "$sd_ver" -ge 235 ]; then
+        log_level_line="LogLevelMax=warning"
+      fi
+      {
+        printf '%s\n' '[Unit]' 'Description=YSQ sing-box log size guard' '[Service]' 'Type=oneshot'
+        [ -z "$log_level_line" ] || printf '%s\n' "$log_level_line"
+        printf '%s\n' "ExecStart=${LOG_TRIM_SCRIPT}"
+      } > "$wd/trim-service"
       cat > "$wd/trim-timer" <<'EOF'
 [Unit]
 Description=YSQ sing-box log size guard timer
 [Timer]
-OnBootSec=30s
-OnUnitActiveSec=30s
-AccuracySec=5s
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=30s
 [Install]
 WantedBy=timers.target
 EOF
       install_if_changed "$wd/trim-service" "${YSQ_TEST_ROOT}/etc/systemd/system/ysq-log-trim.service" 644 || true
       install_if_changed "$wd/trim-timer" "${YSQ_TEST_ROOT}/etc/systemd/system/ysq-log-trim.timer" 644 || true
       service_daemon_reload
-      systemctl enable --now ysq-log-trim.timer >/dev/null 2>&1 || warn "日志容量检查 timer 启动失败，请检查 ysq-log-trim.timer。"
+      systemctl enable --now ysq-log-trim.timer 9>&- >/dev/null 2>&1 || warn "日志容量检查 timer 启动失败，请检查 ysq-log-trim.timer。"
       ;;
     openrc)
       mkdir -p "${CRONTAB_DIR}"
@@ -566,6 +708,7 @@ EOF
 }
 
 remove_log_trim() {
+  stop_log_trim_guard
   if [ "$SERVICE_MANAGER" = "systemd" ]; then
     systemctl disable --now ysq-log-trim.timer >/dev/null 2>&1 || true
   fi
@@ -578,7 +721,7 @@ remove_log_trim() {
 ensure_singbox_service() {
   local wd
 
-  SING_BOX_BIN="$(command -v sing-box 2>/dev/null || true)"
+  SING_BOX_BIN="$(singbox_bin_path)"
   if [ -z "$SING_BOX_BIN" ]; then
     die "未找到 sing-box 可执行文件。"
   fi
@@ -601,12 +744,12 @@ Type=simple
 ExecStart=${SING_BOX_BIN} -D ${CORE_DATA_DIR} -c ${CONFIG_FILE} run
 Restart=on-failure
 RestartSec=10s
-LimitNOFILE=infinity
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
 EOF
-      if install_if_changed "$wd/unit" ${CORE_SYSTEMD_FILE} 644; then
+      if install_if_changed "$wd/unit" "$CORE_SYSTEMD_FILE" 644; then
         service_daemon_reload
       fi
       install_log_trim
@@ -625,8 +768,8 @@ output_log="${LOG_FILE}"
 error_log="${LOG_FILE}"
 
 start_pre() {
-  checkpath -d -m 0755 -o sing-box:sing-box ${CORE_DATA_DIR}
-  checkpath -d -m 0755 -o sing-box:sing-box ${CORE_LOG_DIR}
+  checkpath -d -m 0755 -o sing-box:sing-box "${CORE_DATA_DIR}"
+  checkpath -d -m 0755 -o sing-box:sing-box "${CORE_LOG_DIR}"
 }
 
 depend() {
@@ -634,10 +777,11 @@ depend() {
   after firewall
 }
 EOF
-      install_if_changed "$wd/unit" ${CORE_OPENRC_FILE} 755 || true
+      install_if_changed "$wd/unit" "$CORE_OPENRC_FILE" 755 || true
       install_log_trim
       ;;
     none)
+      install_log_trim
       warn "未检测到 systemd/openrc，将使用 nohup 后台方式管理 sing-box。"
       ;;
   esac
@@ -663,6 +807,15 @@ service_disable() {
   esac
 }
 
+singbox_pid_matches() {
+  local pid="${1:-}"
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ -r "/proc/${pid}/cmdline" ] || return 1
+  local cmd
+  cmd="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null || true)"
+  [[ "$cmd" == *sing-box* && "$cmd" == *"$CONFIG_FILE"* && "$cmd" == *" run"* ]]
+}
+
 service_stop() {
   state_write_guard || return $?
   flush_agent_traffic
@@ -671,24 +824,34 @@ service_stop() {
     return 0
   fi
   case "$SERVICE_MANAGER" in
-    systemd) systemctl stop sing-box 2>/dev/null || true ;;
-    openrc) rc-service sing-box stop 2>/dev/null || true ;;
+    systemd) systemctl stop sing-box 9>&- 2>/dev/null || true ;;
+    openrc) rc-service sing-box stop 9>&- 2>/dev/null || true ;;
     none)
-      if [ -f ${CORE_PID_FILE} ]; then
+      stop_log_trim_guard
+      if [ -f "$CORE_PID_FILE" ]; then
         local old_pid
-        old_pid="$(cat ${CORE_PID_FILE} 2>/dev/null || true)"
-        if [ -n "$old_pid" ]; then
+        old_pid="$(cat "$CORE_PID_FILE" 2>/dev/null || true)"
+        if [ -n "$old_pid" ] && singbox_pid_matches "$old_pid"; then
           kill "$old_pid" 2>/dev/null || true
           # 等旧进程真正退出（最多 15 秒），否则重启时新进程可能和旧进程抢端口
           for _ in $(seq 1 15); do
             kill -0 "$old_pid" 2>/dev/null || break
             sleep 1
           done
-          kill -0 "$old_pid" 2>/dev/null && kill -9 "$old_pid" 2>/dev/null || true
+          if singbox_pid_matches "$old_pid"; then
+            kill -9 "$old_pid" 2>/dev/null || true
+          fi
         fi
-        rm -f ${CORE_PID_FILE}
+        rm -f "$CORE_PID_FILE"
       fi
-      pkill -f "sing-box.*-[cC] /etc/sing-box.*run" 2>/dev/null || true
+      # 精确匹配当前 CONFIG_FILE 的残留 sing-box 进程，不误杀其他路径或编辑器
+      local p_dir p_id
+      for p_dir in /proc/[0-9]*; do
+        p_id="${p_dir#/proc/}"
+        if singbox_pid_matches "$p_id"; then
+          kill "$p_id" 2>/dev/null || true
+        fi
+      done
       ;;
   esac
 }
@@ -738,28 +901,35 @@ service_restart() {
       fi
       ;;
     none)
-      service_stop
-      SING_BOX_BIN="$(command -v sing-box 2>/dev/null || true)"
+      YSQ_SKIP_AGENT_FLUSH=1 service_stop
+      SING_BOX_BIN="$(singbox_bin_path)"
       if [ -z "$SING_BOX_BIN" ]; then
         err "未找到 sing-box 可执行文件。"
         return 1
       fi
-      install -d -m 755 -o sing-box -g sing-box ${CORE_DATA_DIR} ${CORE_LOG_DIR} 2>/dev/null \
-        || mkdir -p ${CORE_DATA_DIR} ${CORE_LOG_DIR}
-      # 没有 cron 可用：每次启动前（进程已停）顺手裁剪一次，并用追加模式写日志
-      local trim_wd
-      trim_wd="$(new_work_dir)"
-      write_log_trim_script "$trim_wd/trim"
-      sh "$trim_wd/trim" || true
-      rm -rf "$trim_wd"
-      nohup "$SING_BOX_BIN" -D ${CORE_DATA_DIR} -c ${CONFIG_FILE} run 9>&- >> "$LOG_FILE" 2>&1 &
-      echo $! > ${CORE_PID_FILE}
+      install -d -m 755 -o sing-box -g sing-box "$CORE_DATA_DIR" "$CORE_LOG_DIR" 2>/dev/null \
+        || mkdir -p "$CORE_DATA_DIR" "$CORE_LOG_DIR"
+      touch "$LOG_FILE"
+      chown sing-box:sing-box "$LOG_FILE" 2>/dev/null || true
+      # 没有 cron 可用：启动前先裁剪一次，并附带轻量周期守护随 sing-box 生命周期运行
+      [ -x "$LOG_TRIM_SCRIPT" ] || install_log_trim
+      sh "$LOG_TRIM_SCRIPT" || true
+      if id sing-box >/dev/null 2>&1 && command -v su >/dev/null 2>&1; then
+        nohup su -s /bin/sh sing-box -c 'exec "$1" -D "$2" -c "$3" run' -- "$SING_BOX_BIN" "$CORE_DATA_DIR" "$CONFIG_FILE" 9>&- >> "$LOG_FILE" 2>&1 &
+      else
+        nohup "$SING_BOX_BIN" -D "$CORE_DATA_DIR" -c "$CONFIG_FILE" run 9>&- >> "$LOG_FILE" 2>&1 &
+      fi
+      local sb_pid=$!
+      echo "$sb_pid" > "$CORE_PID_FILE"
       sleep 0.5
-      if ! kill -0 "$(cat ${CORE_PID_FILE})" 2>/dev/null; then
+      if ! kill -0 "$(cat "$CORE_PID_FILE" 2>/dev/null || true)" 2>/dev/null; then
         tail -n 20 "$LOG_FILE" >&2 || true
         err "sing-box 后台启动失败。"
         return 1
       fi
+      mkdir -p "$(dirname "$LOG_TRIM_PID_FILE")" 2>/dev/null || true
+      nohup sh -c 'while kill -0 "$1" 2>/dev/null; do sleep 120; "$2" >/dev/null 2>&1 || true; done' _ "$sb_pid" "$LOG_TRIM_SCRIPT" 9>&- >/dev/null 2>&1 &
+      echo $! > "$LOG_TRIM_PID_FILE"
       ;;
   esac
   sync_failover_service || warn "主备切换服务启动失败，请查看 ysq-failover 状态；sing-box 仍按当前落地运行。"
@@ -778,8 +948,8 @@ service_status() {
       tail -n 80 "$LOG_FILE" 2>/dev/null || true
       ;;
     none)
-      if [ -f ${CORE_PID_FILE} ] && kill -0 "$(cat ${CORE_PID_FILE})" 2>/dev/null; then
-        ok "sing-box 正在运行，PID: $(cat ${CORE_PID_FILE})"
+      if [ -f "$CORE_PID_FILE" ] && kill -0 "$(cat "$CORE_PID_FILE" 2>/dev/null || true)" 2>/dev/null; then
+        ok "sing-box 正在运行，PID: $(cat "$CORE_PID_FILE")"
       else
         warn "sing-box 未运行。"
       fi
@@ -808,30 +978,36 @@ is_singbox_running() {
   case "$SERVICE_MANAGER" in
     systemd) systemctl is-active --quiet sing-box 2>/dev/null ;;
     openrc)  rc-service sing-box status >/dev/null 2>&1 ;;
-    none)    [ -f ${CORE_PID_FILE} ] && kill -0 "$(cat ${CORE_PID_FILE} 2>/dev/null)" 2>/dev/null ;;
+    none)    [ -f "$CORE_PID_FILE" ] && kill -0 "$(cat "$CORE_PID_FILE" 2>/dev/null || true)" 2>/dev/null ;;
   esac
 }
 
 get_singbox_pid() {
   [ "$SERVICE_MANAGER" != "test" ] || return 0
-  local pid=""
+  local pid="" p_dir p_id
   case "$SERVICE_MANAGER" in
     systemd)
       pid="$(systemctl show -p MainPID --value sing-box 2>/dev/null || true)"
       [ "$pid" = "0" ] && pid=""
       ;;
     openrc|none)
-      if [ -f ${CORE_PID_FILE} ]; then
-        pid="$(cat ${CORE_PID_FILE} 2>/dev/null || true)"
+      if [ -f "$CORE_PID_FILE" ]; then
+        pid="$(cat "$CORE_PID_FILE" 2>/dev/null || true)"
       fi
       ;;
   esac
 
+  if [ -z "$pid" ]; then
+    for p_dir in /proc/[0-9]*; do
+      p_id="${p_dir#/proc/}"
+      if singbox_pid_matches "$p_id"; then
+        pid="$p_id"
+        break
+      fi
+    done
+  fi
   if [ -z "$pid" ] && command -v pidof >/dev/null 2>&1; then
     pid="$(pidof sing-box 2>/dev/null | awk '{print $1}' || true)"
-  fi
-  if [ -z "$pid" ] && command -v pgrep >/dev/null 2>&1; then
-    pid="$(pgrep -f "sing-box.*-[cC] /etc/sing-box.*run" 2>/dev/null | head -n 1 || true)"
   fi
   echo "$pid"
 }
@@ -859,9 +1035,10 @@ get_singbox_memory() {
 }
 
 print_status_bar() {
-  local status_str ver_str mem_str
-  if command -v sing-box >/dev/null 2>&1; then
-    ver_str="$(sing-box version 2>/dev/null | awk 'NR==1 {print $3}' || true)"
+  local status_str ver_str mem_str bin
+  bin="$(singbox_bin_path)"
+  if [ -n "$bin" ]; then
+    ver_str="$("$bin" version 2>/dev/null | awk 'NR==1 {print $3}' || true)"
     ver_str="${ver_str:+v${ver_str#v}}"
     ver_str="${ver_str:-未知}"
   else
@@ -881,31 +1058,44 @@ print_status_bar() {
 
 # 主菜单常驻监听摘要：全部正常时只显示「正常」，异常时列出具体协议和端口。
 print_listen_summary() {
-  local tcp_bound="" udp_bound="" p
-  local tcp_missing="" udp_missing="" issues=""
+  local tcp_raw="" udp_raw="" tcp_bound="" udp_bound="" p
+  local tcp_missing="" udp_missing="" issues="" enabled_users=0
 
   if ! command -v ss >/dev/null 2>&1; then
     echo -e "监听端口: ${C_RED}○ 无法检测（缺少 ss）${C_RESET}"
     return 0
   fi
 
-  tcp_bound="$(ss -H -lnt 2>/dev/null | awk '{s=$4; sub(/^.*:/,"",s); if(s~/^[0-9]+$/) print s}' | sort -u || true)"
-  udp_bound="$(ss -H -lnu 2>/dev/null | awk '{s=$4; sub(/^.*:/,"",s); if(s~/^[0-9]+$/) print s}' | sort -u || true)"
+  tcp_raw="$(ss -H -lntp 2>/dev/null || ss -H -lnt 2>/dev/null || true)"
+  udp_raw="$(ss -H -lnup 2>/dev/null || ss -H -lnu 2>/dev/null || true)"
+  if printf '%s\n' "$tcp_raw" | grep -Fq 'users:(('; then
+    tcp_bound="$(printf '%s\n' "$tcp_raw" | awk '/users:\(\("sing-box"/ {s=$4; sub(/^.*:/,"",s); if(s~/^[0-9]+$/) print s}' | sort -u || true)"
+  else
+    tcp_bound="$(printf '%s\n' "$tcp_raw" | awk '{s=$4; sub(/^.*:/,"",s); if(s~/^[0-9]+$/) print s}' | sort -u || true)"
+  fi
+  if printf '%s\n' "$udp_raw" | grep -Fq 'users:(('; then
+    udp_bound="$(printf '%s\n' "$udp_raw" | awk '/users:\(\("sing-box"/ {s=$4; sub(/^.*:/,"",s); if(s~/^[0-9]+$/) print s}' | sort -u || true)"
+  else
+    udp_bound="$(printf '%s\n' "$udp_raw" | awk '{s=$4; sub(/^.*:/,"",s); if(s~/^[0-9]+$/) print s}' | sort -u || true)"
+  fi
 
   if [ -f "$STATE_FILE" ]; then
-    while IFS= read -r p; do
-      [ -n "$p" ] || continue
-      if ! printf '%s\n' "$tcp_bound" | grep -Fxq "$p"; then
-        tcp_missing="${tcp_missing:+${tcp_missing},}${p}"
-      fi
-    done < <(jq -r '.nodes[]? | select((.protocol // "tcp") == "tcp") | .port' "$STATE_FILE" | sort -nu)
+    enabled_users="$(jq -r '[.users[]? | select(.enabled != false)] | length' "$STATE_FILE" 2>/dev/null || echo 0)"
+    if [ "${enabled_users:-0}" -gt 0 ]; then
+      while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        if ! printf '%s\n' "$tcp_bound" | grep -Fxq "$p"; then
+          tcp_missing="${tcp_missing:+${tcp_missing},}${p}"
+        fi
+      done < <(jq -r '.nodes[]? | select((.protocol // (if (.type // "") | startswith("tuic") then "udp" else "tcp" end)) == "tcp") | .port' "$STATE_FILE" | sort -nu)
 
-    while IFS= read -r p; do
-      [ -n "$p" ] || continue
-      if ! printf '%s\n' "$udp_bound" | grep -Fxq "$p"; then
-        udp_missing="${udp_missing:+${udp_missing},}${p}"
-      fi
-    done < <(jq -r '.nodes[]? | select((.protocol // "tcp") == "udp") | .port' "$STATE_FILE" | sort -nu)
+      while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        if ! printf '%s\n' "$udp_bound" | grep -Fxq "$p"; then
+          udp_missing="${udp_missing:+${udp_missing},}${p}"
+        fi
+      done < <(jq -r '.nodes[]? | select((.protocol // (if (.type // "") | startswith("tuic") then "udp" else "tcp" end)) == "udp") | .port' "$STATE_FILE" | sort -nu)
+    fi
   fi
 
   [ -z "$tcp_missing" ] || issues="TCP ${tcp_missing} 未监听"
@@ -915,7 +1105,11 @@ print_listen_summary() {
   fi
 
   if [ -z "$issues" ]; then
-    echo -e "监听端口: ${C_GREEN}● 正常${C_RESET}"
+    if [ -f "$STATE_FILE" ] && [ "${enabled_users:-0}" -eq 0 ]; then
+      echo -e "监听端口: ${C_GREEN}● 正常${C_RESET}（当前无启用用户）"
+    else
+      echo -e "监听端口: ${C_GREEN}● 正常${C_RESET}"
+    fi
   else
     echo -e "监听端口: ${C_RED}○ 异常${C_RESET} | ${issues}"
   fi
@@ -967,9 +1161,16 @@ def table($headers; $mins; $rows):
 
 # 节点类型文案、自动命名与去重共用同一份 jq 规则。
 JQ_NODE_LIB='
+def landing_label($t):
+  if $t == "tuic" then {suffix:"tuic5", display:"TUIC v5"}
+  elif $t == "socks" then {suffix:"socks5", display:"SOCKS5"}
+  elif $t == "shadowsocks" then {suffix:"ss", display:"Shadowsocks"}
+  else {suffix:"vless", display:"VLESS"} end;
+
 def node_labels($type; $out; $landing_type):
-  (if $landing_type == "tuic" then "tuic5" else "vless" end) as $target |
-  (if $landing_type == "tuic" then "TUIC v5" else "VLESS" end) as $target_display |
+  landing_label($landing_type) as $ll |
+  $ll.suffix as $target |
+  $ll.display as $target_display |
   if ($type | startswith("vless")) then
     if $out == "landing" then {suffix:("vless转"+$target), display:("VLESS -> "+$target_display+" 中转")}
     else {suffix:"vless", display:"VLESS 直出"} end
@@ -1179,6 +1380,9 @@ check_port_available() {
 
   if [ "$proto" = "tcp" ] && [ "$port" = "$V2RAY_API_PORT" ]; then
     die "TCP 端口 ${V2RAY_API_PORT} 已预留给本机 V2Ray API，请换一个 VLESS 端口。"
+  fi
+  if [ "$proto" = "tcp" ] && [ "$port" = "$FAILOVER_API_PORT" ]; then
+    die "TCP 端口 ${FAILOVER_API_PORT} 已预留给本机主备切换 API，请换一个 VLESS 端口。"
   fi
 
   if port_used "$port" "$proto" "$ignore_tag"; then
@@ -1413,17 +1617,51 @@ is_ipv6() {
   [ "${#ip}" -ge 2 ] && [ "${#ip}" -le 45 ] || return 1
   [[ "$ip" =~ ^[0-9a-fA-F:.]+$ ]] || return 1
   [[ "$ip" == *:*:* ]] || return 1
-  return 0
+  [[ "$ip" != *:::* ]] || return 1
+  local doubled="${ip#*::}"
+  if [ "$doubled" != "$ip" ]; then
+    [[ "$doubled" != *::* ]] || return 1
+    # 拒绝首尾单个冒号（允许 :: 开头或结尾）
+    if [[ "$ip" == :* && "$ip" != ::* ]]; then return 1; fi
+    if [[ "$ip" == *: && "$ip" != *:: ]]; then return 1; fi
+  else
+    [[ "$ip" != :* && "$ip" != *: ]] || return 1
+  fi
+  local -a parts=()
+  local p i count=0 total
+  IFS=: read -r -a parts <<< "$ip"
+  total="${#parts[@]}"
+  for ((i = 0; i < total; i++)); do
+    p="${parts[$i]}"
+    [ -z "$p" ] && continue
+    if [[ "$p" == *.* ]]; then
+      [ "$i" -eq "$((total - 1))" ] || return 1
+      is_ipv4 "$p" || return 1
+      count=$((count + 2))
+    elif [[ "$p" =~ ^[0-9a-fA-F]{1,4}$ ]]; then
+      count=$((count + 1))
+    else
+      return 1
+    fi
+  done
+  if [ "$doubled" != "$ip" ]; then
+    [ "$count" -lt 8 ]
+  else
+    [ "$count" -eq 8 ]
+  fi
 }
 
 is_private_ipv4() {
-  local a b
-  IFS=. read -r a b _ _ <<<"$1"
+  local a b c
+  IFS=. read -r a b c _ <<<"$1"
   a=$((10#$a))
   b=$((10#$b))
-  [ "$a" -eq 0 ] || [ "$a" -eq 10 ] || [ "$a" -eq 127 ] \
+  c=$((10#${c:-0}))
+  [ "$a" -eq 0 ] || [ "$a" -eq 10 ] || [ "$a" -eq 127 ] || [ "$a" -ge 224 ] \
     || { [ "$a" -eq 172 ] && [ "$b" -ge 16 ] && [ "$b" -le 31 ]; } \
     || { [ "$a" -eq 192 ] && [ "$b" -eq 168 ]; } \
+    || { [ "$a" -eq 192 ] && [ "$b" -eq 0 ] && { [ "$c" -eq 0 ] || [ "$c" -eq 2 ]; }; } \
+    || { [ "$a" -eq 198 ] && { [ "$b" -eq 18 ] || [ "$b" -eq 19 ]; }; } \
     || { [ "$a" -eq 169 ] && [ "$b" -eq 254 ]; } \
     || { [ "$a" -eq 100 ] && [ "$b" -ge 64 ] && [ "$b" -le 127 ]; }
 }
@@ -1502,10 +1740,16 @@ valid_cc() {
 # 命中返回 0 并输出大写国家码，全部失败返回 1。
 geo_query() {
   local url="$1" filter="${2:-}" fam body code
-  local -a fams=("" "-6" "-4")
+  local -a fams=("")
+  if command -v ip >/dev/null 2>&1; then
+    [ -n "$(ip -6 route show default 2>/dev/null || true)" ] && fams+=("-6")
+    [ -n "$(ip -4 route show default 2>/dev/null || true)" ] && fams+=("-4")
+  else
+    fams+=("-6" "-4")
+  fi
 
   for fam in "${fams[@]}"; do
-    body="$(curl ${fam:+"$fam"} -fsS --max-time 6 "$url" 2>/dev/null || true)"
+    body="$(curl ${fam:+"$fam"} -fsS --connect-timeout 3 --max-time 5 "$url" 2>/dev/null || true)"
     [ -n "$body" ] || continue
 
     if [ -n "$filter" ]; then
@@ -1667,24 +1911,28 @@ install_deps() {
 
 # $1 = force：即使已安装可用的 sing-box 也重新下载安装（更新内核时用）
 install_singbox() {
-  local force="${1:-}"
+  local force="${1:-}" bin
 
   step "安装 / 检查 sing-box"
 
   ensure_singbox_user
   # 安装、面板升级和内核更新共用运行目录准备；配置目录由安装 / 面板升级另行准备。
-  mkdir -p ${CORE_DATA_DIR} ${CORE_LOG_DIR}
-  chown -R sing-box:sing-box ${CORE_DATA_DIR} ${CORE_LOG_DIR} 2>/dev/null || true
-  chmod 755 ${CORE_DATA_DIR} ${CORE_LOG_DIR}
+  mkdir -p "$CORE_DATA_DIR" "$CORE_LOG_DIR"
+  chown -R sing-box:sing-box "$CORE_DATA_DIR" "$CORE_LOG_DIR" 2>/dev/null || true
+  chmod 755 "$CORE_DATA_DIR" "$CORE_LOG_DIR"
   remove_broken_singbox_bins
 
-  if [ "$force" != "force" ] && singbox_bin_works; then
-    ok "检测到 sing-box 已安装：$(sing-box version | head -n 1)"
+  bin="$(singbox_bin_path)"
+  if [ "$force" != "force" ] && [ -n "$bin" ] && singbox_bin_works "$bin"; then
+    ok "检测到 sing-box 已安装：$("$bin" version | head -n 1)"
   else
+    if [ "$force" != "force" ] && [ -n "$bin" ] && [ -x "$bin" ]; then
+      warn "检测到现有 sing-box 版本低于 1.14.0 或缺少必需编译标签（with_quic/with_utls/with_clash_api/with_v2ray_api），将升级为自编译版。"
+    fi
     info "正在安装 sing-box..."
     install_singbox_release
-    singbox_bin_works || die "当前系统无法执行 sing-box，请检查 CPU 架构。"
-    ok "sing-box 安装完成：$(sing-box version | head -n 1)"
+    singbox_bin_works "$CORE_BIN_FILE" || die "当前系统无法执行 sing-box 或版本/编译标签不满足要求，请检查 CPU 架构。"
+    ok "sing-box 安装完成：$("$CORE_BIN_FILE" version | head -n 1)"
   fi
 
   ensure_singbox_service
@@ -1864,29 +2112,30 @@ ensure_state_defaults() {
     .state_schema = 2 |
     # 根字段永久保留旧安装身份，供旧落地池兜底使用；增删改用户不覆盖根密钥。
     # 实际入站用户全部从 .users[] 读取，二者相互独立。
-    .landings |= map(
-      .type = (.type // "vless") |
-      if ((.id // "") | tostring | length) > 0 then .
-      else .id = ("landing_" + ((.server | tostring) | gsub("[^a-zA-Z0-9]"; "_")) + "_" + ((.port // 0) | tostring))
-      end
-    ) |
     .nodes |= map(
       (if has("protocol") then . else .protocol = (if .type | startswith("tuic") then "udp" else "tcp" end) end) |
       (if has("outbound_type") then . else .outbound_type = (if .type | endswith("-relay") then "landing" else "direct" end) end)
     ) |
-    # 旧版本：落地信息被拷贝进每个节点 -> 补进落地池
+    # 旧版本：落地信息被拷贝进每个节点 -> 先迁入落地池，再统一规范化 .landings
     reduce (.nodes[] | select(.outbound_type == "landing" and has("landing_server"))) as $n (.;
       if lid($n; .landings) != null then .
       else .landings += [{
-        "id": ("landing_" + (($n.landing_server | tostring) | gsub("[^a-zA-Z0-9]"; "_")) + "_" + (($n.landing_port // 0) | tostring)),
+        "id": ("landing_" + (($n.landing_server | tostring) | gsub("[^a-zA-Z0-9]"; "_")) + "_" + (($n.landing_port // 443) | tostring)),
+        "type": "vless",
         "server": $n.landing_server,
-        "port": ($n.landing_port | tonumber),
+        "port": (($n.landing_port // 443) | tonumber),
         "uuid": ($n.landing_uuid // .uuid),
         "public_key": ($n.landing_public_key // .public_key),
         "short_id": ($n.landing_short_id // .short_id),
         "sni": ($n.landing_sni // .reality_sni),
         "display": ($n.landing_display // $n.landing_server)
       }]
+      end
+    ) |
+    .landings |= map(
+      .type = (.type // "vless") |
+      if ((.id // "") | tostring | length) > 0 then .
+      else .id = ("landing_" + ((.server | tostring) | gsub("[^a-zA-Z0-9]"; "_")) + "_" + ((.port // 0) | tostring))
       end
     ) |
     .landings as $ls |
@@ -1979,10 +2228,18 @@ EOF
     return 1
   fi
 
+  local key_bak=""
+  if [ -f "$KEY_FILE" ]; then
+    cp -p "$KEY_FILE" "$wd/tuic.key.bak" && key_bak="$wd/tuic.key.bak"
+  fi
   install -m 600 -o sing-box -g sing-box "$wd/tuic.key" "$KEY_FILE" || { rm -rf "$wd"; return 1; }
-  install -m 644 -o sing-box -g sing-box "$wd/tuic.crt" "$CERT_FILE" || { rm -rf "$wd"; return 1; }
-  printf '%s' "$tuic_sni" > "$CERT_SNI_FILE"
-  chown sing-box:sing-box "$CERT_SNI_FILE" 2>/dev/null || true
+  if ! install -m 644 -o sing-box -g sing-box "$wd/tuic.crt" "$CERT_FILE"; then
+    [ -z "$key_bak" ] || install -m 600 -o sing-box -g sing-box "$key_bak" "$KEY_FILE" 2>/dev/null || true
+    rm -rf "$wd"
+    return 1
+  fi
+  printf '%s' "$tuic_sni" > "$wd/tuic.sni"
+  install -m 644 -o sing-box -g sing-box "$wd/tuic.sni" "$CERT_SNI_FILE" || { rm -rf "$wd"; return 1; }
   rm -rf "$wd"
 
   ok "TUIC 证书生成完成：$CERT_FILE"
@@ -2137,6 +2394,18 @@ import sys
 import urllib.parse
 import uuid
 
+SS_METHODS = {
+    "2022-blake3-aes-128-gcm": 16,
+    "2022-blake3-aes-256-gcm": 32,
+    "2022-blake3-chacha20-poly1305": 32,
+    "aes-128-gcm": None,
+    "aes-192-gcm": None,
+    "aes-256-gcm": None,
+    "chacha20-ietf-poly1305": None,
+    "xchacha20-ietf-poly1305": None,
+    "none": None,
+}
+
 
 def text(value, field, limit=4096, empty=False):
     if not isinstance(value, str) or len(value) > limit or (not empty and not value) or any(ord(c) < 32 or ord(c) == 127 for c in value):
@@ -2164,22 +2433,84 @@ def boolean(value, field):
     raise ValueError(field + " 必须为 0/1 或 true/false")
 
 
+def b64_decode_padded(raw):
+    raw = raw.strip()
+    if not raw:
+        raise ValueError("Base64 不能为空")
+    padded = raw + ("=" * (-len(raw) % 4))
+    try:
+        if "-" in raw or "_" in raw:
+            return base64.urlsafe_b64decode(padded.encode("ascii"))
+        return base64.b64decode(padded.encode("ascii"), validate=True)
+    except Exception:
+        raise ValueError("Base64 解码失败") from None
+
+
+def validate_ss2022_password(password, key_len):
+    # SS-2022 支持单密钥或 iPSK（以冒号分隔的多段密钥）
+    parts = password.split(":")
+    if not parts or any(not p for p in parts):
+        raise ValueError("SS-2022 密钥格式无效")
+    for part in parts:
+        try:
+            decoded = base64.b64decode(part.encode("ascii"), validate=True)
+        except Exception:
+            raise ValueError("SS-2022 密钥必须为标准 Base64") from None
+        if len(decoded) != key_len:
+            raise ValueError("SS-2022 密钥长度与加密方式不匹配")
+
+
 def normalize_landing(value):
     if not isinstance(value, dict):
         raise ValueError("落地配置必须为 JSON 对象")
     kind = value.get("type", "vless")
-    if kind not in ("vless", "tuic"):
-        raise ValueError("仅支持 VLESS Reality 和 TUIC v5")
+    if kind == "socks5":
+        kind = "socks"
+    elif kind == "ss":
+        kind = "shadowsocks"
+    if kind not in ("vless", "tuic", "socks", "shadowsocks"):
+        raise ValueError("仅支持 VLESS Reality、TUIC v5、SOCKS5 和 Shadowsocks (含 SS-2022)")
     port = value.get("port")
     if isinstance(port, bool) or not str(port).isdigit() or not 1 <= int(port) <= 65535:
         raise ValueError("端口必须为 1-65535")
+    server = host(value.get("server"))
+    result = {"type": kind, "server": server, "port": int(port)}
+
+    if kind == "socks":
+        version = str(value.get("version", "5"))
+        if version != "5":
+            raise ValueError("仅支持 SOCKS5 落地")
+        username = text(value.get("username", ""), "SOCKS5 用户名", 512, empty=True)
+        password = text(value.get("password", ""), "SOCKS5 密码", 512, empty=True)
+        if password and not username:
+            raise ValueError("填写 SOCKS5 密码时必须填写用户名")
+        result["version"] = "5"
+        if username:
+            result["username"] = username
+        if password:
+            result["password"] = password
+        if boolean(value.get("udp_over_tcp", False), "udp_over_tcp"):
+            result["udp_over_tcp"] = True
+        return result
+
+    if kind == "shadowsocks":
+        method = text(value.get("method"), "Shadowsocks 加密方式", 64).lower()
+        if method not in SS_METHODS:
+            raise ValueError("不支持的 Shadowsocks 加密方式")
+        password = text(value.get("password"), "Shadowsocks 密码", 4096)
+        if SS_METHODS[method] is not None:
+            validate_ss2022_password(password, SS_METHODS[method])
+        result.update(method=method, password=password)
+        if boolean(value.get("udp_over_tcp", False), "udp_over_tcp"):
+            result["udp_over_tcp"] = True
+        return result
+
     try:
         user = str(uuid.UUID(text(value.get("uuid"), "UUID", 36)))
     except (ValueError, AttributeError):
         raise ValueError("UUID 格式无效") from None
-    server = host(value.get("server"))
     sni = host(value.get("sni") or server)
-    result = {"type": kind, "server": server, "port": int(port), "uuid": user, "sni": sni}
+    result.update(uuid=user, sni=sni)
     if kind == "vless":
         key = text(value.get("public_key"), "Reality PublicKey", 43)
         try:
@@ -2193,7 +2524,12 @@ def normalize_landing(value):
         fingerprint = value.get("fingerprint", "chrome")
         if fingerprint not in ("chrome", "firefox", "edge", "safari", "ios", "android", "random", "randomized", "360", "qq"):
             raise ValueError("不支持此 TLS 指纹")
+        flow = value.get("flow", "xtls-rprx-vision")
+        if flow not in ("xtls-rprx-vision", ""):
+            raise ValueError("VLESS flow 仅支持 xtls-rprx-vision 或留空")
         result.update(public_key=key, short_id=short.lower(), fingerprint=fingerprint)
+        if flow != "xtls-rprx-vision":
+            result["flow"] = flow
     else:
         password = text(value.get("password"), "TUIC 密码")
         control = value.get("congestion_control", "bbr")
@@ -2218,18 +2554,107 @@ def normalize_landing(value):
     return result
 
 
+def parse_ss_link(raw):
+    # 支持 SIP002 (ss://base64@host:port 或 ss://method:pass@host:port) 与传统整段 Base64 (ss://base64)
+    body = raw[5:]
+    body, _, _ = body.partition("#")
+    body, _, query = body.partition("?")
+    if "@" not in body:
+        decoded = b64_decode_padded(body).decode("utf-8")
+        if "@" not in decoded:
+            raise ValueError("SS 分享链接格式无效")
+        userinfo_raw, hostport = decoded.rsplit("@", 1)
+        plain_userinfo = True
+    else:
+        userinfo_raw, hostport = body.rsplit("@", 1)
+        plain_userinfo = False
+    hostport = hostport.rstrip("/")
+    parsed_hp = urllib.parse.urlsplit("//" + hostport)
+    server, port = parsed_hp.hostname, parsed_hp.port
+    if not server or port is None or parsed_hp.path not in ("", "/"):
+        raise ValueError("SS 分享链接地址或端口无效")
+    if not plain_userinfo and ":" not in userinfo_raw:
+        decoded_ui = b64_decode_padded(urllib.parse.unquote(userinfo_raw, errors="strict")).decode("utf-8")
+        method, sep, password = decoded_ui.partition(":")
+    elif plain_userinfo:
+        if ":" not in userinfo_raw:
+            raise ValueError("SS 分享链接认证格式无效")
+        method, sep, password = userinfo_raw.partition(":")
+    else:
+        if ":" not in userinfo_raw:
+            raise ValueError("SS 分享链接认证格式无效")
+        m_raw, _, p_raw = userinfo_raw.partition(":")
+        method = urllib.parse.unquote(m_raw, errors="strict")
+        password = urllib.parse.unquote(p_raw, errors="strict")
+        sep = ":"
+    if not sep or not method or not password:
+        raise ValueError("SS 分享链接缺少加密方式或密码")
+    values = urllib.parse.parse_qs(query, keep_blank_values=True, strict_parsing=True) if query else {}
+    if any(len(v) != 1 for v in values.values()):
+        raise ValueError("SS 分享链接含重复参数")
+    if "plugin" in values and values["plugin"][0]:
+        raise ValueError("暂不支持带 SIP003 plugin 的 SS 落地")
+    used = set()
+    uot = False
+    for k in ("uot", "udp_over_tcp", "udp-over-tcp"):
+        if k in values:
+            used.add(k)
+            uot = boolean(values[k][0], "udp_over_tcp")
+    if "plugin" in values:
+        used.add("plugin")
+    if set(values) - used:
+        raise ValueError("SS 分享链接包含不支持的参数")
+    return normalize_landing({"type": "shadowsocks", "server": server, "port": port,
+                              "method": method, "password": password, "udp_over_tcp": uot})
+
+
+def parse_socks_link(link, values):
+    if any(len(v) != 1 for v in values.values()):
+        raise ValueError("SOCKS5 分享链接含重复参数")
+    username = urllib.parse.unquote(link.username or "", errors="strict")
+    password = urllib.parse.unquote(link.password or "", errors="strict")
+    # 兼容 socks://base64(user:pass)@host:port 格式（仅当无 password 且 username 为有效 base64 且解码含冒号）
+    if link.password is None and username and ":" not in username:
+        try:
+            decoded = b64_decode_padded(username).decode("utf-8")
+            if ":" in decoded:
+                u_dec, _, p_dec = decoded.partition(":")
+                if u_dec and all(ord(c) >= 32 and ord(c) != 127 for c in decoded):
+                    username, password = u_dec, p_dec
+        except (ValueError, UnicodeDecodeError):
+            pass
+    used = set()
+    uot = False
+    for k in ("uot", "udp_over_tcp", "udp-over-tcp"):
+        if k in values:
+            used.add(k)
+            uot = boolean(values[k][0], "udp_over_tcp")
+    if set(values) - used:
+        raise ValueError("SOCKS5 分享链接包含不支持的参数")
+    return normalize_landing({"type": "socks", "server": link.hostname, "port": link.port,
+                              "version": "5", "username": username, "password": password,
+                              "udp_over_tcp": uot})
+
+
 def parse_landing_link(raw):
     raw = text(raw, "分享链接", 16384)
-    if re.search(r"%(?![0-9a-fA-F]{2})", raw):
+    if re.search(r"%(?![0-9a-fA-F]{2})", raw.partition("#")[0]):
         raise ValueError("分享链接含无效百分号编码")
+    if raw.lower().startswith("ss://"):
+        return parse_ss_link(raw)
     try:
         link = urllib.parse.urlsplit(raw)
         kind, server, port = link.scheme.lower(), link.hostname, link.port
     except ValueError:
         raise ValueError("分享链接地址或端口无效") from None
+    if kind in ("socks", "socks5"):
+        if not server or port is None or link.path not in ("", "/"):
+            raise ValueError("仅支持带端口的 socks5:// 分享链接")
+        values = urllib.parse.parse_qs(link.query, keep_blank_values=True, strict_parsing=True) if link.query else {}
+        return parse_socks_link(link, values)
     if kind not in ("tuic", "vless") or not server or port is None or link.path not in ("", "/"):
-        raise ValueError("仅支持带端口的 tuic:// 或 vless:// 分享链接")
-    values = urllib.parse.parse_qs(link.query, keep_blank_values=True, strict_parsing=True)
+        raise ValueError("仅支持带端口的 vless://、tuic://、socks5:// 或 ss:// 分享链接")
+    values = urllib.parse.parse_qs(link.query, keep_blank_values=True, strict_parsing=True) if link.query else {}
     if any(len(value) != 1 for value in values.values()):
         raise ValueError("分享链接含重复参数")
     used = set()
@@ -2237,9 +2662,19 @@ def parse_landing_link(raw):
     def option(*names, default=None):
         found = [name for name in names if name in values]
         used.update(found)
-        if len(found) > 1:
+        if len(found) > 1 and len({values[name][0] for name in found}) > 1:
             raise ValueError("分享链接同义参数重复")
         return values[found[0]][0] if found else default
+
+    def bool_option(*names, default=False):
+        found = [name for name in names if name in values]
+        used.update(found)
+        if not found:
+            return default
+        parsed = {boolean(values[name][0], names[0]) for name in found}
+        if len(parsed) > 1:
+            raise ValueError("分享链接同义参数重复")
+        return next(iter(parsed))
 
     def require_option(names, supported, default=None):
         selected = option(*names, default=default)
@@ -2254,26 +2689,37 @@ def parse_landing_link(raw):
             raise ValueError("VLESS 分享链接认证格式无效")
         require_option(("security",), ("reality",))
         require_option(("type", "transport"), ("tcp",), "tcp")
-        require_option(("flow",), ("xtls-rprx-vision",))
+        flow = option("flow", default="")
+        if flow not in ("xtls-rprx-vision", ""):
+            raise ValueError("分享链接的 flow 不受支持")
         require_option(("encryption",), ("none",), "none")
         require_option(("headerType",), ("none", ""), "none")
+        # 兼容 3x-ui / v2rayN / Hiddify 等导出的无害客户端扩展与空传输字段
+        option("spx", "spiderX", "spiderx", default="")
+        ins_raw = option("allow_insecure", "allowInsecure", "insecure", "skip-cert-verify", "skip_cert_verify", default="")
+        if ins_raw != "" and boolean(ins_raw, "insecure"):
+            raise ValueError("VLESS Reality 不支持启用跳过证书校验")
+        for empty_key in ("host", "path", "serviceName", "authority", "seed", "alpn", "pqv"):
+            if option(empty_key, default="") != "":
+                raise ValueError("分享链接的 " + empty_key + " 不受支持")
         result.update(public_key=option("pbk", "publicKey", "public_key"),
                       short_id=option("sid", "shortId", "short_id", default=""),
-                      fingerprint=option("fp", "fingerprint", default="chrome"))
+                      fingerprint=option("fp", "fingerprint", default="chrome"),
+                      flow=flow)
     else:
         result["password"] = urllib.parse.unquote(link.password or "", errors="strict")
         require_option(("version", "v"), ("5",), "5")
         result["congestion_control"] = option("congestion_control", "congestion-controller", "congestion-control", default="bbr")
-        result["insecure"] = option("allow_insecure", "allowInsecure", "insecure", "skip-cert-verify", "skip_cert_verify", default="0")
-        result["alpn"] = option("alpn", default="h3").split(",")
-        if boolean(option("disable_sni", "disable-sni", default="0"), "disable_sni"):
+        result["insecure"] = bool_option("allow_insecure", "allowInsecure", "insecure", "skip-cert-verify", "skip_cert_verify", default=False)
+        alpn_raw = option("alpn", default="h3")
+        result["alpn"] = [a for a in alpn_raw.split(",") if a] or ["h3"]
+        if bool_option("disable_sni", "disable-sni", default=False):
             raise ValueError("不支持 disable_sni=1，请使用 SNI")
-        if boolean(option("zero_rtt_handshake", "zero-rtt-handshake", default="0"), "zero_rtt_handshake"):
+        if bool_option("zero_rtt_handshake", "zero-rtt-handshake", default=False):
             raise ValueError("不支持启用 0-RTT")
-        stream = option("udp_over_stream", "udp-over-stream", default="0")
-        result["udp_over_stream"] = boolean(stream, "udp_over_stream")
+        result["udp_over_stream"] = bool_option("udp_over_stream", "udp-over-stream", default=False)
         mode = option("udp_relay_mode", "udp-relay-mode")
-        if mode is not None:
+        if mode is not None and mode != "":
             result["udp_relay_mode"] = mode
     if set(values) - used:
         raise ValueError("分享链接包含当前不支持的连接参数，请改为手动填写")
@@ -2286,9 +2732,9 @@ def main():
         result = normalize_landing(json.loads(raw)) if "--json" in sys.argv else parse_landing_link(raw.strip())
         print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
         return 0
-    except (ValueError, TypeError, UnicodeError, KeyError):
+    except (ValueError, TypeError, UnicodeError, KeyError) as exc:
         # Never echo the supplied link, credentials or decoded password.
-        print("落地参数无效或含不支持的选项，请检查协议、UUID、密码、TLS 与分享链接参数。", file=sys.stderr)
+        print("落地参数无效或含不支持的选项：" + str(exc)[:120], file=sys.stderr)
         return 1
 
 
@@ -2304,23 +2750,52 @@ parse_landing_uri() {
 
 # 密码不套用本机用户密码字符限制，保留冒号、@、+、空格等原始字符。
 ask_landing_secret() {
-  local prompt="$1" previous="${2:-}" answer=""
+  local prompt="$1" previous="${2:-}" allow_empty="${3:-0}" answer=""
   while true; do
-    IFS= read -rsp "${prompt}${previous:+ [已设置，留空保持]}: " answer || die "无法读取落地认证信息。"
+    if [ "$allow_empty" = "1" ]; then
+      IFS= read -rsp "${prompt}${previous:+ [已设置，留空保持，输入 - 清空]}: " answer || die "无法读取落地认证信息。"
+    else
+      IFS= read -rsp "${prompt}${previous:+ [已设置，留空保持]}: " answer || die "无法读取落地认证信息。"
+    fi
     printf '\n' >&2
+    if [ "$allow_empty" = "1" ] && [ "$answer" = "-" ]; then
+      printf ''
+      return 0
+    fi
     answer="${answer:-$previous}"
-    if [ -n "$answer" ]; then printf '%s' "$answer"; return 0; fi
+    if [ -n "$answer" ] || [ "$allow_empty" = "1" ]; then printf '%s' "$answer"; return 0; fi
     warn "这里不能为空。"
   done
 }
 
 LANDING_CONFIG_JSON=""
 collect_landing_config() {
-  local previous="${1:-}" source old_type type choice server port user password sni pbk sid fp insecure cc mode alpn json address_hint=""
+  local previous="${1:-}" source old_type type choice server port user password sni pbk sid fp insecure cc mode alpn method uot json address_hint=""
+  local prev_server prev_port prev_uuid prev_pass prev_sni prev_pbk prev_sid prev_fp prev_insecure prev_cc prev_mode prev_alpn prev_user prev_method prev_uot
   [ -n "$previous" ] || previous='{}'
-  ensure_agent_python || return 1
-  [ -z "$(printf '%s' "$previous" | jq -r '.server // empty')" ] || address_hint="（留空沿用原地址）"
-  read_line "落地 IP/域名或 tuic://、vless:// 分享链接${address_hint}，0 返回: " source
+  ensure_landing_python || return 1
+  IFS=$'\x1f' read -r prev_server old_type prev_port prev_uuid prev_pass prev_sni prev_pbk prev_sid prev_fp prev_insecure prev_cc prev_mode prev_alpn prev_user prev_method prev_uot < <(
+    printf '%s' "$previous" | jq -r '[
+      (.server // ""),
+      (.type // "vless"),
+      ((.port // "") | tostring),
+      (.uuid // ""),
+      (.password // ""),
+      (.sni // ""),
+      (.public_key // ""),
+      (.short_id // ""),
+      (.fingerprint // "chrome"),
+      ((.insecure // false) | tostring),
+      (.congestion_control // "bbr"),
+      (if .udp_over_stream == true then "stream" else (.udp_relay_mode // "native") end),
+      ((.alpn // ["h3"]) | join(",")),
+      (.username // ""),
+      (.method // "2022-blake3-aes-128-gcm"),
+      ((.udp_over_tcp // false) | tostring)
+    ] | join("\u001f")'
+  ) || return 1
+  [ -z "$prev_server" ] || address_hint="（留空沿用原地址）"
+  read_line "落地 IP/域名或 vless://、tuic://、socks5://、ss:// 分享链接${address_hint}，0 返回: " source || return 1
   source="$(trim "$source")"
   [ "$source" != "0" ] || return "$CANCEL_RC"
   case "$source" in
@@ -2330,46 +2805,108 @@ collect_landing_config() {
       return 0
       ;;
   esac
-  server="${source:-$(printf '%s' "$previous" | jq -r '.server // ""')}"
+  server="${source:-$prev_server}"
   server="${server#[}"; server="${server%]}"
   valid_host "$server" || { err "请输入有效 IP/域名或完整分享链接。"; return 1; }
-  old_type="$(printf '%s' "$previous" | jq -r '.type // "vless"')"
-  if [ "$old_type" = "tuic" ]; then choice=2; else choice=1; fi
-  echo "1) VLESS Reality (TCP)  2) TUIC v5 (QUIC/UDP)" >&2
-  read_line "落地协议 [默认 ${choice}]: " type
+  case "$old_type" in
+    tuic) choice=2 ;;
+    socks|socks5) choice=3 ;;
+    shadowsocks|ss) choice=4 ;;
+    *) choice=1 ;;
+  esac
+  echo "1) VLESS Reality (TCP)  2) TUIC v5 (QUIC/UDP)  3) SOCKS5 (TCP/UDP)  4) Shadowsocks / SS-2022 (TCP/UDP)" >&2
+  read_line "落地协议 [默认 ${choice}]: " type || return 1
   type="${type:-$choice}"
-  case "$type" in 1|vless) type=vless ;; 2|tuic) type=tuic ;; *) err "落地协议无效。"; return 1 ;; esac
+  case "$type" in
+    1|vless) type=vless ;;
+    2|tuic) type=tuic ;;
+    3|socks|socks5) type=socks ;;
+    4|ss|shadowsocks) type=shadowsocks ;;
+    *) err "落地协议无效。"; return 1 ;;
+  esac
   # 切换协议保留通用地址；认证/TLS设置按新协议重新填写。
-  if [ "$old_type" != "$type" ]; then previous="$(printf '%s' "$previous" | jq 'del(.uuid,.password,.sni,.public_key,.short_id,.fingerprint,.insecure,.congestion_control,.udp_relay_mode,.udp_over_stream,.alpn)')"; fi
-  port="$(ask_port "落地远端端口 (1-65535)" "$(printf '%s' "$previous" | jq -r '.port // 443')")"
+  if [ "$old_type" != "$type" ]; then
+    prev_uuid=""; prev_pass=""; prev_sni=""; prev_pbk=""; prev_sid=""; prev_fp="chrome"
+    prev_insecure="false"; prev_cc="bbr"; prev_mode="native"; prev_alpn="h3"
+    prev_user=""; prev_method="2022-blake3-aes-128-gcm"; prev_uot="false"
+  fi
+  local default_port="$prev_port"
+  if [ -z "$default_port" ]; then
+    case "$type" in
+      socks) default_port=1080 ;;
+      shadowsocks) default_port=8388 ;;
+      *) default_port=443 ;;
+    esac
+  fi
+  port="$(ask_port "落地远端端口 (1-65535)" "$default_port")" || return 1
   if [ "$type" = "vless" ]; then
-    user="$(ask_landing_secret "落地 VLESS UUID" "$(jq -r --argjson previous "$previous" '$previous.uuid // .uuid' "$STATE_FILE")")"
+    local st_uuid st_pbk st_sid st_rsni
+    IFS=$'\x1f' read -r st_uuid st_pbk st_sid st_rsni < <(
+      jq -r '[(.uuid // ""), (.public_key // ""), (.short_id // ""), (.reality_sni // "")] | join("\u001f")' "$STATE_FILE"
+    ) || return 1
+    user="$(ask_landing_secret "落地 VLESS UUID" "${prev_uuid:-$st_uuid}")" || return 1
     [ -n "$user" ] || return 1
-    pbk="$(ask_text_default "落地 Reality PublicKey" "$(jq -r --argjson previous "$previous" '$previous.public_key // .public_key' "$STATE_FILE")")"
-    read_line "落地 Reality ShortID [默认 $(jq -r --argjson previous "$previous" '$previous.short_id // .short_id' "$STATE_FILE")]: " sid
-    sid="${sid:-$(jq -r --argjson previous "$previous" '$previous.short_id // .short_id' "$STATE_FILE")}"
-    sni="$(ask_text_default "落地 Reality SNI" "$(jq -r --argjson previous "$previous" '$previous.sni // .reality_sni' "$STATE_FILE")")"
-    fp="$(ask_text_default "TLS 指纹" "$(printf '%s' "$previous" | jq -r '.fingerprint // "chrome"')")"
-    json="$(jq -nc --arg type "$type" --arg server "$server" --argjson port "$port" --arg uuid "$user" --arg public_key "$pbk" --arg short_id "$sid" --arg sni "$sni" --arg fingerprint "$fp" '{type:$type,server:$server,port:$port,uuid:$uuid,public_key:$public_key,short_id:$short_id,sni:$sni,fingerprint:$fingerprint}')"
-  else
-    user="$(ask_landing_secret "落地 TUIC UUID" "$(printf '%s' "$previous" | jq -r '.uuid // empty')")"
-    password="$(ask_landing_secret "落地 TUIC 密码" "$(printf '%s' "$previous" | jq -r '.password // empty')")"
-    sni="$(ask_text_default "落地 TUIC SNI" "$(printf '%s' "$previous" | jq -r --arg server "$server" '.sni // $server')")"
-    if [ "$(printf '%s' "$previous" | jq -r '.insecure // false')" = true ]; then choice=2; else choice=1; fi
+    pbk="$(ask_text_default "落地 Reality PublicKey" "${prev_pbk:-$st_pbk}")" || return 1
+    local def_sid="${prev_sid:-$st_sid}"
+    read_line "落地 Reality ShortID${def_sid:+ [默认 ${def_sid}，输入 - 清空]}: " sid || return 1
+    sid="$(trim "$sid")"
+    if [ "$sid" = "-" ]; then
+      sid=""
+    elif [ -z "$sid" ]; then
+      sid="$def_sid"
+    fi
+    sni="$(ask_text_default "落地 Reality SNI" "${prev_sni:-$st_rsni}")" || return 1
+    fp="$(ask_text_default "TLS 指纹" "${prev_fp:-chrome}")" || return 1
+    json="$(jq -nc --arg type "$type" --arg server "$server" --argjson port "$port" --arg uuid "$user" --arg public_key "$pbk" --arg short_id "$sid" --arg sni "$sni" --arg fingerprint "$fp" '{type:$type,server:$server,port:$port,uuid:$uuid,public_key:$public_key,short_id:$short_id,sni:$sni,fingerprint:$fingerprint}')" || return 1
+  elif [ "$type" = "tuic" ]; then
+    user="$(ask_landing_secret "落地 TUIC UUID" "$prev_uuid")" || return 1
+    password="$(ask_landing_secret "落地 TUIC 密码" "$prev_pass")" || return 1
+    sni="$(ask_text_default "落地 TUIC SNI" "${prev_sni:-$server}")" || return 1
+    if [ "$prev_insecure" = true ]; then choice=2; else choice=1; fi
     echo "1) 校验证书  2) 跳过校验（自签证书）" >&2
-    read_line "TLS 证书验证 [默认 ${choice}]: " insecure
+    read_line "TLS 证书验证 [默认 ${choice}]: " insecure || return 1
     insecure="${insecure:-$choice}"
     case "$insecure" in 1) insecure=false ;; 2) insecure=true ;; *) err "证书验证选项无效。"; return 1 ;; esac
-    cc="$(ask_text_default "拥塞控制 bbr / cubic / new_reno" "$(printf '%s' "$previous" | jq -r '.congestion_control // "bbr"')")"
-    mode="$(ask_text_default "UDP 转发 native / quic / stream" "$(printf '%s' "$previous" | jq -r 'if .udp_over_stream == true then "stream" else (.udp_relay_mode // "native") end')")"
-    alpn="$(ask_text_default "ALPN（多个用逗号分隔）" "$(printf '%s' "$previous" | jq -r '(.alpn // ["h3"]) | join(",")')")"
-    json="$(jq -nc --arg type "$type" --arg server "$server" --argjson port "$port" --arg uuid "$user" --arg password "$password" --arg sni "$sni" --argjson insecure "$insecure" --arg congestion_control "$cc" --arg mode "$mode" --arg alpn "$alpn" '{type:$type,server:$server,port:$port,uuid:$uuid,password:$password,sni:$sni,insecure:$insecure,congestion_control:$congestion_control,alpn:($alpn|split(","))} + (if $mode=="stream" then {udp_over_stream:true} else {udp_relay_mode:$mode,udp_over_stream:false} end)')"
+    cc="$(ask_text_default "拥塞控制 bbr / cubic / new_reno" "${prev_cc:-bbr}")" || return 1
+    mode="$(ask_text_default "UDP 转发 native / quic / stream" "${prev_mode:-native}")" || return 1
+    alpn="$(ask_text_default "ALPN（多个用逗号分隔）" "${prev_alpn:-h3}")" || return 1
+    json="$(jq -nc --arg type "$type" --arg server "$server" --argjson port "$port" --arg uuid "$user" --arg password "$password" --arg sni "$sni" --argjson insecure "$insecure" --arg congestion_control "$cc" --arg mode "$mode" --arg alpn "$alpn" '{type:$type,server:$server,port:$port,uuid:$uuid,password:$password,sni:$sni,insecure:$insecure,congestion_control:$congestion_control,alpn:($alpn|split(","))} + (if $mode=="stream" then {udp_over_stream:true} else {udp_relay_mode:$mode,udp_over_stream:false} end)')" || return 1
+  elif [ "$type" = "socks" ]; then
+    read_line "SOCKS5 用户名（无认证请留空${prev_user:+，当前 ${prev_user}，输入 - 清空}）: " user || return 1
+    user="$(trim "$user")"
+    if [ "$user" = "-" ]; then
+      user=""
+      password=""
+    else
+      user="${user:-$prev_user}"
+      if [ -n "$user" ]; then
+        password="$(ask_landing_secret "SOCKS5 密码（无密码可留空）" "$prev_pass" 1)" || return 1
+      else
+        password=""
+      fi
+    fi
+    if [ "$prev_uot" = true ]; then choice=2; else choice=1; fi
+    echo "1) 原生 UDP（默认）  2) 启用 UDP over TCP (UoT)" >&2
+    read_line "UDP 转发模式 [默认 ${choice}]: " uot || return 1
+    uot="${uot:-$choice}"
+    case "$uot" in 1) uot=false ;; 2) uot=true ;; *) err "UDP 转发选项无效。"; return 1 ;; esac
+    json="$(jq -nc --arg type "$type" --arg server "$server" --argjson port "$port" --arg username "$user" --arg password "$password" --argjson udp_over_tcp "$uot" '{type:$type,version:"5",server:$server,port:$port,username:$username,password:$password,udp_over_tcp:$udp_over_tcp}')" || return 1
+  else
+    echo "常用加密：2022-blake3-aes-128-gcm / 2022-blake3-aes-256-gcm / 2022-blake3-chacha20-poly1305 / aes-256-gcm / chacha20-ietf-poly1305" >&2
+    method="$(ask_text_default "Shadowsocks 加密方式" "${prev_method:-2022-blake3-aes-128-gcm}")" || return 1
+    password="$(ask_landing_secret "Shadowsocks 密码 / SS-2022 Base64 密钥" "$prev_pass")" || return 1
+    if [ "$prev_uot" = true ]; then choice=2; else choice=1; fi
+    echo "1) 原生 UDP（默认）  2) 启用 UDP over TCP (UoT)" >&2
+    read_line "UDP 转发模式 [默认 ${choice}]: " uot || return 1
+    uot="${uot:-$choice}"
+    case "$uot" in 1) uot=false ;; 2) uot=true ;; *) err "UDP 转发选项无效。"; return 1 ;; esac
+    json="$(jq -nc --arg type "$type" --arg server "$server" --argjson port "$port" --arg method "$method" --arg password "$password" --argjson udp_over_tcp "$uot" '{type:$type,server:$server,port:$port,method:$method,password:$password,udp_over_tcp:$udp_over_tcp}')" || return 1
   fi
   if ! LANDING_CONFIG_JSON="$(printf '%s' "$json" | parse_landing_uri --json)"; then return 1; fi
-  if [ "$type" = "vless" ]; then
-    check_landing_connectivity "$server" "$port" || return $?
-  else
+  if [ "$type" = "tuic" ]; then
     info "TUIC 使用 QUIC/UDP；TCP 端口状态不能验证 TUIC。绑定到中转节点后由实际代理探测检查。"
+  else
+    check_landing_connectivity "$server" "$port" || return $?
   fi
 }
 
@@ -2378,9 +2915,7 @@ add_landing_wizard() {
   step "添加落地节点"
   local server port type flag loc display id
   collect_landing_config || return $?
-  server="$(printf '%s' "$LANDING_CONFIG_JSON" | jq -r '.server')"
-  port="$(printf '%s' "$LANDING_CONFIG_JSON" | jq -r '.port')"
-  type="$(printf '%s' "$LANDING_CONFIG_JSON" | jq -r '.type')"
+  IFS=$'\x1f' read -r server port type < <(printf '%s' "$LANDING_CONFIG_JSON" | jq -r '[.server, (.port|tostring), .type] | join("\u001f")')
   info "正在检测落地节点地区..."
   IFS='|' read -r _ flag loc <<<"$(detect_location "$server" "" "落地节点")"
   display="${flag}${loc}：${server}"
@@ -2395,22 +2930,28 @@ list_landings_table() {
   if [ "$(landing_count)" -eq 0 ]; then warn "当前无任何落地节点。"; return 1; fi
   jq -r "$JQ_TABLE_LIB"'
     . as $s |
-    ["序号", "落地节点 (国家：ip)", "协议", "端口", "被引用", "SNI"] as $headers |
-    [4, 28, 10, 6, 6, 16] as $mins |
-    [.landings | to_entries[] | .value as $l |
+    ["序号", "落地节点 (国家：ip)", "协议", "端口", "被引用", "SNI / 加密 / 认证"] as $headers |
+    [4, 28, 10, 6, 6, 20] as $mins |
+    [.landings | to_entries[] | .value as $l | ($l.type // "vless") as $t |
       [((.key+1)|tostring),($l.display // "-"),
-       (if ($l.type // "vless")=="tuic" then "TUIC v5" else "VLESS" end),($l.port|tostring),
-       (([$s.nodes[]? | select(.landing_id==$l.id or .backup_landing_id==$l.id)]|length)|tostring),($l.sni // "-")]
+       (if $t=="tuic" then "TUIC v5"
+        elif $t=="socks" then "SOCKS5"
+        elif $t=="shadowsocks" then (if ($l.method // "") | startswith("2022-") then "SS-2022" else "SS" end)
+        else "VLESS" end),
+       ($l.port|tostring),
+       (([$s.nodes[]? | select(.landing_id==$l.id or .backup_landing_id==$l.id)]|length)|tostring),
+       (if $t=="socks" then (if ($l.username // "") != "" then "认证:" + $l.username else "无认证" end)
+        elif $t=="shadowsocks" then ($l.method // "-")
+        else ($l.sni // "-") end)]
     ] as $rows | table($headers;$mins;$rows)' "$STATE_FILE"
 }
 
 edit_landing() {
   local idx="$1" previous previous_config id old_server old_type old_display server type display flag loc used rename=false
   previous="$(jq -c --argjson i "$idx" '.landings[$i]' "$STATE_FILE")"
-  id="$(printf '%s' "$previous" | jq -r '.id')"
-  old_server="$(printf '%s' "$previous" | jq -r '.server')"
-  old_type="$(printf '%s' "$previous" | jq -r '.type // "vless"')"
-  old_display="$(printf '%s' "$previous" | jq -r '.display // .server')"
+  IFS=$'\x1f' read -r id old_server old_type old_display < <(
+    printf '%s' "$previous" | jq -r '[.id, .server, (.type // "vless"), (.display // .server)] | join("\u001f")'
+  )
   used="$(jq --arg id "$id" '[.nodes[]? | select(.landing_id==$id or .backup_landing_id==$id)] | length' "$STATE_FILE")"
   echo "落地：${old_display} (${old_type^^})，被 ${used} 个节点引用。"
   if [ "$used" -gt 0 ]; then warn "修改后会重启 sing-box 并同步生效。"; fi
@@ -2424,8 +2965,7 @@ edit_landing() {
     info "落地信息没有变化。"
     return "$CANCEL_RC"
   fi
-  server="$(printf '%s' "$LANDING_CONFIG_JSON" | jq -r '.server')"
-  type="$(printf '%s' "$LANDING_CONFIG_JSON" | jq -r '.type')"
+  IFS=$'\x1f' read -r server type < <(printf '%s' "$LANDING_CONFIG_JSON" | jq -r '[.server, .type] | join("\u001f")')
   display="$old_display"
   if [ "$server" != "$old_server" ]; then
     IFS='|' read -r _ flag loc <<<"$(detect_location "$server" "" "落地节点")"
@@ -2719,7 +3259,9 @@ delete_node_wizard() {
 
   if [ -z "$indices" ] || [ "$indices" = "0" ]; then return "$CANCEL_RC"; fi
 
-  for idx in $indices; do
+  local -a idx_items=()
+  IFS=' ' read -r -a idx_items <<< "$indices"
+  for idx in "${idx_items[@]}"; do
     if valid_index "$idx" "$count"; then
       real_idx=$((10#$idx - 1))
       # 去重
@@ -2800,13 +3342,18 @@ modify_node_wizard() {
   echo "协议: ${protocol^^}"
   echo "端口: ${old_port}"
   echo "出口: $([ "$outbound_type" = "landing" ] && echo "落地中转 (${landing_display})" || echo "直出")"
-  echo "备用: $(jq -r --argjson i "$real_idx" '. as $s | .nodes[$i].backup_landing_id as $id | if $id==null then "未启用" else ([.landings[]|select(.id==$id)|.display][0]//"落地已丢失") end' "$STATE_FILE")"
-  if [ -f "$FAILOVER_STATUS_FILE" ]; then
+  local backup_id backup_display
+  IFS=$'\x1f' read -r backup_id backup_display < <(
+    jq -r --argjson i "$real_idx" '. as $s | (.nodes[$i].backup_landing_id // "") as $id |
+      [$id, (if $id=="" then "未启用" else ([.landings[]?|select(.id==$id)|.display][0]//"落地已丢失") end)] | join("\u001f")' "$STATE_FILE"
+  )
+  echo "备用: ${backup_display}"
+  if [ "$outbound_type" = "landing" ] && [ -n "$backup_id" ] && [ -f "$FAILOVER_STATUS_FILE" ]; then
     jq -r --arg t "failover-${old_tag}" '
       if (now - (.checked_at//0)) > 90 then "主备检测状态已超过 90 秒未更新，请检查 ysq-failover 服务。"
       elif (.error//"")!="" then "主备检测异常: \(.error)"
       else .groups[]? | select(.tag==$t) |
-        "当前出口: \(.selected) (主: \(.primary_ok), 备: \(.backup_ok))" end' "$FAILOVER_STATUS_FILE"
+        "当前出口: \(.selected) (主: \(.primary_ok), 备: \(.backup_ok))" end' "$FAILOVER_STATUS_FILE" 2>/dev/null || true
   fi
   echo "--------------------"
   echo
@@ -2967,12 +3514,13 @@ ask_user_name() {
 }
 
 ask_user_uuid() {
-  local n=""
+  local n="" bin
+  bin="$(singbox_bin_path)"
   while true; do
     read_line "输入 VLESS / TUIC 共用 UUID（留空自动生成）: " n
     n="$(trim "$n")"
     if [ -z "$n" ]; then
-      n="$(sing-box generate uuid)" || return 1
+      n="$("${bin:-sing-box}" generate uuid)" || return 1
     fi
     if valid_user_uuid "$n"; then
       echo "${n,,}"
@@ -3007,7 +3555,7 @@ add_user_wizard() {
   name="$(ask_user_name)"
   uuid="$(ask_user_uuid)"
   password="$(ask_user_tuic_password)"
-  if jq -e --arg u "$uuid" '.users[] | select(.uuid == $u)' "$STATE_FILE" >/dev/null 2>&1; then
+  if jq -e --arg u "${uuid,,}" '.users[]? | select((.uuid | ascii_downcase) == $u)' "$STATE_FILE" >/dev/null 2>&1; then
     die "UUID 已被其他用户使用，请重新添加。"
   fi
   state_build --arg n "$name" --arg u "$uuid" --arg p "$password" \
@@ -3045,10 +3593,10 @@ modify_user_wizard() {
       ;;
     2)
       new="$(ask_user_uuid)"
-      if jq -e --argjson i "$idx" --arg u "$new" '.users | to_entries[] | select(.key != $i and .value.uuid == $u)' "$STATE_FILE" >/dev/null 2>&1; then
+      if jq -e --argjson i "$idx" --arg u "${new,,}" '.users | to_entries[] | select(.key != $i and (.value.uuid | ascii_downcase) == $u)' "$STATE_FILE" >/dev/null 2>&1; then
         die "该 UUID 已被其他用户使用。"
       fi
-      [ "$new" != "$uuid" ] || return "$CANCEL_RC"
+      [ "${new,,}" != "${uuid,,}" ] || return "$CANCEL_RC"
       state_build --argjson i "$idx" --arg u "$new" '.users[$i].uuid=$u'
       ;;
     3)
@@ -3057,7 +3605,9 @@ modify_user_wizard() {
       state_build --argjson i "$idx" --arg p "$new" '.users[$i].tuic_pass=$p'
       ;;
     4)
-      new="$(sing-box generate uuid)"
+      local sb_bin
+      sb_bin="$(singbox_bin_path)"
+      new="$("${sb_bin:-sing-box}" generate uuid)"
       pass="$(openssl rand -hex 16)"
       state_build --argjson i "$idx" --arg u "$new" --arg p "$pass" \
         '.users[$i] |= (.uuid=$u | .tuic_pass=$p)'
@@ -3148,11 +3698,11 @@ ensure_grpcurl() {
   file="${wd}/${asset}"
   sums="${wd}/checksums.txt"
   info "首次查看流量：下载 grpcurl ${GRPCURL_VERSION}（仅用于读取本机 gRPC 统计）..."
-  if ! curl -fL --connect-timeout 10 --retry 2 -o "$file" "${base}/${asset}"; then
+  if ! curl -fL --connect-timeout 10 --max-time 120 --speed-time 20 --speed-limit 1024 --retry 2 -o "$file" "${base}/${asset}"; then
     err "grpcurl 下载失败。可自行安装 grpcurl 后重新打开流量统计。"
     return 1
   fi
-  if ! curl -fL --connect-timeout 10 --retry 2 -o "$sums" "${base}/grpcurl_${GRPCURL_VERSION}_checksums.txt"; then
+  if ! curl -fL --connect-timeout 10 --max-time 30 --retry 2 -o "$sums" "${base}/grpcurl_${GRPCURL_VERSION}_checksums.txt"; then
     err "无法下载 grpcurl 官方 SHA256 校验文件，已拒绝安装。"
     return 1
   fi
@@ -3278,25 +3828,28 @@ normalize_domain() {
   printf '%s' "$d"
 }
 
-direct_add() {
+routing_domain_add() {
   need_state
-
-  local raw_input item domain domains_json
+  local field="$1" other_field="$2" action_label="$3" list_label="$4"
+  local raw_input item domain domains_json existing_list
+  local -a items=()
   local -a new_domains=()
 
-  read_line "请输入要直连的域名 (多个用空格或逗号隔开，输入 0 返回): " raw_input
+  read_line "请输入要${action_label}的域名 (多个用空格或逗号隔开，输入 0 返回): " raw_input
   raw_input="$(split_input "$raw_input")"
   if [ -z "$raw_input" ] || [ "$raw_input" = "0" ]; then return "$CANCEL_RC"; fi
 
-  for item in $raw_input; do
+  existing_list="$(jq -r --arg f "$field" '(.[$f] // [])[]' "$STATE_FILE")"
+  IFS=' ' read -r -a items <<< "$raw_input"
+  for item in "${items[@]}"; do
     domain="$(normalize_domain "$item")"
     if [ -z "$domain" ]; then continue; fi
     if ! [[ "$domain" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]]; then
       warn "忽略无效域名格式：${item}（中文域名请填写 punycode 形式）"
       continue
     fi
-    if jq -e --arg d "$domain" '.direct_domains | index($d)' "$STATE_FILE" >/dev/null 2>&1; then
-      info "域名已在直连列表中，跳过：$domain"
+    if [ -n "$existing_list" ] && printf '%s\n' "$existing_list" | grep -Fxq "$domain"; then
+      info "域名已在${list_label}中，跳过：$domain"
       continue
     fi
     if [[ " ${new_domains[*]:-} " == *" ${domain} "* ]]; then
@@ -3311,39 +3864,42 @@ direct_add() {
   fi
 
   domains_json="$(printf '%s\n' "${new_domains[@]}" | jq -R . | jq -s .)"
-  state_build --argjson ds "$domains_json" '.direct_domains += $ds | .direct_domains |= unique | .blocked_domains = ((.blocked_domains//[]) - $ds)'
+  state_build --arg f "$field" --arg of "$other_field" --argjson ds "$domains_json" \
+    '.[$f] = (((.[$f] // []) + $ds) | unique) | .[$of] = ((.[$of] // []) - $ds)'
   apply_state
-  ok "已批量直连 ${#new_domains[@]} 个域名: ${new_domains[*]}"
+  ok "已批量${action_label} ${#new_domains[@]} 个域名: ${new_domains[*]}"
 }
 
-direct_remove() {
+routing_domain_remove() {
   need_state
-
+  local field="$1" action_label="$2" list_label="$3"
   local count raw_indices idx real_idx remove_json
   local -a all_domains=()
+  local -a idx_items=()
   local -a remove_domains=()
   local -a seen=()
 
-  mapfile -t all_domains < <(jq -r '.direct_domains[]?' "$STATE_FILE")
+  mapfile -t all_domains < <(jq -r --arg f "$field" '(.[$f] // [])[]' "$STATE_FILE")
   count="${#all_domains[@]}"
   if [ "$count" -eq 0 ]; then
-    warn "直连列表为空。"
+    warn "${list_label}为空。"
     return "$CANCEL_RC"
   fi
 
-  read_line "请输入要解除直连的序号 (多个用空格或逗号隔开，输入 all 清空全部，输入 0 取消): " raw_indices
+  read_line "请输入要解除${action_label}的序号 (多个用空格或逗号隔开，输入 all 清空全部，输入 0 取消): " raw_indices
   raw_indices="$(split_input "$raw_indices")"
   if [ -z "$raw_indices" ] || [ "$raw_indices" = "0" ]; then return "$CANCEL_RC"; fi
 
   if [ "${raw_indices,,}" = "all" ]; then
-    confirm_or_cancel "确认清空全部 ${count} 个已直连域名吗？输入 y 确认: " || return $?
-    state_build '.direct_domains = []'
+    confirm_or_cancel "确认清空全部 ${count} 个已${action_label}域名吗？输入 y 确认: " || return $?
+    state_build --arg f "$field" '.[$f] = []'
     apply_state
-    ok "已清空全部直连域名。"
+    ok "已清空全部${action_label}域名。"
     return 0
   fi
 
-  for idx in $raw_indices; do
+  IFS=' ' read -r -a idx_items <<< "$raw_indices"
+  for idx in "${idx_items[@]}"; do
     if valid_index "$idx" "$count"; then
       real_idx=$((10#$idx - 1))
       if [[ " ${seen[*]:-} " == *" ${real_idx} "* ]]; then continue; fi
@@ -3360,99 +3916,16 @@ direct_remove() {
   fi
 
   remove_json="$(printf '%s\n' "${remove_domains[@]}" | jq -R . | jq -s .)"
-  state_build --argjson rm_list "$remove_json" \
-    '.direct_domains |= map(select(. as $d | $rm_list | index($d) | not))'
+  state_build --arg f "$field" --argjson rm_list "$remove_json" \
+    '.[$f] |= map(select(. as $d | $rm_list | index($d) | not))'
   apply_state
-  ok "已解除直连 (${#remove_domains[@]} 个): ${remove_domains[*]}"
+  ok "已解除${action_label} (${#remove_domains[@]} 个): ${remove_domains[*]}"
 }
 
-block_add() {
-  need_state
-
-  local raw_input item domain domains_json
-  local -a new_domains=()
-
-  read_line "请输入要屏蔽的域名 (多个用空格或逗号隔开，输入 0 返回): " raw_input
-  raw_input="$(split_input "$raw_input")"
-  if [ -z "$raw_input" ] || [ "$raw_input" = "0" ]; then return "$CANCEL_RC"; fi
-
-  for item in $raw_input; do
-    domain="$(normalize_domain "$item")"
-    if [ -z "$domain" ]; then continue; fi
-    if ! [[ "$domain" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]]; then
-      warn "忽略无效域名格式：${item}（中文域名请填写 punycode 形式）"
-      continue
-    fi
-    if jq -e --arg d "$domain" '.blocked_domains | index($d)' "$STATE_FILE" >/dev/null 2>&1; then
-      info "域名已在屏蔽列表中，跳过：$domain"
-      continue
-    fi
-    if [[ " ${new_domains[*]:-} " == *" ${domain} "* ]]; then
-      continue
-    fi
-    new_domains+=("$domain")
-  done
-
-  if [ "${#new_domains[@]}" -eq 0 ]; then
-    warn "没有新增任何有效域名。"
-    return "$CANCEL_RC"
-  fi
-
-  domains_json="$(printf '%s\n' "${new_domains[@]}" | jq -R . | jq -s .)"
-  state_build --argjson ds "$domains_json" '.blocked_domains += $ds | .blocked_domains |= unique | .direct_domains = ((.direct_domains//[]) - $ds)'
-  apply_state
-  ok "已批量屏蔽 ${#new_domains[@]} 个域名: ${new_domains[*]}"
-}
-
-block_remove() {
-  need_state
-
-  local count raw_indices idx real_idx remove_json
-  local -a all_domains=()
-  local -a remove_domains=()
-  local -a seen=()
-
-  mapfile -t all_domains < <(jq -r '.blocked_domains[]?' "$STATE_FILE")
-  count="${#all_domains[@]}"
-  if [ "$count" -eq 0 ]; then
-    warn "屏蔽列表为空。"
-    return "$CANCEL_RC"
-  fi
-
-  read_line "请输入要解除屏蔽的序号 (多个用空格或逗号隔开，输入 all 清空全部，输入 0 取消): " raw_indices
-  raw_indices="$(split_input "$raw_indices")"
-  if [ -z "$raw_indices" ] || [ "$raw_indices" = "0" ]; then return "$CANCEL_RC"; fi
-
-  if [ "${raw_indices,,}" = "all" ]; then
-    confirm_or_cancel "确认清空全部 ${count} 个已屏蔽域名吗？输入 y 确认: " || return $?
-    state_build '.blocked_domains = []'
-    apply_state
-    ok "已清空全部屏蔽域名。"
-    return 0
-  fi
-
-  for idx in $raw_indices; do
-    if valid_index "$idx" "$count"; then
-      real_idx=$((10#$idx - 1))
-      if [[ " ${seen[*]:-} " == *" ${real_idx} "* ]]; then continue; fi
-      seen+=("$real_idx")
-      remove_domains+=("${all_domains[$real_idx]}")
-    else
-      warn "忽略无效序号: $idx"
-    fi
-  done
-
-  if [ "${#remove_domains[@]}" -eq 0 ]; then
-    warn "未选择有效序号。"
-    return 1
-  fi
-
-  remove_json="$(printf '%s\n' "${remove_domains[@]}" | jq -R . | jq -s .)"
-  state_build --argjson rm_list "$remove_json" \
-    '.blocked_domains |= map(select(. as $d | $rm_list | index($d) | not))'
-  apply_state
-  ok "已解除屏蔽 (${#remove_domains[@]} 个): ${remove_domains[*]}"
-}
+direct_add() { routing_domain_add "direct_domains" "blocked_domains" "直连" "直连列表"; }
+direct_remove() { routing_domain_remove "direct_domains" "直连" "直连列表"; }
+block_add() { routing_domain_add "blocked_domains" "direct_domains" "屏蔽" "屏蔽列表"; }
+block_remove() { routing_domain_remove "blocked_domains" "屏蔽" "屏蔽列表"; }
 
 # 直连指此 VPS 本机出口；未匹配的流量仍使用各节点原本的出口。
 routing_menu() {
@@ -3542,8 +4015,9 @@ block_website_menu() { routing_menu; }
 update_core_wizard() {
   local current_ver latest_ver bin wd rc new_ver
 
-  if command -v sing-box >/dev/null 2>&1; then
-    current_ver="$(sing-box version 2>/dev/null | head -n 1 | awk '{print $3}' || true)"
+  bin="$(singbox_bin_path)"
+  if [ -n "$bin" ]; then
+    current_ver="$("$bin" version 2>/dev/null | head -n 1 | awk '{print $3}' || true)"
   else
     current_ver="未知"
   fi
@@ -3570,7 +4044,6 @@ update_core_wizard() {
 
   state_write_guard || return $?
   # 先备份旧二进制，安装失败时恢复，避免把服务搞成“没有可执行文件”
-  bin="$(command -v sing-box 2>/dev/null || true)"
   wd="$(new_work_dir)"
   if [ -n "$bin" ] && [ -x "$bin" ]; then
     cp -p "$bin" "$wd/sing-box.bak"
@@ -3587,7 +4060,7 @@ update_core_wizard() {
   if [ "$rc" -ne 0 ]; then
     err "更新失败，正在恢复旧版本..."
     if [ -f "$wd/sing-box.bak" ] && [ -n "$bin" ]; then
-      install -m 755 "$wd/sing-box.bak" "$bin"
+      install -m 755 "$wd/sing-box.bak" "${bin}.new.${WORK_TAG}" && mv -f "${bin}.new.${WORK_TAG}" "$bin"
       hash -r 2>/dev/null || true
       service_restart || true
     fi
@@ -3597,7 +4070,7 @@ update_core_wizard() {
 
   rm -rf "$wd"
 
-  new_ver="$(sing-box version 2>/dev/null | head -n 1 | awk '{print $3}' || true)"
+  new_ver="$("$CORE_BIN_FILE" version 2>/dev/null | head -n 1 | awk '{print $3}' || true)"
   if [ "$new_ver" != "$latest_ver" ]; then
     warn "当前版本 ${new_ver:-未知} 与 Release 最新版 ${latest_ver} 不一致。"
   fi
@@ -3738,15 +4211,17 @@ choose_initial_nodes() {
 #   - check 被系统杀掉（退出码 137，多半是内存不足）：先重试一次；
 #     仍被杀就用 jq 确认 JSON 合法后跳过 check，交给「启动服务」来验证（启动失败会自动回滚）
 check_config_file() {
-  local f="$1" rc=0
+  local f="$1" rc=0 bin
+  bin="$(singbox_bin_path)"
+  bin="${bin:-sing-box}"
 
-  sing-box check -c "$f" && return 0 || rc=$?
+  "$bin" check -c "$f" && return 0 || rc=$?
   [ "$rc" -eq 137 ] || return 1
 
   warn "sing-box check 被系统杀掉（137，疑似内存不足），1 秒后重试一次..."
   sleep 1
   rc=0
-  sing-box check -c "$f" && return 0 || rc=$?
+  "$bin" check -c "$f" && return 0 || rc=$?
   [ "$rc" -eq 137 ] || return 1
 
   warn "重试仍被杀：内存不足。改为用 jq 确认 JSON 合法后跳过 check，直接启动服务验证（启动失败会自动回滚）。"
@@ -3775,24 +4250,32 @@ render_config() {
     return 1
   fi
   info "生成 sing-box 配置..."
-  mkdir -p "$CORE_LOG_DIR"
-  touch "$LOG_FILE"
-  chmod 640 "$LOG_FILE"
+  mkdir -p "$CORE_LOG_DIR" || return 1
+  touch "$LOG_FILE" || return 1
+  chmod 640 "$LOG_FILE" || return 1
   # Legacy OpenRC stdout logs may have been created by root. The new core file
   # output must be writable by the service account, including on first adoption.
   if id sing-box >/dev/null 2>&1; then
-    chown sing-box:sing-box "$CORE_LOG_DIR" "$LOG_FILE"
+    chown sing-box:sing-box "$CORE_LOG_DIR" "$LOG_FILE" || return 1
+  fi
+
+  local default_log_level="warn"
+  if agent_binding_present; then
+    default_log_level="info"
   fi
 
   tmp="$(mktemp "${CONFIG_FILE}.tmp.${WORK_TAG}.XXXXXX")" || { err "无法创建临时配置文件。"; return 1; }
 
-  if ! jq --arg api_listen "127.0.0.1:${V2RAY_API_PORT}" --arg cert_file "$CERT_FILE" --arg key_file "$KEY_FILE" --arg log_file "$LOG_FILE" --arg cache_file "${CORE_DATA_DIR}/route-rule-cache.db" --arg failover_listen "127.0.0.1:${FAILOVER_API_PORT}" '
+  if ! jq --arg api_listen "127.0.0.1:${V2RAY_API_PORT}" --arg cert_file "$CERT_FILE" --arg key_file "$KEY_FILE" --arg log_file "$LOG_FILE" --arg default_log_level "$default_log_level" --arg cache_file "${CORE_DATA_DIR}/route-rule-cache.db" --arg failover_listen "127.0.0.1:${FAILOVER_API_PORT}" '
     (.users |= map(select(.enabled != false))) as $s |
 
     def landing_id($id):
       first($s.landings[]? | select(.id == $id))
       // error("引用的落地节点不存在: " + $id);
+    def has_users: ($s.users | length) > 0;
+    def active_nodes: if has_users then [$s.nodes[]? | select((.type | startswith("vless")) or (.type | startswith("tuic")))] else [] end;
     def relay_nodes: [$s.nodes[]? | select(.outbound_type == "landing")];
+    def active_relay_nodes: if has_users then relay_nodes else [] end;
     def failover_nodes: [relay_nodes[] | select((.backup_landing_id // "") != "")];
     def landing_ids: [relay_nodes[] | .landing_id, (.backup_landing_id // empty) | select(. != "")] | unique;
     def policy_rule($field; $action):
@@ -3857,13 +4340,34 @@ render_config() {
        tls:{enabled:true,server_name:($l.sni // $l.server),insecure:($l.insecure // false),alpn:($l.alpn // ["h3"])}}
        + (if $l.udp_over_stream == true then {udp_over_stream:true}
           else {udp_relay_mode:($l.udp_relay_mode // "native")} end) end
-    elif ($l.type // "vless") == "vless" then {
+    elif ($l.type // "vless") == "socks" then
+      {
+        "type": "socks",
+        "tag": ("out-" + $l.id),
+        "server": $l.server,
+        "server_port": ($l.port | tonumber),
+        "version": ($l.version // "5")
+      }
+      + (if (($l.username // "") | length) > 0 then {"username": $l.username} else {} end)
+      + (if (($l.password // "") | length) > 0 then {"password": $l.password} else {} end)
+      + (if $l.udp_over_tcp == true then {"udp_over_tcp": true} else {} end)
+    elif ($l.type // "vless") == "shadowsocks" then
+      if (($l.method // "")|length)==0 or (($l.password // "")|length)==0 then error("Shadowsocks 落地缺少加密方式或密码") else
+      {
+        "type": "shadowsocks",
+        "tag": ("out-" + $l.id),
+        "server": $l.server,
+        "server_port": ($l.port | tonumber),
+        "method": $l.method,
+        "password": $l.password
+      }
+      + (if $l.udp_over_tcp == true then {"udp_over_tcp": true} else {} end) end
+    elif ($l.type // "vless") == "vless" then ({
       "type": "vless",
       "tag": ("out-" + $l.id),
       "server": $l.server,
       "server_port": ($l.port | tonumber),
       "uuid": ($l.uuid // $s.uuid),
-      "flow": "xtls-rprx-vision",
       "tls": {
         "enabled": true,
         "server_name": ($l.sni // $s.reality_sni),
@@ -3878,11 +4382,11 @@ render_config() {
         }
       },
       "packet_encoding": "xudp"
-    } else error("落地协议不支持: " + ($l.type|tostring)) end;
+    } + (if ($l.flow // "xtls-rprx-vision") != "" then {"flow": ($l.flow // "xtls-rprx-vision")} else {} end)) else error("落地协议不支持: " + ($l.type|tostring)) end;
 
     {
       "log": {
-        "level": "info",
+        "level": (if $default_log_level == "info" then (if ($s.log_level // "") == "debug" or ($s.log_level // "") == "trace" then $s.log_level else "info" end) else ($s.log_level // "warn") end),
         "output": $log_file,
         "timestamp": true
       },
@@ -3892,7 +4396,7 @@ render_config() {
           "stats": {
             "enabled": true,
             "users": [$s.users[] | (.stats_key // .name)],
-            "inbounds": [$s.nodes[]? | .tag],
+            "inbounds": [active_nodes[] | .tag],
             "outbounds": (["direct"] + [landing_ids[] | "out-" + .] + [failover_nodes[] | "failover-" + .tag])
           }
         }
@@ -3901,7 +4405,7 @@ render_config() {
         + (if (failover_nodes|length)>0 then
          {clash_api:{external_controller:$failover_listen,secret:$s.failover_secret}} else {} end)),
       "inbounds": [
-        $s.nodes[]? | select(($s.users | length) > 0) |
+        active_nodes[] |
         if (.type | startswith("vless")) then
           vless_in(.)
         elif (.type | startswith("tuic")) then
@@ -3939,7 +4443,7 @@ render_config() {
           + set_rule("block"; {action:"reject"})
           + policy_rule("direct_domains"; {action:"route",outbound:"direct"})
           + set_rule("direct"; {action:"route",outbound:"direct"})
-          + [relay_nodes[] | {inbound:[.tag],action:"route",
+          + [active_relay_nodes[] | {inbound:[.tag],action:"route",
              outbound:(if (.backup_landing_id//"")!="" then "failover-"+.tag else "out-"+.landing_id end)}]
         ),
         "final": "direct"
@@ -3982,17 +4486,17 @@ render_info() {
     return 1
   fi
 
-  local server_ip reality_sni tuic_sni public_key private_key short_id ip_version server_ip_display
-  local type tag name port protocol outbound_type landing_disp landing_port user uuid tuic_pass encoded_name link
-  local default_name default_uuid default_tuic_pass
+  local server_ip reality_sni tuic_sni public_key short_id ip_version server_ip_display
+  local type tag name port protocol outbound_type landing_disp landing_port user uuid tuic_pass encoded_name type_disp link
+  local default_name default_uuid default_tuic_pass tmp_out out_dir
 
-  state_read '.server_ip, .reality_sni, .tuic_sni, .public_key, .private_key, .short_id, (.ip_version // "ipv4"), ([.users[] | select(.enabled != false)][0].name), ([.users[] | select(.enabled != false)][0].uuid), ([.users[] | select(.enabled != false)][0].tuic_pass)' \
-    server_ip reality_sni tuic_sni public_key private_key short_id ip_version default_name default_uuid default_tuic_pass
+  state_read '.server_ip, .reality_sni, .tuic_sni, .public_key, .short_id, (.ip_version // "ipv4"), ([.users[] | select(.enabled != false)][0].name), ([.users[] | select(.enabled != false)][0].uuid), ([.users[] | select(.enabled != false)][0].tuic_pass)' \
+    server_ip reality_sni tuic_sni public_key short_id ip_version default_name default_uuid default_tuic_pass || return 1
   if [ -n "$selected_user" ]; then
     IFS=$'\x1f' read -r default_name default_uuid default_tuic_pass <<< "$(
       jq -r --arg name "$selected_user" \
         '.users[] | select(.enabled != false and .name == $name) | [.name, .uuid, .tuic_pass] | join("\u001f")' "$STATE_FILE"
-    )"
+    )" || return 1
     user_label="用户"
   fi
   if [ "$ip_version" = "ipv6" ]; then
@@ -4001,14 +4505,18 @@ render_info() {
     server_ip_display="$server_ip"
   fi
 
-  cat > "$out_file" <<INFO
+  out_dir="$(dirname "$out_file")"
+  mkdir -p "$out_dir" || return 1
+  tmp_out="$(mktemp "${out_dir}/.ysq-info.${WORK_TAG}.XXXXXX")" || return 1
+  chmod 600 "$tmp_out" || { rm -f "$tmp_out"; return 1; }
+
+  cat > "$tmp_out" <<INFO || { rm -f "$tmp_out"; return 1; }
 ==============================
 ysq sing-box 节点信息（按用户）
 ==============================
 服务器地址: ${server_ip} (${ip_version})
 ${user_label}: ${default_name}
 UUID: ${default_uuid}
-REALITY PrivateKey: ${private_key}
 REALITY PublicKey: ${public_key}
 ShortID: ${short_id}
 TUIC Password: ${default_tuic_pass}
@@ -4021,12 +4529,13 @@ YAML配置: ${YAML_FILE}
 INFO
 
   if [ "$(jq '.nodes | length' "$STATE_FILE")" -eq 0 ]; then
-    printf '当前还没有节点。输入 ysq 后在面板中添加节点。\n' >> "$out_file"
-    chmod 600 "$out_file"
+    printf '当前还没有节点。输入 ysq 后在面板中添加节点。\n' >> "$tmp_out" || { rm -f "$tmp_out"; return 1; }
+    mv -f "$tmp_out" "$out_file" || { rm -f "$tmp_out"; return 1; }
     return 0
   fi
 
-  while IFS=$'\t' read -r type tag name port protocol outbound_type landing_disp landing_port user uuid tuic_pass encoded_name; do
+  while IFS=$'\x1f' read -r type tag name port protocol outbound_type landing_disp landing_port user uuid tuic_pass encoded_name type_disp; do
+    [ -n "$type" ] || continue
     if [[ "$type" == vless* ]]; then
       link="vless://${uuid}@${server_ip_display}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reality_sni}&fp=chrome&pbk=${public_key}&sid=${short_id}&type=tcp&headerType=none#${encoded_name}"
     elif [[ "$type" == tuic* ]]; then
@@ -4038,7 +4547,7 @@ INFO
       echo "=============================="
       echo "节点: ${name}"
       echo "用户: ${user}"
-      echo "类型: $(node_type_name "$type" "$outbound_type" "$tag")"
+      echo "类型: ${type_disp}"
       echo "传输协议: ${protocol^^} / 端口: ${port}"
       if [ "$outbound_type" = "landing" ]; then
         echo "落地出口: ${landing_disp} (端口: ${landing_port})"
@@ -4047,18 +4556,20 @@ INFO
       if [[ "$type" == tuic* ]]; then echo "TUIC Password: ${tuic_pass}"; fi
       echo "$link"
       echo
-    } >> "$out_file"
-  done <<< "$(jq -r --arg selected "$selected_user" '
+    } >> "$tmp_out" || { rm -f "$tmp_out"; return 1; }
+  done < <(jq -r --arg selected "$selected_user" "$JQ_NODE_LIB"'
     . as $s |
     $s.nodes[]? as $n |
     (first($s.landings[]? | select(.id == ($n.landing_id // ""))) // {}) as $l |
     ($s.users[] | select(.enabled != false) | select($selected == "" or .name == $selected)) as $u |
-    [ $n.type, $n.tag, $n.name, ($n.port | tostring), ($n.protocol // "tcp"),
+    [ $n.type, $n.tag, $n.name, ($n.port | tostring),
+      ($n.protocol // (if $n.type | startswith("tuic") then "udp" else "tcp" end)),
       ($n.outbound_type // "direct"), ($l.display // "-"), (($l.port // "-") | tostring),
-      $u.name, $u.uuid, $u.tuic_pass, (($n.name + "-" + $u.name) | @uri) ] | @tsv
-  ' "$STATE_FILE")"
+      $u.name, $u.uuid, $u.tuic_pass, (($n.name + "-" + $u.name) | @uri),
+      node_type_name_for($s; $n) ] | join("\u001f")
+  ' "$STATE_FILE")
 
-  chmod 600 "$out_file"
+  mv -f "$tmp_out" "$out_file" || { rm -f "$tmp_out"; return 1; }
   return 0
 }
 
@@ -4074,12 +4585,13 @@ render_yaml() {
   fi
 
   local public_key short_id reality_sni tuic_sni server_ip
-  local type name port user uuid tuic_pass proxy_name
+  local type name port user uuid tuic_pass proxy_name tmp_out out_dir
   local -a names=()
+  local -A used_names=()
   local q_server q_uuid q_pass q_rsni q_tsni q_pbk q_sid
 
   state_read '.public_key, .short_id, .reality_sni, .tuic_sni, .server_ip' \
-    public_key short_id reality_sni tuic_sni server_ip
+    public_key short_id reality_sni tuic_sni server_ip || return 1
 
   q_server="$(yaml_quote "$server_ip")"
   q_rsni="$(yaml_quote "$reality_sni")"
@@ -4087,7 +4599,12 @@ render_yaml() {
   q_pbk="$(yaml_quote "$public_key")"
   q_sid="$(yaml_quote "$short_id")"
 
-  cat > "$out_file" <<YAML
+  out_dir="$(dirname "$out_file")"
+  mkdir -p "$out_dir" || return 1
+  tmp_out="$(mktemp "${out_dir}/.ysq-yaml.${WORK_TAG}.XXXXXX")" || return 1
+  chmod 600 "$tmp_out" || { rm -f "$tmp_out"; return 1; }
+
+  cat > "$tmp_out" <<YAML || { rm -f "$tmp_out"; return 1; }
 mixed-port: 7890
 allow-lan: false
 mode: rule
@@ -4110,15 +4627,21 @@ proxies:
 YAML
 
   # 每个用户都有自己的 UUID / TUIC Password。同一个入口可以给多个用户生成独立订阅条目。
-  # 第一个用户的节点名保持原样，兼容已有的 Clash 代理组引用。
-  while IFS=$'\t' read -r type name port user uuid tuic_pass proxy_name; do
+  # 第一个用户的节点名保持原样，兼容已有的 Clash 代理组引用；全局去重避免 Clash 拒绝加载。
+  while IFS=$'\x1f' read -r type name port user uuid tuic_pass proxy_name; do
     [ -n "$type" ] || continue
-    names+=("$proxy_name")
+    local final_name="$proxy_name" dup_n=2
+    while [ -n "${used_names[$final_name]+x}" ]; do
+      final_name="${proxy_name}-${dup_n}"
+      dup_n=$((dup_n + 1))
+    done
+    used_names["$final_name"]=1
+    names+=("$final_name")
     q_uuid="$(yaml_quote "$uuid")"
     q_pass="$(yaml_quote "$tuic_pass")"
     if [[ "$type" == vless* ]]; then
       {
-        printf '  - name: %s\n' "$(yaml_quote "$proxy_name")"
+        printf '  - name: %s\n' "$(yaml_quote "$final_name")"
         cat <<YAML
     type: vless
     server: ${q_server}
@@ -4134,10 +4657,10 @@ YAML
       public-key: ${q_pbk}
       short-id: ${q_sid}
 YAML
-      } >> "$out_file"
+      } >> "$tmp_out" || { rm -f "$tmp_out"; return 1; }
     elif [[ "$type" == tuic* ]]; then
       {
-        printf '  - name: %s\n' "$(yaml_quote "$proxy_name")"
+        printf '  - name: %s\n' "$(yaml_quote "$final_name")"
         cat <<YAML
     type: tuic
     server: ${q_server}
@@ -4151,20 +4674,20 @@ YAML
     congestion-controller: bbr
     udp-relay-mode: native
 YAML
-      } >> "$out_file"
+      } >> "$tmp_out" || { rm -f "$tmp_out"; return 1; }
     fi
-  done <<< "$(jq -r --arg selected "$selected_user" '
+  done < <(jq -r --arg selected "$selected_user" '
     . as $s |
     $s.nodes[]? as $n |
     ($s.users | map(select(.enabled != false)) | to_entries[] | select($selected == "" or .value.name == $selected)) as $u |
     [$n.type, $n.name, ($n.port | tostring), $u.value.name, $u.value.uuid, $u.value.tuic_pass,
-     (if $selected != "" or $u.key == 0 then $n.name else $n.name + "-" + $u.value.name end)] | @tsv
-  ' "$STATE_FILE")"
+     (if $selected != "" or $u.key == 0 then $n.name else $n.name + "-" + $u.value.name end)] | join("\u001f")
+  ' "$STATE_FILE")
 
   if [ "${#names[@]}" -eq 0 ]; then
-    sed -i 's/^proxies:$/proxies: []/' "$out_file"
+    sed -i 's/^proxies:$/proxies: []/' "$tmp_out" || { rm -f "$tmp_out"; return 1; }
   fi
-  cat >> "$out_file" <<YAML
+  cat >> "$tmp_out" <<YAML || { rm -f "$tmp_out"; return 1; }
 
 proxy-groups:
   - name: PROXY
@@ -4173,10 +4696,10 @@ proxy-groups:
 YAML
 
   for name in "${names[@]}"; do
-    printf '      - %s\n' "$(yaml_quote "$name")" >> "$out_file"
+    printf '      - %s\n' "$(yaml_quote "$name")" >> "$tmp_out" || { rm -f "$tmp_out"; return 1; }
   done
 
-  cat >> "$out_file" <<YAML
+  cat >> "$tmp_out" <<YAML || { rm -f "$tmp_out"; return 1; }
       - DIRECT
 
 rules:
@@ -4184,7 +4707,7 @@ rules:
   - MATCH,PROXY
 YAML
 
-  chmod 600 "$out_file"
+  mv -f "$tmp_out" "$out_file" || { rm -f "$tmp_out"; return 1; }
   return 0
 }
 
@@ -4193,7 +4716,7 @@ render_all() {
   ensure_state_defaults || return 1
   ensure_tuic_cert || return 1
   if failover_configured; then
-    ensure_agent_python || return 1
+    ensure_failover_python || return 1
     # Install all fallible helper assets before replacing the active core config.
     install_failover_bundle || return 1
   fi
@@ -4219,32 +4742,42 @@ restart_and_status() {
   service_status
 }
 
-# 重新渲染 config.json（按 ysq-state.db）并重启；渲染失败不重启，重启失败恢复旧配置
+# 重新渲染 config.json（按 ysq-state.db）并重启；渲染失败不重启，重启失败恢复旧配置与旧状态
 rerender_and_restart() {
-  local bak_conf=""
+  local bak_conf="" bak_state=""
 
   state_write_guard || return $?
+  if [ -f "$STATE_FILE" ]; then
+    bak_state="$(mktemp "${STATE_FILE}.tmp.${WORK_TAG}.XXXXXX")" || { err "无法创建状态备份文件。"; return 1; }
+    if ! cp -p "$STATE_FILE" "$bak_state"; then
+      rm -f "$bak_state"
+      err "备份现有状态失败，未修改配置。"
+      return 1
+    fi
+  fi
   if [ -f "$CONFIG_FILE" ]; then
-    bak_conf="$(mktemp "${CONFIG_FILE}.tmp.${WORK_TAG}.XXXXXX")" || { err "无法创建备份文件。"; return 1; }
+    bak_conf="$(mktemp "${CONFIG_FILE}.tmp.${WORK_TAG}.XXXXXX")" || { rm -f "$bak_state"; err "无法创建备份文件。"; return 1; }
     if ! cp -p "$CONFIG_FILE" "$bak_conf"; then
-      rm -f "$bak_conf"
+      rm -f "$bak_state" "$bak_conf"
       err "备份现有配置失败，未修改配置。"
       return 1
     fi
   fi
 
   if ! render_all; then
+    [ -z "$bak_state" ] || mv -f "$bak_state" "$STATE_FILE" || warn "恢复状态备份失败：${bak_state}"
     if [ -n "$bak_conf" ]; then
       mv -f "$bak_conf" "$CONFIG_FILE" || { err "恢复配置备份失败：${bak_conf}"; return 1; }
     else
       rm -f "$CONFIG_FILE"
     fi
-    err "重新渲染失败，已恢复原配置，未重启。"
+    err "重新渲染失败，已恢复原配置与原状态，未重启。"
     return 1
   fi
 
   if ! restart_singbox; then
     err "用新配置重启失败，正在恢复旧配置..."
+    [ -z "$bak_state" ] || mv -f "$bak_state" "$STATE_FILE" || warn "恢复状态备份失败：${bak_state}"
     if [ -n "$bak_conf" ]; then
       mv -f "$bak_conf" "$CONFIG_FILE"
       restart_singbox || warn "旧配置也启动失败，请在面板里查看状态与日志。"
@@ -4252,6 +4785,7 @@ rerender_and_restart() {
     return 1
   fi
 
+  [ -z "$bak_state" ] || rm -f "$bak_state"
   [ -z "$bak_conf" ] || rm -f "$bak_conf"
   return 0
 }
@@ -4387,10 +4921,7 @@ show_logs() {
       fi
       ;;
     openrc|none)
-      if [ -s "$LOG_FILE" ]; then
-        echo "--- ${LOG_FILE} ---"
-        tail -n "$lines" "$LOG_FILE"
-      fi
+      warn "暂无 sing-box 日志文件（${LOG_FILE}）。"
       ;;
   esac
 
@@ -4417,8 +4948,11 @@ print_summary() {
 }
 
 install_panel_wrapper() {
-  mkdir -p "$(dirname "$PANEL_FILE")"
-  cat > "$PANEL_FILE" <<PANEL
+  local dir tmp
+  dir="$(dirname "$PANEL_FILE")"
+  mkdir -p "$dir" || return 1
+  tmp="$(mktemp "${dir}/.ysq-panel.${WORK_TAG}.XXXXXX")" || return 1
+  cat > "$tmp" <<PANEL || { rm -f "$tmp"; return 1; }
 #!/usr/bin/env bash
 if [ ! -f "$INSTALLER_FILE" ]; then
   echo "未找到主脚本文件: $INSTALLER_FILE，请重新运行安装脚本。" >&2
@@ -4426,7 +4960,8 @@ if [ ! -f "$INSTALLER_FILE" ]; then
 fi
 exec bash "$INSTALLER_FILE" panel "\$@"
 PANEL
-  chmod +x "$PANEL_FILE"
+  chmod 755 "$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$PANEL_FILE" || { rm -f "$tmp"; return 1; }
 }
 
 # 判断一个文件是不是「我们自己的脚本」：
@@ -4470,17 +5005,22 @@ save_self() {
     return 0
   fi
 
-  # 管道 / 进程替换运行时没有本地文件：从发布地址（默认 GitHub，可用环境变量 YSQ_SCRIPT_URL 覆盖）下载一份
+  # 管道 / 进程替换运行时没有本地文件：从发布地址（默认 GitHub，可用环境变量 YSQ_SCRIPT_URL 覆盖，仅允许 HTTPS）下载一份
+  local dl_url="${YSQ_SCRIPT_URL:-$DEFAULT_SCRIPT_URL}"
+  case "$dl_url" in
+    https://*) ;;
+    *) warn "拒绝从非 HTTPS 地址保存脚本：${dl_url}"; return 1 ;;
+  esac
   wd="$(new_work_dir)"
   tmp="${wd}/${INSTALLER_NAME}"
-  if curl -fsSL --connect-timeout 10 --max-time 60 -o "$tmp" "${YSQ_SCRIPT_URL:-$DEFAULT_SCRIPT_URL}" 2>/dev/null && is_ysq_script "$tmp"; then
+  if curl -fsSL --connect-timeout 10 --max-time 60 -o "$tmp" "$dl_url" 2>/dev/null && is_ysq_script "$tmp"; then
     install -m 755 "$tmp" "$INSTALLER_FILE"
     rm -rf "$wd"
     return 0
   fi
   rm -rf "$wd"
 
-  warn "当前通过管道 / 进程替换运行，没有本地脚本文件，且从 ${YSQ_SCRIPT_URL:-$DEFAULT_SCRIPT_URL} 下载失败，未能保存到 ${INSTALLER_FILE}，因此不会创建 ysq 快捷命令。"
+  warn "当前通过管道 / 进程替换运行，没有本地脚本文件，且从 ${dl_url} 下载失败，未能保存到 ${INSTALLER_FILE}，因此不会创建 ysq 快捷命令。"
   warn "如需 ysq 命令：先把脚本保存为文件再执行（curl -fsSLo ${INSTALLER_NAME} <脚本地址> && bash ${INSTALLER_NAME}）。"
   return 1
 }
@@ -4493,19 +5033,19 @@ do_uninstall() {
   flush_agent_traffic
   agent_service_disable
   stop_failover_service
-  service_stop
+  YSQ_SKIP_AGENT_FLUSH=1 service_stop
   service_disable
 
-  rm -f ${CORE_BIN_FILE}
+  rm -f "$CORE_BIN_FILE"
   rm -f "$GRPCURL_YSQ_BIN"
-  rm -f ${CORE_SYSTEMD_FILE}
-  rm -f ${CORE_OPENRC_FILE}
-  rm -f ${CORE_PID_FILE}
+  rm -f "$CORE_SYSTEMD_FILE"
+  rm -f "$CORE_OPENRC_FILE"
+  rm -f "$CORE_PID_FILE"
   remove_log_trim
   rm -f "$FAILOVER_FILE" "$FAILOVER_SYSTEMD_FILE" "$FAILOVER_OPENRC_FILE" "$FAILOVER_PID_FILE"
   rm -rf "$(dirname "$FAILOVER_STATUS_FILE")"
-  rm -rf ${CORE_DATA_DIR} ${CORE_LOG_DIR}
-  rm -f "$INFO_FILE" "$YAML_FILE" "$PANEL_FILE"
+  rm -rf "$CORE_DATA_DIR" "$CORE_LOG_DIR"
+  rm -f "$INFO_FILE" "$YAML_FILE" "$PANEL_FILE" "$LOG_LOCK_FILE"
   rm -f "$AGENT_FILE" "$AGENT_SYSTEMD_FILE" "$AGENT_OPENRC_FILE" "$AGENT_PID_FILE"
 
   if [ "$keep" = "1" ]; then
@@ -4518,7 +5058,7 @@ do_uninstall() {
     chmod 600 "$STATE_FILE" 2>/dev/null || true
   else
     rm -rf "$CONFIG_DIR" "$(dirname "$AGENT_CONFIG_FILE")" "$AGENT_DATA_DIR"
-    rm -f "$INSTALLER_FILE"
+    rm -f "$INSTALLER_FILE" "${INSTALLER_FILE}.bak"
   fi
 
   service_daemon_reload
@@ -4594,10 +5134,16 @@ update_panel_wizard() {
   step "更新面板"
 
   local url="${YSQ_SCRIPT_URL:-$DEFAULT_SCRIPT_URL}"
-  local wd tmp new_ver confirm_prompt confirm_default new_file bak
+  local wd tmp sums expect actual new_ver confirm_prompt confirm_default new_file bak
+
+  case "$url" in
+    https://*) ;;
+    *) die "更新地址必须使用 HTTPS：${url}" ;;
+  esac
 
   wd="$(new_work_dir)"
   tmp="${wd}/${INSTALLER_NAME}"
+  sums="${wd}/${INSTALLER_NAME}.sha256"
 
   info "当前面板版本：${YSQ_VERSION}"
   info "下载地址：${url}"
@@ -4605,6 +5151,23 @@ update_panel_wizard() {
   if ! curl -fsSL --connect-timeout 10 --max-time 60 -o "$tmp" "$url"; then
     rm -rf "$wd"
     die "下载失败，现有面板未改动。请检查网络或 GitHub 访问。"
+  fi
+  actual="$(sha256sum "$tmp" | awk '{print $1}')"
+  expect="${YSQ_SCRIPT_SHA256:-}"
+  if [ -z "$expect" ] && curl -fsSL --connect-timeout 10 --max-time 20 -o "$sums" "${url}.sha256" 2>/dev/null; then
+    expect="$(awk '{print $1; exit}' "$sums")"
+  fi
+  if [ -n "$expect" ]; then
+    if ! [[ "$expect" =~ ^[0-9a-fA-F]{64}$ ]] || [ "${expect,,}" != "${actual,,}" ]; then
+      rm -rf "$wd"
+      die "新脚本 SHA256 校验失败（期望 ${expect}，实际 ${actual}），已拒绝更新。"
+    fi
+    ok "新脚本 SHA256 校验通过。"
+  elif [ "${YSQ_REQUIRE_SHA256:-0}" = "1" ]; then
+    rm -rf "$wd"
+    die "已开启 YSQ_REQUIRE_SHA256=1，但未提供校验值或远端缺少 ${url}.sha256，已拒绝更新。"
+  else
+    warn "未发现配套 SHA256 校验文件，继续执行语法与标识校验（可设置 YSQ_SCRIPT_SHA256 或 YSQ_REQUIRE_SHA256=1 启用强制校验）。"
   fi
   if ! is_ysq_script "$tmp"; then
     rm -rf "$wd"
@@ -4645,7 +5208,7 @@ update_panel_wizard() {
 
   state_write_guard || return $?
   # 先写同目录临时文件再 mv：原子替换；当前正在运行的旧脚本仍持有旧 inode，不会被改乱
-  new_file="${INSTALLER_FILE}.new.$$"
+  new_file="${INSTALLER_FILE}.new.${WORK_TAG}"
   bak="${INSTALLER_FILE}.bak"
   install -m 755 "$tmp" "$new_file"
   if [ -f "$INSTALLER_FILE" ]; then
@@ -4793,6 +5356,9 @@ validate_cli_ports() {
     if [ "$name" = "vless" ] && [ "$((10#$val))" -eq "$V2RAY_API_PORT" ]; then
       die "TCP ${V2RAY_API_PORT} 已留给 V2Ray API，请使用其他 VLESS 端口。"
     fi
+    if [ "$name" = "vless" ] && [ "$((10#$val))" -eq "$FAILOVER_API_PORT" ]; then
+      die "TCP ${FAILOVER_API_PORT} 已留给主备切换 API，请使用其他 VLESS 端口。"
+    fi
   done
 }
 
@@ -4811,8 +5377,12 @@ install_wizard() {
   ensure_dirs
 
   # 已有状态文件：有效就沿用（不覆盖），无效则改名备份后当作全新安装
-  # 修改前先留一份 .prev，渲染 / 启动失败时恢复
-  local prev="${STATE_FILE}.prev.${WORK_TAG}" bad
+  # 修改前先留一份 .prev，渲染 / 启动失败时同步恢复 state 与 config.json
+  local prev="${STATE_FILE}.prev.${WORK_TAG}" prev_conf="${CONFIG_FILE}.prev.${WORK_TAG}" bad
+  if [ -f "$CONFIG_FILE" ]; then
+    cp -p "$CONFIG_FILE" "$prev_conf"
+    INSTALL_PREV_CONFIG="$prev_conf"
+  fi
   if [ -f "$STATE_FILE" ]; then
     cp -p "$STATE_FILE" "$prev"
     INSTALL_PREV_FILE="$prev"
@@ -4825,6 +5395,7 @@ install_wizard() {
       bad="${STATE_FILE}.invalid.$(date +%Y%m%d%H%M%S)"
       mv -f "$STATE_FILE" "$bad"
       rm -f "$prev"
+      INSTALL_PREV_FILE=""
       warn "已有的状态文件无效（不是合法 JSON 或缺少必需字段），已改名备份为 ${bad}，将按全新安装处理。"
       create_state_file
     fi
@@ -4837,7 +5408,13 @@ install_wizard() {
   if ! render_all; then
     if [ -f "$prev" ]; then
       mv -f "$prev" "$STATE_FILE"
+      INSTALL_PREV_FILE=""
       warn "已恢复安装前的状态文件。"
+    fi
+    if [ -f "$prev_conf" ]; then
+      mv -f "$prev_conf" "$CONFIG_FILE"
+      INSTALL_PREV_CONFIG=""
+      warn "已恢复安装前的配置文件。"
     fi
     die "配置生成失败，安装中止。"
   fi
@@ -4845,12 +5422,20 @@ install_wizard() {
   if ! restart_singbox; then
     if [ -f "$prev" ]; then
       mv -f "$prev" "$STATE_FILE"
-      warn "已恢复安装前的状态文件（配置文件请在 ysq 面板里选「重启 → 重新渲染后重启」重新生成）。"
+      INSTALL_PREV_FILE=""
+      warn "已恢复安装前的状态文件。"
+    fi
+    if [ -f "$prev_conf" ]; then
+      mv -f "$prev_conf" "$CONFIG_FILE"
+      INSTALL_PREV_CONFIG=""
+      warn "已恢复安装前的配置文件。"
     fi
     die "sing-box 启动失败，请根据上方日志排查。"
   fi
 
-  rm -f "$prev"
+  rm -f "$prev" "$prev_conf"
+  INSTALL_PREV_FILE=""
+  INSTALL_PREV_CONFIG=""
   if save_self; then
     install_panel_wrapper
     PANEL_READY=1
@@ -4898,6 +5483,8 @@ class Monitor:
         self.config_path, self.status_path = Path(config_path), Path(status_path)
         self.counters = {}
         self.fingerprint = None
+        self.config_sig = None
+        self.cached_config = None
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         self.base = ""
         self.secret = ""
@@ -4942,7 +5529,12 @@ class Monitor:
                 os.unlink(name)
 
     def cycle(self):
-        config = json.loads(self.config_path.read_text(encoding="utf-8"))
+        st = self.config_path.stat()
+        sig = (st.st_mtime_ns, st.st_size)
+        if sig != self.config_sig or self.cached_config is None:
+            self.cached_config = json.loads(self.config_path.read_text(encoding="utf-8"))
+            self.config_sig = sig
+        config = self.cached_config
         selectors = [item for item in config.get("outbounds", [])
                      if item.get("type") == "selector" and item.get("tag", "").startswith("failover-")]
         if not selectors:
@@ -4955,7 +5547,8 @@ class Monitor:
         if not separator or host != "127.0.0.1" or not port.isdigit() or not api.get("secret"):
             raise ControllerError("missing authenticated loopback controller")
         self.base, self.secret = "http://" + controller, api["secret"]
-        fingerprint = json.dumps(config, sort_keys=True, separators=(",", ":"))
+        # 仅对主备 selector 与 clash_api 计算指纹，增删用户不重置故障切换计数器
+        fingerprint = json.dumps({"selectors": selectors, "controller": controller}, sort_keys=True, separators=(",", ":"))
         if fingerprint != self.fingerprint:
             self.counters.clear()
             self.fingerprint = fingerprint
@@ -5034,10 +5627,13 @@ install_failover_bundle() {
   wd="$(new_work_dir)"
   py="$(command -v python3)"
   mkdir -p "$(dirname "$FAILOVER_FILE")" "$(dirname "$FAILOVER_STATUS_FILE")" || return 1
-  chmod 700 "$(dirname "$FAILOVER_STATUS_FILE")" || return 1
+  chmod 750 "$(dirname "$FAILOVER_STATUS_FILE")" || return 1
+  if id sing-box >/dev/null 2>&1; then
+    chown -R sing-box:sing-box "$(dirname "$FAILOVER_STATUS_FILE")" 2>/dev/null || true
+  fi
   write_failover_worker > "$wd/worker" || return 1
   python3 -c 'import sys; compile(open(sys.argv[1],encoding="utf-8").read(),sys.argv[1],"exec")' "$wd/worker" || return 1
-  if ! install_if_changed "$wd/worker" "$FAILOVER_FILE" 700; then
+  if ! install_if_changed "$wd/worker" "$FAILOVER_FILE" 755; then
     [ -s "$FAILOVER_FILE" ] && cmp -s "$wd/worker" "$FAILOVER_FILE" || return 1
   fi
   case "$SERVICE_MANAGER" in
@@ -5049,7 +5645,8 @@ After=network-online.target sing-box.service
 Wants=network-online.target
 [Service]
 Type=simple
-User=root
+User=sing-box
+Group=sing-box
 UMask=0077
 ExecStart=${py} ${FAILOVER_FILE} ${CONFIG_FILE} ${FAILOVER_STATUS_FILE}
 Restart=on-failure
@@ -5071,10 +5668,11 @@ EOF
 description="YSQ preferred landing failover monitor"
 command="${py}"
 command_args="${FAILOVER_FILE} ${CONFIG_FILE} ${FAILOVER_STATUS_FILE}"
+command_user="sing-box:sing-box"
 command_background="yes"
 pidfile="${FAILOVER_PID_FILE}"
-output_log="/dev/null"
-error_log="/dev/null"
+output_log="${CORE_LOG_DIR}/ysq-failover.log"
+error_log="${CORE_LOG_DIR}/ysq-failover.log"
 umask="0077"
 retry="TERM/15/KILL/5"
 depend() {
@@ -5093,8 +5691,8 @@ EOF
 
 stop_failover_service() {
   case "$SERVICE_MANAGER" in
-    systemd) systemctl disable --now ysq-failover >/dev/null 2>&1 || true ;;
-    openrc) rc-service ysq-failover stop >/dev/null 2>&1 || true; rc-update del ysq-failover default >/dev/null 2>&1 || true ;;
+    systemd) systemctl disable --now ysq-failover 9>&- >/dev/null 2>&1 || true ;;
+    openrc) rc-service ysq-failover stop 9>&- >/dev/null 2>&1 || true; rc-update del ysq-failover default >/dev/null 2>&1 || true ;;
     none)
       if [ -f "$FAILOVER_PID_FILE" ]; then
         local pid
@@ -5243,8 +5841,8 @@ except (OSError, subprocess.TimeoutExpired):
 
 write_embedded_agent() {
   cat <<'YSQ_AGENT_PY'
-# BEGIN_EMBEDDED_AGENT
 #!/usr/bin/env python3
+# BEGIN_EMBEDDED_AGENT
 """YSQ node agent. Python 3.9+, standard library only.
 
 Configuration and the SQLite ledger are private local files.  The collector never
@@ -5280,7 +5878,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-VERSION = "2026.10.24.2"
+VERSION = "2026.11.25.1"
 PROTOCOL = 1
 SAMPLE_SECONDS = 10
 SYNC_SECONDS = 15
@@ -5457,9 +6055,16 @@ def validate_origin(value, allow_loopback_http=False):
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
 
 
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise urllib.error.HTTPError(req.full_url, code, "Agent refuses HTTP redirects", headers, fp)
+_SSL_LOCK = threading.Lock()
+_SSL_CONTEXT = None
+
+
+def shared_ssl_context():
+    global _SSL_CONTEXT
+    with _SSL_LOCK:
+        if _SSL_CONTEXT is None:
+            _SSL_CONTEXT = ssl.create_default_context()
+        return _SSL_CONTEXT
 
 
 class Transport:
@@ -5467,40 +6072,86 @@ class Transport:
         self.origin = validate_origin(origin, allow_loopback_http)
         self.token = token
         self.timeout = timeout
-        self.opener = urllib.request.build_opener(
-            urllib.request.ProxyHandler({}),
-            urllib.request.HTTPSHandler(context=ssl.create_default_context()), NoRedirect())
+        parsed = urllib.parse.urlsplit(self.origin)
+        self._scheme = parsed.scheme
+        self._host = parsed.hostname
+        self._port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        self._netloc = parsed.netloc
+        self._local = threading.local()
+
+    def close(self):
+        conn = getattr(self._local, "conn", None)
+        self._local.conn = None
+        self._local.reused = False
+        if conn is not None:
+            with contextlib.suppress(Exception):
+                conn.close()
+
+    def _get_conn(self):
+        conn = getattr(self._local, "conn", None)
+        if conn is not None and getattr(conn, "sock", None) is not None:
+            conn.timeout = self.timeout
+            with contextlib.suppress(OSError):
+                conn.sock.settimeout(self.timeout)
+            self._local.reused = True
+            return conn
+        self.close()
+        if self._scheme == "https":
+            conn = http.client.HTTPSConnection(self._host, self._port, timeout=self.timeout,
+                                               context=shared_ssl_context())
+        else:
+            conn = http.client.HTTPConnection(self._host, self._port, timeout=self.timeout)
+        self._local.conn = conn
+        self._local.reused = False
+        return conn
 
     def post(self, path, body, authenticated=True):
         if path not in ("/api/agent/register", "/api/agent/sync", "/api/agent/detach", "/api/agent/wait", "/api/agent/activity"):
             raise AgentError("Unsupported agent endpoint")
-        data = canonical(body).encode("utf-8")
-        if len(data) > MAX_BODY:
+        payload = canonical(body).encode("utf-8")
+        if len(payload) > MAX_BODY:
             raise AgentError("Agent request exceeds 2 MiB")
-        headers = {"Content-Type": "application/json", "Accept": "application/json",
+        headers = {"Host": self._netloc, "Content-Type": "application/json", "Accept": "application/json",
+                   "Content-Length": str(len(payload)), "Connection": "keep-alive",
                    "User-Agent": "ysq-agent/" + VERSION}
         if authenticated:
             if not self.token:
                 raise AgentError("No node credential is configured")
             headers["Authorization"] = "Bearer " + self.token
-        request = urllib.request.Request(self.origin + path, data=data, headers=headers, method="POST")
-        try:
-            with self.opener.open(request, timeout=self.timeout) as response:
-                data = response.read(MAX_BODY + 1)
-        except urllib.error.HTTPError as exc:
-            if 300 <= exc.code < 400:
-                raise TransportError("Center redirected the request; redirects are refused", exc.code) from exc
+        raw = b""
+        for attempt in range(2):
+            conn = self._get_conn()
+            was_reused = getattr(self._local, "reused", False)
             try:
-                detail = json.loads(exc.read(4096)).get("error", "Request rejected")
-            except (ValueError, AttributeError):
-                detail = "Request rejected"
-            raise TransportError("Center HTTP %d: %s" % (exc.code, detail), exc.code) from exc
-        except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError) as exc:
-            raise TransportError("HTTPS request failed: " + str(exc)) from exc
-        if len(data) > MAX_BODY:
+                conn.request("POST", path, body=payload, headers=headers)
+                response = conn.getresponse()
+                status = response.status
+                if 300 <= status < 400:
+                    self.close()
+                    raise TransportError("Center redirected the request; redirects are refused", status)
+                if status < 200 or status >= 300:
+                    err_raw = response.read(4096)
+                    self.close()
+                    try:
+                        detail = json.loads(err_raw).get("error", "Request rejected")
+                    except (ValueError, AttributeError):
+                        detail = "Request rejected"
+                    raise TransportError("Center HTTP %d: %s" % (status, detail), status)
+                raw = response.read(MAX_BODY + 1)
+                if len(raw) > MAX_BODY or response.will_close:
+                    self.close()
+                break
+            except TransportError:
+                raise
+            except (urllib.error.URLError, http.client.HTTPException, TimeoutError, socket.timeout, ssl.SSLError, OSError) as exc:
+                self.close()
+                if was_reused and attempt == 0:
+                    continue
+                raise TransportError("HTTPS request failed: " + str(exc)) from exc
+        if len(raw) > MAX_BODY:
             raise TransportError("Center response exceeds 2 MiB")
         try:
-            result = json.loads(data)
+            result = json.loads(raw)
         except ValueError as exc:
             raise TransportError("Center did not return valid JSON") from exc
         if not isinstance(result, dict) or result.get("protocol") != PROTOCOL:
@@ -5510,31 +6161,26 @@ class Transport:
 
 def run_process(args, timeout, config=None, termination_grace=5):
     """Run a fixed local command; timeout also terminates all of its children."""
-    with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
-        process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=out, stderr=err,
-                                   start_new_session=True, close_fds=True)
+    process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, start_new_session=True, close_fds=True)
+    try:
+        output, err_bytes = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGTERM)
         try:
-            process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired as exc:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGTERM)
-            try:
-                process.wait(timeout=termination_grace)
-            except subprocess.TimeoutExpired:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(process.pid, signal.SIGKILL)
-                process.wait(timeout=1)
-            # A shell can exit before a descendant; finish cleaning its group.
+            process.communicate(timeout=termination_grace)
+        except subprocess.TimeoutExpired:
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(process.pid, signal.SIGKILL)
-            raise AgentError("Local helper timed out; its process group was terminated; "
-                             "configuration must be checked on the next sync") from exc
-        out.seek(0)
-        output = out.read(MAX_BODY + 1)
-        err.seek(0, os.SEEK_END)
-        size = err.tell()
-        err.seek(max(0, size - 8192))
-        errors = err.read().decode("utf-8", "replace")
+            with contextlib.suppress(Exception):
+                process.communicate(timeout=1)
+        # A shell can exit before a descendant; finish cleaning its group.
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        raise AgentError("Local helper timed out; its process group was terminated; "
+                         "configuration must be checked on the next sync") from exc
+    errors = err_bytes[-8192:].decode("utf-8", "replace")
     if process.returncode != 0:
         raise AgentError("Local command failed (%d): %s" % (process.returncode, redact(errors, config)))
     if len(output) > MAX_BODY:
@@ -5606,6 +6252,7 @@ class Ledger:
         finally:
             os.close(fd)
         with self.connect() as db:
+            db.execute("PRAGMA journal_mode=WAL")
             db.executescript('''
               CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
               CREATE TABLE IF NOT EXISTS aliases (
@@ -5625,14 +6272,15 @@ class Ledger:
                 epoch TEXT NOT NULL, seq INTEGER NOT NULL, payload TEXT NOT NULL, created_at INTEGER NOT NULL,
                 PRIMARY KEY(epoch, seq));
             ''')
+            db.execute("BEGIN IMMEDIATE")
             db.execute("INSERT OR IGNORE INTO meta VALUES ('epoch', ?)", (canonical(str(uuid.uuid4())),))
             db.execute("INSERT OR IGNORE INTO meta VALUES ('next_seq', '1')")
             db.execute("INSERT OR IGNORE INTO meta VALUES ('applied_revision', '0')")
             db.execute("INSERT OR IGNORE INTO meta VALUES ('last_packaged_at', '0')")
         os.chmod(self.path, 0o600)
 
-    def connect(self):
-        return database_connection(self.path)
+    def connect(self, write=False):
+        return database_connection(self.path, write=write)
 
     @staticmethod
     def get(db, key, default=None):
@@ -5649,12 +6297,14 @@ class Ledger:
             return self.get(db, key, default)
 
     def set_meta(self, **values):
-        with self.connect() as db:
+        with self.connect(write=True) as db:
             for key, value in values.items():
                 self.put(db, key, value)
 
     def remember(self, entries):
-        with self.connect() as db:
+        if not entries:
+            return
+        with self.connect(write=True) as db:
             for stats_key, user_id, baseline_required in entries:
                 old = db.execute("SELECT user_id FROM aliases WHERE stats_key=?", (stats_key,)).fetchone()
                 if old and old[0] != user_id:
@@ -5667,14 +6317,18 @@ class Ledger:
             return [dict(row) for row in db.execute("SELECT * FROM aliases")]
 
     def record(self, core_epoch, counters, sampled_at):
-        with self.connect() as db:
-            db.execute("BEGIN IMMEDIATE")
+        with self.connect(write=True) as db:
             rows = db.execute("SELECT * FROM aliases").fetchall()
+            baselines = {row["stats_key"]: row for row in db.execute("SELECT * FROM baselines")}
+            meta_rows = {row["key"]: json.loads(row["value"]) for row in db.execute(
+                "SELECT key, value FROM meta WHERE key IN ('collector_error', 'core_epoch', 'service_running')")}
+            baseline_updates, usage_updates, pending_updates = [], [], []
             added_up = added_down = 0
+            bucket = sampled_at // BATCH_SECONDS * BATCH_SECONDS
             for alias in rows:
                 key = alias["stats_key"]
                 counter = counters.get(key, {})
-                old = db.execute("SELECT * FROM baselines WHERE stats_key=?", (key,)).fetchone()
+                old = baselines.get(key)
                 up, down = counter.get("uplink", 0), counter.get("downlink", 0)
                 integer(up, "upload counter")
                 integer(down, "download counter")
@@ -5689,29 +6343,38 @@ class Ledger:
                     delta_up, delta_down = 0, 0
                 else:
                     delta_up, delta_down = up, down
-                db.execute("INSERT INTO baselines VALUES (?,?,?,?,?) ON CONFLICT(stats_key) DO UPDATE SET "
-                           "core_epoch=excluded.core_epoch,up=excluded.up,down=excluded.down,ts=excluded.ts",
-                           (key, core_epoch, up, down, sampled_at))
+                # Skip redundant row updates when neither core_epoch nor byte counters moved.
+                if not old or old["core_epoch"] != core_epoch or old["up"] != up or old["down"] != down:
+                    baseline_updates.append((key, core_epoch, up, down, sampled_at))
                 if delta_up or delta_down:
-                    db.execute("INSERT INTO usage VALUES (?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET "
-                               "up=usage.up+excluded.up,down=usage.down+excluded.down,last_at=excluded.last_at",
-                               (alias["user_id"], delta_up, delta_down, sampled_at))
-                    bucket = sampled_at // BATCH_SECONDS * BATCH_SECONDS
-                    db.execute("INSERT INTO pending_usage VALUES (?,?,?,?) ON CONFLICT(user_id,ts) DO UPDATE SET "
-                               "up=pending_usage.up+excluded.up,down=pending_usage.down+excluded.down",
-                               (alias["user_id"], bucket, delta_up, delta_down))
+                    usage_updates.append((alias["user_id"], delta_up, delta_down, sampled_at))
+                    pending_updates.append((alias["user_id"], bucket, delta_up, delta_down))
                     added_up += delta_up
                     added_down += delta_down
+            if baseline_updates:
+                db.executemany(
+                    "INSERT INTO baselines VALUES (?,?,?,?,?) ON CONFLICT(stats_key) DO UPDATE SET "
+                    "core_epoch=excluded.core_epoch,up=excluded.up,down=excluded.down,ts=excluded.ts",
+                    baseline_updates)
+            if usage_updates:
+                db.executemany(
+                    "INSERT INTO usage VALUES (?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET "
+                    "up=usage.up+excluded.up,down=usage.down+excluded.down,last_at=excluded.last_at",
+                    usage_updates)
+            if pending_updates:
+                db.executemany(
+                    "INSERT INTO pending_usage VALUES (?,?,?,?) ON CONFLICT(user_id,ts) DO UPDATE SET "
+                    "up=pending_usage.up+excluded.up,down=pending_usage.down+excluded.down",
+                    pending_updates)
             self.put(db, "last_sample_at", sampled_at)
-            self.put(db, "collector_error", "")
-            self.put(db, "core_epoch", core_epoch)
-            self.put(db, "service_running", True)
+            for m_key, m_val in (("collector_error", ""), ("core_epoch", core_epoch), ("service_running", True)):
+                if meta_rows.get(m_key) != m_val:
+                    self.put(db, m_key, m_val)
         return {"sampled_at": sampled_at, "up": added_up, "down": added_down}
 
     def package(self, now=None, force=False):
         now = int(time.time()) if now is None else int(now)
-        with self.connect() as db:
-            db.execute("BEGIN IMMEDIATE")
+        with self.connect(write=True) as db:
             if not force and now - self.get(db, "last_packaged_at", 0) < BATCH_SECONDS:
                 return 0
             count = 0
@@ -5755,8 +6418,9 @@ class Ledger:
             if key not in allowed:
                 raise TransportError("Center acknowledged a batch that was not sent")
             accepted.add(key)
-        with self.connect() as db:
-            db.executemany("DELETE FROM outbox WHERE epoch=? AND seq=?", list(accepted))
+        if accepted:
+            with self.connect(write=True) as db:
+                db.executemany("DELETE FROM outbox WHERE epoch=? AND seq=?", list(accepted))
         return len(accepted)
 
     def summary(self):
@@ -5774,17 +6438,21 @@ class Ledger:
 
 
 @contextlib.contextmanager
-def database_connection(path):
-    db = sqlite3.connect(path, timeout=4.0)
+def database_connection(path, write=False):
+    db = sqlite3.connect(path, timeout=4.0, isolation_level=None)
     db.row_factory = sqlite3.Row
+    db.execute("PRAGMA synchronous=NORMAL")
+    db.execute("PRAGMA busy_timeout=4000")
     try:
-        db.execute("PRAGMA journal_mode=WAL")
-        db.execute("PRAGMA synchronous=FULL")
-        db.execute("PRAGMA busy_timeout=4000")
+        if write:
+            db.execute("BEGIN IMMEDIATE")
         yield db
-        db.commit()
+        if db.in_transaction:
+            db.execute("COMMIT")
     except BaseException:
-        db.rollback()
+        if db.in_transaction:
+            with contextlib.suppress(sqlite3.Error):
+                db.execute("ROLLBACK")
         raise
     finally:
         db.close()
@@ -5807,8 +6475,11 @@ def probe_core(config):
             args = [part.decode("utf-8", "replace") for part in command if part]
             if not args or pathlib.Path(args[0]).name != "sing-box" or "run" not in args:
                 continue
-            configured = any(args[index] in ("-c", "--config") and index + 1 < len(args)
-                             and args[index + 1] == core_config for index in range(len(args)))
+            configured = any(
+                (args[index] in ("-c", "--config") and index + 1 < len(args) and args[index + 1] == core_config)
+                or args[index] == "--config=" + core_config
+                for index in range(len(args))
+            )
             if not configured:
                 continue
             raw = (entry / "stat").read_text()
@@ -5826,20 +6497,50 @@ def probe_core(config):
     return candidates[0]
 
 
+_PROTO_BYTES = PROTO.encode("utf-8")
+_PROTO_CACHE = {}
+_PROTO_LOCK = threading.Lock()
+
+
+def ensure_stats_proto(directory):
+    proto_path = pathlib.Path(directory) / "stats.proto"
+    key = str(proto_path)
+    with _PROTO_LOCK:
+        try:
+            st = os.lstat(proto_path)
+            sig = (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)
+            if not os.path.islink(proto_path) and st.st_size == len(_PROTO_BYTES):
+                if _PROTO_CACHE.get(key) == sig or proto_path.read_bytes() == _PROTO_BYTES:
+                    _PROTO_CACHE[key] = sig
+                    return str(directory), "stats.proto"
+        except OSError:
+            pass
+        fd, temp = tempfile.mkstemp(prefix=".stats-proto-", suffix=".tmp", dir=str(directory))
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                os.fchmod(stream.fileno(), 0o600)
+                stream.write(_PROTO_BYTES)
+            os.replace(temp, proto_path)
+            st = os.lstat(proto_path)
+            _PROTO_CACHE[key] = (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)
+        finally:
+            if os.path.exists(temp):
+                os.unlink(temp)
+        return str(directory), "stats.proto"
+
+
 def collect_counters(config):
     command = config.get("grpcurl_path", DEFAULT_GRPCURL)
     if not os.path.isabs(command) or not os.access(command, os.X_OK):
         raise CollectorError("grpcurl is not installed; repair the node agent installation")
     directory = private_parent(config["db_path"])
-    with tempfile.TemporaryDirectory(prefix=".stats-", dir=str(directory)) as temp:
-        proto_path = pathlib.Path(temp) / "stats.proto"
-        proto_path.write_text(PROTO, encoding="utf-8")
-        os.chmod(proto_path, 0o600)
-        output = run_process([command, "-plaintext", "-max-time", "3", "-import-path", temp,
-                              "-proto", "stats.proto", "-d", '{"reset":false}',
-                              "127.0.0.1:41453",
-                              "v2ray.core.app.stats.command.StatsService/QueryStats"], 4, config,
-                             termination_grace=0.5)
+    import_dir, proto_name = ensure_stats_proto(directory)
+    api_listen = config.get("v2ray_api_listen", "127.0.0.1:41453")
+    output = run_process([command, "-plaintext", "-max-time", "3", "-import-path", import_dir,
+                          "-proto", proto_name, "-d", '{"reset":false}',
+                          api_listen,
+                          "v2ray.core.app.stats.command.StatsService/QueryStats"], 4, config,
+                         termination_grace=0.5)
     try:
         response = json.loads(output)
     except ValueError as exc:
@@ -5891,16 +6592,25 @@ class ActivityCollector:
         scope = str(config.get("node_id") or "pending") + "@" + config["center_url"]
         suffix = hashlib.sha256(scope.encode()).hexdigest()[:12]
         self.path = config["db_path"] + ".activity-" + suffix + ".db"
+        self._json_cache = {}
+        self._aliases_sig = None
+        self._aliases_cache = {}
+        self._last_cursor = None
+        self._transport_cache = None
+        self._last_bound_at = 0
+        self._enqueued_since_bound = 0
         private_parent(self.path)
         with self.connect() as db:
             db.execute("PRAGMA auto_vacuum=INCREMENTAL")
+            db.execute("PRAGMA journal_mode=WAL")
             db.executescript('''
                 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS pending(id TEXT PRIMARY KEY,ts INTEGER NOT NULL,payload TEXT NOT NULL,bytes INTEGER NOT NULL);
                 CREATE INDEX IF NOT EXISTS pending_time ON pending(ts);
-                CREATE INDEX IF NOT EXISTS pending_size ON pending(bytes);
+                DROP INDEX IF EXISTS pending_size;
                 CREATE TABLE IF NOT EXISTS seen(id TEXT PRIMARY KEY,ts INTEGER NOT NULL);
                 CREATE TABLE IF NOT EXISTS contexts(id TEXT PRIMARY KEY,ts INTEGER NOT NULL,value TEXT NOT NULL);
+                CREATE INDEX IF NOT EXISTS contexts_time ON contexts(ts);
             ''')
         os.chmod(self.path, 0o600)
 
@@ -5908,7 +6618,7 @@ class ActivityCollector:
     def connect(self):
         db = sqlite3.connect(self.path, timeout=3, isolation_level=None)
         db.row_factory = sqlite3.Row
-        db.execute("PRAGMA synchronous=FULL")
+        db.execute("PRAGMA synchronous=NORMAL")
         db.execute("PRAGMA busy_timeout=3000")
         # The queue has a 16 MiB payload budget; this also bounds ancillary pages.
         db.execute("PRAGMA max_page_count=12288")
@@ -5976,6 +6686,7 @@ class ActivityCollector:
         payload = canonical(event)
         if db.execute("INSERT OR IGNORE INTO seen VALUES(?,?)", (event["id"], event["ts"])).rowcount:
             db.execute("INSERT OR IGNORE INTO pending VALUES(?,?,?,?)", (event["id"], event["ts"], payload, len(payload.encode("utf-8"))))
+            self._enqueued_since_bound += 1
 
     def gap(self, db, reason, ts):
         Ledger.put(db, "gaps", Ledger.get(db, "gaps", 0) + 1)
@@ -6028,35 +6739,81 @@ class ActivityCollector:
         dropped = db.execute("DELETE FROM pending WHERE ts<?", (ts - 7 * 86400,)).rowcount
         count, size = db.execute("SELECT COUNT(*),COALESCE(SUM(bytes),0) FROM pending").fetchone()
         if count > self.MAX_PENDING or size > self.MAX_QUEUE_BYTES:
+            to_delete = []
             for row in db.execute("SELECT id,bytes FROM pending ORDER BY ts,rowid").fetchall():
                 if count <= self.MAX_PENDING - 1 and size <= self.MAX_QUEUE_BYTES - 2048:
                     break
-                db.execute("DELETE FROM pending WHERE id=?", (row["id"],))
+                to_delete.append((row["id"],))
                 dropped += 1
                 count -= 1
                 size -= row["bytes"]
+            if to_delete:
+                db.executemany("DELETE FROM pending WHERE id=?", to_delete)
         if dropped:
             Ledger.put(db, "dropped", Ledger.get(db, "dropped", 0) + dropped)
             self.gap(db, "本地行为缓存达到容量或 7 天期限，丢弃 %d 条记录" % dropped, ts)
         db.execute("DELETE FROM seen WHERE rowid IN (SELECT rowid FROM seen ORDER BY rowid DESC LIMIT -1 OFFSET 40000)")
         db.execute("DELETE FROM contexts WHERE ts<?", (ts - 900,))
         db.execute("DELETE FROM contexts WHERE rowid IN (SELECT rowid FROM contexts ORDER BY ts DESC LIMIT -1 OFFSET 4000)")
+        self._last_bound_at = ts
+        self._enqueued_since_bound = 0
+
+    def _read_json_cached(self, path):
+        st = os.stat(path)
+        sig = (st.st_mtime_ns, st.st_size)
+        cached = self._json_cache.get(path)
+        if cached and cached[0] == sig:
+            return cached[1]
+        data = read_json(path)
+        self._json_cache[path] = (sig, data)
+        return data
 
     def collect_once(self):
-        config = read_json(self.config_path)
+        config = self._read_json_cached(self.config_path)
         if config.get("detached") or config.get("detaching") or config.get("status") != "active":
             return False
-        aliases = self.aliases(config)
         path = config.get("activity_log_path", system_path("/var/log/sing-box/sing-box.log"))
+        state_path = config.get("state_path", DEFAULT_STATE)
         ts = int(time.time())
         core_path = config.get("activity_core_config_path", system_path("/etc/sing-box/config.json"))
         if os.path.isfile(core_path):
-            log_config = read_json(core_path).get("log", {})
-            if (log_config.get("disabled") or log_config.get("level", "info") not in ("info", "debug", "trace")
+            log_config = self._read_json_cached(core_path).get("log", {})
+            level = log_config.get("level", "info")
+            if level == "warn" and os.path.isfile(state_path):
+                if self._read_json_cached(state_path).get("management", {}).get("mode") != "managed":
+                    return False
+            if (log_config.get("disabled") or level not in ("info", "debug", "trace")
                     or log_config.get("output") != path or log_config.get("timestamp") is not True):
                 raise AgentError("行为日志未启用：请升级 VPS 脚本，使用 info 文件日志并开启 timestamp")
-        with file_lock(self.path + ".read.lock", timeout=0.2):
-            with open(path, "rb") as stream, self.transaction() as db:
+        # 快速路径：日志文件不存在，或无变化且未达裁剪阈值时避免每秒开 SQLite 事务
+        try:
+            quick_stat = os.stat(path)
+            if (self._last_cursor
+                    and self._last_cursor[0] == [quick_stat.st_dev, quick_stat.st_ino, path]
+                    and self._last_cursor[1] == quick_stat.st_size
+                    and self._last_cursor[2] == quick_stat.st_mtime_ns
+                    and quick_stat.st_size < self.MAX_RAW_BYTES):
+                return False
+        except FileNotFoundError:
+            return False
+        try:
+            st_cfg = os.stat(self.config_path)
+            st_state = os.stat(state_path)
+            st_db = os.stat(config["db_path"])
+            a_sig = (st_cfg.st_mtime_ns, st_state.st_mtime_ns, st_db.st_mtime_ns)
+        except OSError:
+            a_sig = None
+        if a_sig is None or a_sig != self._aliases_sig:
+            self._aliases_cache = self.aliases(config)
+            self._aliases_sig = a_sig
+        aliases = self._aliases_cache
+        lock_path = config.get("log_lock_path", system_path("/run/ysq-log.lock"))
+        with file_lock(lock_path, timeout=0.2):
+            try:
+                stream_ctx = open(path, "rb")
+            except FileNotFoundError:
+                return False
+            with stream_ctx as stream, self.transaction() as db:
                 stat = os.fstat(stream.fileno())
                 identity = [stat.st_dev, stat.st_ino, path]
                 cursor = Ledger.get(db, "cursor", {})
@@ -6090,15 +6847,17 @@ class ActivityCollector:
                 Ledger.put(db, "cursor", {"identity": identity, "session": session, "offset": offset, "anchor": anchor})
                 Ledger.put(db, "collected_at", ts)
                 Ledger.put(db, "error", "")
-                self.bound_queue(db, ts)
+                if ts - self._last_bound_at >= 15 or self._enqueued_since_bound >= 500:
+                    self.bound_queue(db, ts)
                 caught_up = offset >= stat.st_size
+                self._last_cursor = (identity, offset, stat.st_mtime_ns)
             # Parsed records are durable before raw bytes are discarded. The
             # writer can race copytruncate; disclose this conservative gap.
             if caught_up and stat.st_size >= self.MAX_RAW_BYTES:
-                self.trim(path, identity)
+                self.trim(path, identity, session)
         return not caught_up
 
-    def trim(self, path, identity):
+    def trim(self, path, identity, session=None):
         with open(path, "r+b") as stream:
             stat = os.fstat(stream.fileno())
             if [stat.st_dev, stat.st_ino, path] != identity or stat.st_size < self.MAX_RAW_BYTES:
@@ -6114,6 +6873,15 @@ class ActivityCollector:
             stream.truncate(len(tail))
             stream.flush()
             os.fsync(stream.fileno())
+            new_offset = len(tail)
+            new_anchor = hashlib.sha256(tail[max(0, new_offset - 128):]).hexdigest()
+            new_stat = os.fstat(stream.fileno())
+            with self.transaction() as db:
+                cur = Ledger.get(db, "cursor", {})
+                cur_session = session or cur.get("session") or uuid.uuid4().hex
+                Ledger.put(db, "cursor", {"identity": identity, "session": cur_session,
+                                          "offset": new_offset, "anchor": new_anchor})
+            self._last_cursor = (identity, new_offset, new_stat.st_mtime_ns)
 
     def set_error(self, error):
         with self.transaction() as db:
@@ -6125,23 +6893,32 @@ class ActivityCollector:
                     **{key: Ledger.get(db, key, "" if key == "error" else 0)
                        for key in ("collected_at", "dropped", "gaps", "error")}}
 
+    def _transport(self, config, allow_loopback_http):
+        key = (config["center_url"], config.get("node_token"), allow_loopback_http)
+        if self._transport_cache is None or self._transport_cache[0] != key:
+            if self._transport_cache is not None:
+                self._transport_cache[1].close()
+            self._transport_cache = (key, Transport(*key))
+        return self._transport_cache[1]
+
     def upload_once(self, transport=None, allow_loopback_http=False):
         config = read_json(self.config_path)
         if config.get("detached") or config.get("detaching") or config.get("status") != "active":
             return 0
         with self.connect() as db:
             events = [json.loads(row[0]) for row in db.execute("SELECT payload FROM pending ORDER BY ts,rowid LIMIT 400")]
-        transport = transport or Transport(config["center_url"], config.get("node_token"), allow_loopback_http)
+        transport = transport or self._transport(config, allow_loopback_http)
         response = transport.post("/api/agent/activity", {"protocol": PROTOCOL, "node_id": config["node_id"],
                                                         "events": events, "status": self.status()})
         ack = response.get("ack")
         sent = {event["id"] for event in events}
         if not isinstance(ack, list) or any(not isinstance(eid, str) or eid not in sent for eid in ack):
             raise TransportError("Invalid activity acknowledgement")
-        with self.transaction() as db:
-            db.executemany("DELETE FROM pending WHERE id=?", ((eid,) for eid in ack))
-        with self.connect() as db:
-            db.execute("PRAGMA incremental_vacuum(128)")
+        if ack:
+            with self.transaction() as db:
+                db.executemany("DELETE FROM pending WHERE id=?", ((eid,) for eid in ack))
+            with self.connect() as db:
+                db.execute("PRAGMA incremental_vacuum(128)")
         return len(ack)
 
 
@@ -6156,6 +6933,7 @@ class Agent:
         validate_origin(self.config["center_url"], allow_loopback_http)
         self.ledger = Ledger(self.config["db_path"])
         self.transport_override = transport
+        self._transports = {}
         self.collector = collector or collect_counters
         self.core_probe = core_probe or probe_core
         self.helper_runner = helper_runner or helper
@@ -6171,8 +6949,18 @@ class Agent:
         atomic_json(self.config_path, self.config)
 
     def transport(self, timeout=12):
-        return self.transport_override or Transport(self.config["center_url"], self.config.get("node_token"),
-                                                     self.allow_loopback_http, timeout=timeout)
+        if self.transport_override is not None:
+            return self.transport_override
+        key = (self.config["center_url"], self.config.get("node_token"), self.allow_loopback_http, timeout)
+        cached = self._transports.get(key)
+        if cached is None:
+            if len(self._transports) >= 4:
+                for old in self._transports.values():
+                    old.close()
+                self._transports.clear()
+            cached = Transport(*key)
+            self._transports[key] = cached
+        return cached
 
     def state(self):
         return read_json(self.config.get("state_path", DEFAULT_STATE))
@@ -6182,11 +6970,13 @@ class Agent:
         result = []
         for node in state.get("nodes", []):
             kind = str(node.get("type", ""))
+            is_tuic = kind.startswith("tuic")
             item = {key: node.get(key, "") for key in ("name", "tag", "type", "port")}
-            item.update(server=state.get("server_ip", ""),
-                        sni=state.get("tuic_sni" if kind.startswith("tuic") else "reality_sni", ""),
-                        public_key=state.get("public_key", ""), short_id=state.get("short_id", ""),
-                        skip_cert_verify=kind.startswith("tuic"))
+            item.update(server=state.get("server_ip") or "",
+                        sni=(state.get("tuic_sni") if is_tuic else state.get("reality_sni")) or "",
+                        public_key="" if is_tuic else (state.get("public_key") or ""),
+                        short_id="" if is_tuic else (state.get("short_id") or ""),
+                        skip_cert_verify=is_tuic)
             result.append(item)
         return result
 
@@ -6550,7 +7340,7 @@ class Agent:
                     except LockBusy:
                         pass
                     except (AgentError, OSError, ValueError, sqlite3.Error) as exc:
-                        log("Collector: " + str(exc), self.config)
+                        log("Collector: " + str(exc), sampling_agent.config)
                     stop.wait(max(0.1, SAMPLE_SECONDS - (time.monotonic() - start)))
 
             def watch_changes():
@@ -6574,12 +7364,12 @@ class Agent:
                             stop.wait(0.5)
                     except TransportError as exc:
                         if exc.status in (404, 405):
-                            log("Center has no change listener; keeping 15-second sync", self.config)
+                            log("Center has no change listener; keeping 15-second sync", waiting_agent.config)
                             break
-                        log("Change listener: " + str(exc), self.config)
+                        log("Change listener: " + str(exc), waiting_agent.config)
                         stop.wait(3)
                     except (AgentError, OSError, ValueError, sqlite3.Error) as exc:
-                        log("Change listener: " + str(exc), self.config)
+                        log("Change listener: " + str(exc), waiting_agent.config)
                         stop.wait(3)
 
             def activity_worker(upload=False):
@@ -6708,7 +7498,11 @@ def join(config_path, url, code, name=None, script=None, allow_loopback_http=Fal
             if not isinstance(inbound, dict):
                 raise AgentError("Invalid inbound inventory")
             port = integer(inbound.get("port"), "inbound port", 1, 65535)
-            clean = {key: str(inbound.get(key, ""))[:253] for key in ("name", "tag", "type", "server", "sni", "public_key", "short_id")}
+            is_tuic = str(inbound.get("type") or "").startswith("tuic")
+            clean = {key: str(inbound.get(key) or "")[:253] for key in ("name", "tag", "type", "server", "sni", "public_key", "short_id")}
+            if is_tuic:
+                clean["public_key"] = ""
+                clean["short_id"] = ""
             clean["skip_cert_verify"] = bool(inbound.get("skip_cert_verify", False))
             clean["port"] = port
             inbounds.append(clean)
@@ -6734,7 +7528,8 @@ def main(argv=None):
         commands.add_parser(command)
     joining = commands.add_parser("join")
     joining.add_argument("--url", required=True)
-    joining.add_argument("--code", required=True)
+    joining.add_argument("--code")
+    joining.add_argument("--code-stdin", action="store_true")
     joining.add_argument("--name")
     joining.add_argument("--script")
     detaching = commands.add_parser("detach")
@@ -6742,7 +7537,10 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         if args.command == "join":
-            result = join(args.config, args.url, args.code, args.name, args.script, args.allow_loopback_http)
+            join_code = sys.stdin.read(512).strip() if args.code_stdin else (args.code or "")
+            if not join_code:
+                raise AgentError("Missing join code")
+            result = join(args.config, args.url, join_code, args.name, args.script, args.allow_loopback_http)
         elif args.command == "status" and not os.path.isfile(args.config):
             result = {"version": VERSION, "status": "standalone", "configured": False}
         else:
@@ -6774,14 +7572,38 @@ if __name__ == "__main__":
 YSQ_AGENT_PY
 }
 
+ensure_python3_installed() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    [ -z "$YSQ_TEST_ROOT" ] || { err "隔离测试需要 Python 3。"; return 1; }
+    pkg_update
+    pkg_install python3 || return 1
+  fi
+}
+
+ensure_landing_python() {
+  ensure_python3_installed || return 1
+  if ! python3 -c 'import base64, ipaddress, json, re, sys, urllib.parse, uuid; raise SystemExit(0 if sys.version_info >= (3,6) else 1)' >/dev/null 2>&1; then
+    err "落地参数解析需要 Python 3.6 或更新版本。"
+    return 1
+  fi
+}
+
+ensure_failover_python() {
+  ensure_python3_installed || return 1
+  if ! python3 -c 'import concurrent.futures, json, pathlib, tempfile, threading, urllib.request, sys; raise SystemExit(0 if sys.version_info >= (3,6) else 1)' >/dev/null 2>&1; then
+    err "主备切换需要 Python 3.6 或更新版本；其他单机功能不受影响。"
+    return 1
+  fi
+}
+
 ensure_agent_python() {
   if ! command -v python3 >/dev/null 2>&1; then
     [ -z "$YSQ_TEST_ROOT" ] || { err "隔离测试需要 Python 3.9+。"; return 1; }
     pkg_update
     pkg_install python3 || return 1
   fi
-  if ! python3 -c 'import sys, sqlite3, ssl; raise SystemExit(0 if sys.version_info >= (3,9) else 1)' >/dev/null 2>&1; then
-    err "中控 Agent / 主备切换需要 Python 3.9 或更新版本，以及 sqlite3/ssl 标准库；其他单机功能不受影响。"
+  if ! python3 -c 'import sys, sqlite3, ssl; raise SystemExit(0 if sys.version_info >= (3,9) and sqlite3.sqlite_version_info >= (3,24,0) else 1)' >/dev/null 2>&1; then
+    err "中控 Agent 需要 Python 3.9 或更新版本（含 sqlite3 >= 3.24 与 ssl 标准库）；单机功能、落地解析与主备切换不受影响。"
     return 1
   fi
 }
@@ -6859,8 +7681,8 @@ install_agent_bundle() {
 
 agent_service_stop() {
   case "$SERVICE_MANAGER" in
-    systemd) systemctl stop ysq-agent 2>/dev/null || true ;;
-    openrc) rc-service ysq-agent stop 2>/dev/null || true ;;
+    systemd) systemctl stop ysq-agent 9>&- 2>/dev/null || true ;;
+    openrc) rc-service ysq-agent stop 9>&- 2>/dev/null || true ;;
     test) rm -f "$AGENT_DATA_DIR/test-running" ;;
   esac
 }
@@ -6944,9 +7766,9 @@ agent_join_wizard() {
     return 1
   fi
   ( acquire_config_lock && install_agent_bundle ) || return 1
-  # Agent joins without holding the config lock; it reads local inventory.
-  if ! python3 "$AGENT_FILE" --config "$AGENT_CONFIG_FILE" join \
-    --url="$url" --code="$code" --script="$INSTALLER_FILE" >/dev/null; then
+  # Agent joins without holding the config lock; pass join code via stdin so it never appears in /proc/cmdline.
+  if ! printf '%s\n' "$code" | python3 "$AGENT_FILE" --config "$AGENT_CONFIG_FILE" join \
+    --url="$url" --code-stdin --script="$INSTALLER_FILE" >/dev/null; then
     if agent_binding_present; then
       agent_service_start || true
       warn "注册身份已在本机保存。如果是暂时的网络错误，Agent 会后台自动重试；请查看详细状态。"
@@ -6971,25 +7793,29 @@ agent_status_wizard() {
     err "无法读取 Agent 状态，请检查 ysq-agent 服务日志。"
     return 1
   }
-  center="$(jq -r '.center_url // "-"' <<<"$status")"
-  node_id="$(jq -r '.node_id // "-"' <<<"$status")"
-  mode="$(jq -r '.status // "unknown"' <<<"$status")"
-  revision="$(jq -r '.applied_revision // 0' <<<"$status")"
-  last_sync="$(jq -r '.last_sync_at // 0' <<<"$status")"
-  last_sample="$(jq -r '.last_sample_at // 0' <<<"$status")"
-  pending="$(jq -r '.pending_batches // 0' <<<"$status")"
-  rows="$(jq -r '.unpackaged_rows // 0' <<<"$status")"
-  sync_error="$(jq -r '.sync_error // ""' <<<"$status")"
-  apply_error="$(jq -r '.apply_error // ""' <<<"$status")"
-  sample_error="$(jq -r '.collector_error // ""' <<<"$status")"
-  running="$(jq -r '.service_running // false' <<<"$status")"
+  IFS=$'\x1f' read -r center node_id mode revision last_sync last_sample pending rows sync_error apply_error sample_error running < <(
+    jq -r '[
+      (.center_url // "-"),
+      (.node_id // "-"),
+      (.status // "unknown"),
+      ((.applied_revision // 0) | tostring),
+      ((.last_sync_at // 0) | tostring),
+      ((.last_sample_at // 0) | tostring),
+      ((.pending_batches // 0) | tostring),
+      ((.unpackaged_rows // 0) | tostring),
+      ((.sync_error // "") | gsub("[\r\n\u001f]+"; " ")),
+      ((.apply_error // "") | gsub("[\r\n\u001f]+"; " ")),
+      ((.collector_error // "") | gsub("[\r\n\u001f]+"; " ")),
+      ((.service_running // false) | tostring)
+    ] | join("\u001f")' <<<"$status"
+  )
   last_sync_display="尚未成功同步"
   last_sample_display="尚未成功采样"
   if [[ "$last_sync" =~ ^[0-9]+$ ]] && [ "$last_sync" -gt 0 ]; then
-    last_sync_display="$(date -d "@$last_sync" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$last_sync")"
+    last_sync_display="$(python3 -c 'import datetime, sys; print(datetime.datetime.fromtimestamp(int(sys.argv[1])).strftime("%Y-%m-%d %H:%M:%S"))' "$last_sync" 2>/dev/null || echo "$last_sync")"
   fi
   if [[ "$last_sample" =~ ^[0-9]+$ ]] && [ "$last_sample" -gt 0 ]; then
-    last_sample_display="$(date -d "@$last_sample" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$last_sample")"
+    last_sample_display="$(python3 -c 'import datetime, sys; print(datetime.datetime.fromtimestamp(int(sys.argv[1])).strftime("%Y-%m-%d %H:%M:%S"))' "$last_sample" 2>/dev/null || echo "$last_sample")"
   fi
   case "$mode" in
     active) text="已连接（中控托管）" ;;
@@ -7091,8 +7917,11 @@ agent_inventory_action() {
   jq -c --argjson running "$running" '{
     users:[.users[]? | select(.enabled != false) | {name,uuid,tuic_pass}],
     inbounds:[. as $s | .nodes[]? | {name,tag,type,port,
-      server:$s.server_ip, sni:(if (.type | startswith("tuic")) then $s.tuic_sni else $s.reality_sni end),
-      public_key:$s.public_key, short_id:$s.short_id, skip_cert_verify:(.type | startswith("tuic"))}],
+      server:($s.server_ip // ""),
+      sni:(if (.type | startswith("tuic")) then ($s.tuic_sni // "") else ($s.reality_sni // "") end),
+      public_key:(if (.type | startswith("tuic")) then "" else ($s.public_key // "") end),
+      short_id:(if (.type | startswith("tuic")) then "" else ($s.short_id // "") end),
+      skip_cert_verify:(.type | startswith("tuic"))}],
     management:(.management // {}), service_running:$running
   }' "$STATE_FILE"
 }
