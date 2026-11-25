@@ -23,18 +23,28 @@ import logging
 import os
 import re
 import secrets
+import shutil
 import signal
 import socket
 import socketserver
 import sqlite3
+import ssl
+import subprocess
+import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 import uuid
 from pathlib import Path
 
-VERSION = "2026.10.23.6"
+VERSION = "2026.11.26"
+DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/showcode1024/singbox-auto/main/center-panel.py"
+MAX_UPDATE_BYTES = 8 * 1024 * 1024
+UPDATE_MARKER = "# YSQ_CENTER_STDLIB_V1"
+VERSION_RE = re.compile(r'^VERSION\s*=\s*"([^"\r\n]{1,64})"\s*$', re.MULTILINE)
 PROTOCOL = 1
 MAX_BODY = 2 * 1024 * 1024
 MAX_BYTES = (1 << 63) - 1
@@ -1443,12 +1453,166 @@ class RateLimiter:
             self.failures.pop(key, None)
 
 
+class SafeHTTPSRedirect(urllib.request.HTTPRedirectHandler):
+    def __init__(self, dev=False):
+        super().__init__()
+        self.dev = dev
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        normalize_update_url(newurl, self.dev)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def normalize_update_url(value, dev=False):
+    if not isinstance(value, str) or not value.strip() or any(c.isspace() for c in value):
+        raise ValueError("更新地址格式不正确")
+    parsed = urllib.parse.urlsplit(value.strip())
+    if parsed.username or parsed.password or parsed.fragment or not parsed.hostname:
+        raise ValueError("更新地址不合法")
+    try:
+        parsed.port
+    except ValueError:
+        raise ValueError("更新地址端口不合法")
+    if parsed.scheme != "https":
+        if not dev or parsed.scheme != "http" or parsed.hostname not in ("127.0.0.1", "localhost", "::1"):
+            raise ValueError("生产环境更新地址必须使用 HTTPS")
+    return value.strip()
+
+
+class Updater:
+    def __init__(self, script_path, url, dev=False):
+        self.script_path = Path(script_path).resolve()
+        self.url = normalize_update_url(url, dev)
+        self.dev = dev
+        self._lock = threading.Lock()
+
+    def can_write(self):
+        parent_ok = os.access(self.script_path.parent, os.W_OK)
+        file_ok = not self.script_path.exists() or os.access(self.script_path, os.W_OK)
+        return bool(parent_ok and file_ok)
+
+    def fetch(self):
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=ssl.create_default_context()),
+            SafeHTTPSRedirect(self.dev),
+        )
+        req = urllib.request.Request(self.url, headers={"User-Agent": "ysq-center/" + VERSION, "Cache-Control": "no-cache"})
+        try:
+            with opener.open(req, timeout=15) as resp:
+                raw = resp.read(MAX_UPDATE_BYTES + 1)
+        except urllib.error.HTTPError as exc:
+            raise APIError(502, f"获取远端版本失败（HTTP {exc.code}）")
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+            raise APIError(502, "无法连接更新源，请检查网络访问：" + type(exc).__name__)
+        if not raw or len(raw) > MAX_UPDATE_BYTES:
+            raise APIError(502, "远端脚本体积异常，已拒绝更新")
+        try:
+            source = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            raise APIError(502, "远端脚本不是有效的 UTF-8 文本")
+        if UPDATE_MARKER not in source:
+            raise APIError(502, "远端内容缺少中控版本标识，已拒绝覆盖")
+        match = VERSION_RE.search(source)
+        if not match:
+            raise APIError(502, "远端脚本缺少有效的 VERSION 声明")
+        remote_version = match.group(1)
+        try:
+            compile(source, str(self.script_path.name), "exec")
+        except SyntaxError:
+            raise APIError(502, "远端脚本语法检查未通过，已拒绝更新")
+        remote_sha256 = hashlib.sha256(raw).hexdigest()
+        local_sha256 = ""
+        with contextlib.suppress(OSError):
+            local_sha256 = hashlib.sha256(self.script_path.read_bytes()).hexdigest()
+        return {
+            "raw": raw,
+            "remote_version": remote_version,
+            "remote_sha256": remote_sha256,
+            "same_content": bool(local_sha256 and hmac.compare_digest(local_sha256, remote_sha256)),
+        }
+
+    def check(self):
+        info = self.fetch()
+        return {
+            "current_version": VERSION,
+            "remote_version": info["remote_version"],
+            "has_update": not info["same_content"],
+            "same_content": info["same_content"],
+            "remote_sha256": info["remote_sha256"],
+            "source_url": self.url,
+            "can_write": self.can_write(),
+        }
+
+    def apply(self, store, actor, expected_sha256=None):
+        if not self._lock.acquire(blocking=False):
+            raise APIError(409, "已有更新任务正在进行，请稍候")
+        temp_path = None
+        try:
+            if not self.can_write():
+                raise APIError(403, f"当前运行用户对 {self.script_path.parent} 没有写权限，无法在线更新；请手动替换脚本后重启服务")
+            info = self.fetch()
+            if expected_sha256 is not None:
+                if not isinstance(expected_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+                    raise APIError(400, "校验摘要格式不正确")
+                if not hmac.compare_digest(info["remote_sha256"], expected_sha256):
+                    raise APIError(409, "远端脚本刚刚发生变化，请重新点击「检查更新」后再更新")
+            mode = 0o755
+            with contextlib.suppress(OSError):
+                mode = self.script_path.stat().st_mode & 0o777
+            fd, temp_name = tempfile.mkstemp(prefix=".center-update-", suffix=".py", dir=str(self.script_path.parent))
+            temp_path = Path(temp_name)
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(info["raw"])
+                stream.flush()
+                os.fsync(stream.fileno())
+            with contextlib.suppress(OSError):
+                os.chmod(temp_path, mode)
+            check_cmd = [sys.executable, str(temp_path), "--check", "--data-dir", str(store.directory)]
+            if self.dev:
+                check_cmd.extend(["--dev", "--origin", "http://127.0.0.1"])
+            try:
+                proc = subprocess.run(
+                    check_cmd,
+                    capture_output=True, text=True, timeout=20, close_fds=True,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                raise APIError(502, "新版中控自检超时或无法启动，已放弃更新，当前服务不受影响")
+            if proc.returncode != 0:
+                raise APIError(502, "新版中控数据库与启动自检未通过，已放弃更新，当前服务不受影响")
+            backup_path = self.script_path.with_name(self.script_path.name + ".bak")
+            if self.script_path.exists():
+                shutil.copy2(self.script_path, backup_path)
+            os.replace(temp_path, self.script_path)
+            temp_path = None
+            if hasattr(os, "O_DIRECTORY"):
+                with contextlib.suppress(OSError):
+                    dir_fd = os.open(str(self.script_path.parent), os.O_RDONLY | os.O_DIRECTORY)
+                    try:
+                        os.fsync(dir_fd)
+                    finally:
+                        os.close(dir_fd)
+            with store.transaction(notify=False) as db:
+                store.audit(db, actor, "center.update", f"{VERSION} → {info['remote_version']}（sha256:{info['remote_sha256'][:12]}）")
+            return {
+                "ok": True,
+                "old_version": VERSION,
+                "new_version": info["remote_version"],
+                "restarting": True,
+                "backup": backup_path.name,
+            }
+        finally:
+            if temp_path is not None:
+                with contextlib.suppress(OSError):
+                    temp_path.unlink()
+            self._lock.release()
+
+
 class CenterServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
     request_queue_size = 64
 
-    def __init__(self, address, store, origin, dev=False, workers=24):
+    def __init__(self, address, store, origin, dev=False, workers=24, update_url=DEFAULT_UPDATE_URL):
         self.store, self.origin, self.dev = store, origin.rstrip("/"), dev
         if ":" in address[0]:
             self.address_family = socket.AF_INET6
@@ -1458,7 +1622,16 @@ class CenterServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
         self.request_context = threading.local()
         self.password_slots = threading.BoundedSemaphore(2)
         self.login_limiter = RateLimiter()
+        self.updater = Updater(Path(__file__).resolve(), update_url, dev=dev)
+        self.restart_requested = False
         super().__init__(address, Handler)
+
+    def schedule_restart(self):
+        self.restart_requested = True
+        def _do_shutdown():
+            time.sleep(0.6)
+            self.shutdown()
+        threading.Thread(target=_do_shutdown, name="ysq-restart", daemon=True).start()
 
     def get_request(self):
         request, address = super().get_request()
@@ -1682,6 +1855,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return self.respond(200, store.logs())
                 if path == "/api/admin/settings":
                     return self.respond(200, store.settings())
+                if path == "/api/admin/update/check":
+                    return self.respond(200, self.server.updater.check())
                 if path == "/api/admin/traffic":
                     query = urllib.parse.parse_qs(parsed.query)
                     try:
@@ -1746,6 +1921,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.respond(200, {"ok": True}, {"Set-Cookie": self.cookie_header("", clear=True)})
             if method == "POST" and path == "/api/admin/settings":
                 return self.respond(200, store.save_settings(data, actor))
+            if method == "POST" and path == "/api/admin/update/apply":
+                result = self.server.updater.apply(store, actor, data.get("expected_sha256"))
+                self.respond(200, result)
+                self.server.schedule_restart()
+                return
             if method == "POST" and path == "/api/admin/nodes":
                 return self.respond(201, store.create_node(data.get("name"), actor))
             match = re.fullmatch(r"/api/admin/nodes/(n_[0-9a-f]{32})", path)
@@ -4454,7 +4634,7 @@ JS = r'''
 'use strict';
 const $=id=>document.getElementById(id);
 const esc=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const state={activity:null,activityFilter:{user_id:'',node_id:'',hours:24,q:'',page:1},view:'overview',session:null,users:[],nodes:[],subscriptions:[],overview:null,chart:null,logs:[],settings:{timezone_offset:480},settingsLoaded:false,settingsDirty:false,activityRetentionDirty:false,templatesDirty:false,userMonth:'',userPeriod:null,trafficTask:null,trafficUser:null,subscriptionTask:null,syncFollowup:null,epoch:0,refreshTask:null,requests:new Set(),toast:null};
+const state={activity:null,activityFilter:{user_id:'',node_id:'',hours:24,q:'',page:1},view:'overview',session:null,users:[],nodes:[],subscriptions:[],overview:null,chart:null,logs:[],settings:{timezone_offset:480},settingsLoaded:false,settingsDirty:false,activityRetentionDirty:false,templatesDirty:false,updateInfo:null,userMonth:'',userPeriod:null,trafficTask:null,trafficUser:null,subscriptionTask:null,syncFollowup:null,epoch:0,refreshTask:null,requests:new Set(),toast:null};
 const REFRESH_MS=15000, REQUEST_TIMEOUT_MS=15000;
 const views={overview:['运行总览','总览'],users:['用户管理','用户管理'],nodes:['服务器','服务器'],subscriptions:['订阅','订阅'],activity:['行为分析','行为分析'],logs:['操作记录','操作记录'],settings:['设置','设置']};
 function bytes(value){let n=Number(value||0);if(!Number.isFinite(n))return '—';const units=['B','KiB','MiB','GiB','TiB','PiB'];let i=0;while(n>=1024&&i<units.length-1){n/=1024;i++;}return (i?n.toFixed(n>=100?1:2):Math.round(n))+' '+units[i];}
@@ -4484,7 +4664,7 @@ async function api(path,method='GET',body,{signal}={}){
     throw error;
   }finally{clearTimeout(timer);signal?.removeEventListener('abort',abort);state.requests.delete(controller);}
 }
-function showLogin(){cancelRequests();Object.assign(state,{activity:null,activityFilter:{user_id:'',node_id:'',hours:24,q:'',page:1},session:null,users:[],nodes:[],subscriptions:[],overview:null,chart:null,logs:[],settings:{timezone_offset:480},settingsLoaded:false,settingsDirty:false,activityRetentionDirty:false,templatesDirty:false,userMonth:'',userPeriod:null});$('app').hidden=true;$('loading').hidden=true;$('login').hidden=false;closeModal();}
+function showLogin(){cancelRequests();Object.assign(state,{activity:null,activityFilter:{user_id:'',node_id:'',hours:24,q:'',page:1},session:null,users:[],nodes:[],subscriptions:[],overview:null,chart:null,logs:[],settings:{timezone_offset:480},settingsLoaded:false,settingsDirty:false,activityRetentionDirty:false,templatesDirty:false,updateInfo:null,userMonth:'',userPeriod:null});$('app').hidden=true;$('loading').hidden=true;$('login').hidden=false;closeModal();}
 function showApp(){cancelRequests();$('login').hidden=true;$('loading').hidden=true;$('app').hidden=false;$('account').textContent=state.session.username;$('version').textContent=state.session.version;$('sidebar-origin').textContent=location.host;const selected=location.hash.slice(1);state.view=views[selected]?selected:'overview';setView(state.view,false);}
 function empty(title,description='',action=''){return `<div class="empty"><span class="empty-icon">◫</span><h3>${esc(title)}</h3>${description?`<p>${esc(description)}</p>`:''}${action}</div>`;}
 function badge(label,color=''){return `<span class="badge ${color}">${esc(label)}</span>`;}
@@ -4595,7 +4775,14 @@ function renderActivity(bodyOnly=false){
 }
 
 function renderLogs(){$('content').innerHTML=`<section class="card table-card">${state.logs.length?`<div class="table-scroll"><table><thead><tr><th>时间（${tzName()}）</th><th>操作者</th><th>操作</th><th>详情</th></tr></thead><tbody>${state.logs.map(l=>`<tr><td>${stamp(l.ts)}</td><td class="mono">${esc(l.actor.length>18?l.actor.slice(0,16)+'…':l.actor)}</td><td class="log-action">${esc(l.action)}</td><td class="log-detail">${esc(l.detail)}</td></tr>`).join('')}</tbody></table></div>`:empty('暂无操作记录')}</section>`;}
-function renderSettings(){$('content').innerHTML=`<div class="settings-grid"><section class="card"><div class="card-head"><div><h3>修改管理员密码</h3><p>修改后，所有已登录会话都会退出。</p></div></div><form id="password-form"><label>当前密码<input name="old_password" type="password" required autocomplete="current-password" maxlength="256"></label><label>新密码<input name="new_password" type="password" required minlength="12" maxlength="256" autocomplete="new-password" placeholder="至少 12 个字符"></label><label>再次输入新密码<input name="confirm_password" type="password" required minlength="12" maxlength="256" autocomplete="new-password"></label><div class="form-footer"><button class="primary" type="submit">更新密码</button></div></form></section><div class="form-grid"><section class="card"><div class="card-head"><div><h3>数据备份</h3></div></div><p class="muted">备份包含代理认证资料，请妥善保管。</p><div class="form-footer"><a class="inline-link" href="/api/admin/backup">下载数据库备份 ↓</a></div></section><section class="card"><div class="card-head"><div><h3>统计时区</h3></div></div><form id="timezone-form"><label>时区偏移（分钟）<input name="timezone_offset" type="number" min="-720" max="840" step="15" value="${Number(state.settings.timezone_offset)}" required></label><p class="form-help">UTC+8 = 480；UTC = 0。明细保留 100 天，累计永久保留。</p><div class="form-footer"><button type="submit">保存时区</button></div></form></section><section class="card"><div class="card-head"><h3>行为记录保留</h3></div><form id="activity-retention-form"><div class="form-row"><label>明细（天）<input name="activity_detail_days" type="number" min="1" max="30" value="${Number(state.settings.activity_detail_days||7)}" required></label><label>汇总（天）<input name="activity_summary_days" type="number" min="1" max="90" value="${Number(state.settings.activity_summary_days||90)}" required></label></div><div class="form-footer"><button type="submit">保存期限</button></div></form></section></div></div>`;}
+function renderUpdateStatus(){
+  const info=state.updateInfo;
+  if(!info)return `<p class="form-help">当前版本：<strong>v${esc(state.session?.version||'')}</strong>。点击下方按钮从 GitHub 检查最新版本。</p>`;
+  if(!info.can_write)return `<p class="form-error">当前版本 v${esc(info.current_version)}，远端版本 v${esc(info.remote_version)}。当前进程无脚本目录写权限，无法在线更新。</p>`;
+  if(info.same_content)return `<p class="form-help">当前版本：<strong>v${esc(info.current_version)}</strong>（已与远端 v${esc(info.remote_version)} 完全一致）。</p>`;
+  return `<p class="form-help">当前版本：<strong>v${esc(info.current_version)}</strong> → 发现新版：<strong>v${esc(info.remote_version)}</strong>（摘要 <span class="mono">${esc(info.remote_sha256.slice(0,12))}</span>）。更新前会自动备份旧版并进行数据库自检。</p>`;
+}
+function renderSettings(){const info=state.updateInfo;const canApply=Boolean(info&&info.can_write);$('content').innerHTML=`<div class="settings-grid"><section class="card"><div class="card-head"><div><h3>修改管理员密码</h3><p>修改后，所有已登录会话都会退出。</p></div></div><form id="password-form"><label>当前密码<input name="old_password" type="password" required autocomplete="current-password" maxlength="256"></label><label>新密码<input name="new_password" type="password" required minlength="12" maxlength="256" autocomplete="new-password" placeholder="至少 12 个字符"></label><label>再次输入新密码<input name="confirm_password" type="password" required minlength="12" maxlength="256" autocomplete="new-password"></label><div class="form-footer"><button class="primary" type="submit">更新密码</button></div></form></section><div class="form-grid"><section class="card"><div class="card-head"><div><h3>中控面板更新</h3></div></div><div id="update-status">${renderUpdateStatus()}</div><div class="form-footer"><button type="button" data-action="check-update">检查更新</button><button type="button" class="primary" data-action="apply-update" ${canApply?'':'disabled'}>${info&&info.same_content?'强制重新安装':'立即更新并重启'}</button></div></section><section class="card"><div class="card-head"><div><h3>数据备份</h3></div></div><p class="muted">备份包含代理认证资料，请妥善保管。</p><div class="form-footer"><a class="inline-link" href="/api/admin/backup">下载数据库备份 ↓</a></div></section><section class="card"><div class="card-head"><div><h3>统计时区</h3></div></div><form id="timezone-form"><label>时区偏移（分钟）<input name="timezone_offset" type="number" min="-720" max="840" step="15" value="${Number(state.settings.timezone_offset)}" required></label><p class="form-help">UTC+8 = 480；UTC = 0。明细保留 100 天，累计永久保留。</p><div class="form-footer"><button type="submit">保存时区</button></div></form></section><section class="card"><div class="card-head"><h3>行为记录保留</h3></div><form id="activity-retention-form"><div class="form-row"><label>明细（天）<input name="activity_detail_days" type="number" min="1" max="30" value="${Number(state.settings.activity_detail_days||7)}" required></label><label>汇总（天）<input name="activity_summary_days" type="number" min="1" max="90" value="${Number(state.settings.activity_summary_days||90)}" required></label></div><div class="form-footer"><button type="submit">保存期限</button></div></form></section></div></div>`;}
 function render() {
   let status = state.view === 'overview' ? state.overview : null;
   if (state.view === 'nodes' || state.view === 'users') {
@@ -4778,6 +4965,27 @@ async function action(button){
     if(key==='reset-user'&&confirm('重置 UUID 和 TUIC 密码？此用户所有客户端都需要更新认证资料。')){await api('/api/admin/users/'+id,'POST',{reset_credentials:true});userForm(await api('/api/admin/users/'+id));toast('认证凭据已重置，请更新客户端');await refresh(true);}
     if(key==='join-code')showJoin(await api('/api/admin/nodes/'+id+'/join-code','POST',{}));
     if(key==='rename-node')renameNode(state.nodes.find(n=>n.id===id));if(key==='node-detail')nodeDetail(state.nodes.find(n=>n.id===id));
+    if(key==='check-update'){
+      const box=$('update-status');if(box)box.innerHTML='<p class="form-help">正在连接远端检查最新版本…</p>';
+      state.updateInfo=await api('/api/admin/update/check');
+      renderSettings();
+      toast(state.updateInfo.same_content?'当前已是最新版本':'发现新版本 v'+state.updateInfo.remote_version);
+    }
+    if(key==='apply-update'){
+      const info=state.updateInfo;if(!info)throw new Error('请先点击「检查更新」');
+      const tip=info.same_content?'远端脚本与当前一致，确认强制重新安装并重启中控服务？':'确认将中控从 v'+info.current_version+' 更新到 v'+info.remote_version+' 并重启服务？数据库会完整保留。';
+      if(confirm(tip)){
+        const box=$('update-status');if(box)box.innerHTML='<p class="form-help">正在下载、自检并应用更新…</p>';
+        const res=await api('/api/admin/update/apply','POST',{expected_sha256:info.remote_sha256});
+        toast('更新已写入，正在重启中控服务…');
+        if(box)box.innerHTML='<p class="form-help">已更新至 v'+esc(res.new_version)+'，正在等待服务重启恢复…</p>';
+        for(let i=0;i<25;i++){
+          await new Promise(r=>setTimeout(r,800));
+          try{const h=await fetch('/healthz',{cache:'no-store'});if(h.ok){location.reload();return;}}catch{}
+        }
+        toast('服务重启耗时较长，请手动刷新页面',true);
+      }
+    }
     if(key==='delete-node'&&confirm('彻底删除这台服务器？流量记录和用户绑定将清除，VPS 联网后自动解绑中控。')){await api('/api/admin/nodes/'+id,'DELETE',{});toast('服务器和相关数据已删除');await refresh(true);}
   }catch(error){if(error.name!=='AbortError')toast(error.message,true);}finally{button.disabled=false;}
 }
@@ -4874,13 +5082,15 @@ def main(argv=None):
     parser.add_argument("--host", default="127.0.0.1", help="只允许回环地址，供同机 Nginx 代理")
     parser.add_argument("--port", type=int, default=8099)
     parser.add_argument("--origin", default="https://panel.eulmo.com", help="浏览器和 Agent 使用的公开 HTTPS 来源")
+    parser.add_argument("--update-url", default=os.environ.get("YSQ_CENTER_UPDATE_URL", DEFAULT_UPDATE_URL), help="面板在线更新脚本地址（须为 HTTPS）")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--init-admin", metavar="USER", help="创建管理员后退出")
     group.add_argument("--reset-admin", metavar="USER", help="重置管理员密码并注销会话后退出")
     group.add_argument("--check", action="store_true", help="检查数据库与管理员；无管理员退出码 3")
     parser.add_argument("--dev", action="store_true", help="仅本机测试：允许 HTTP origin 和非 Secure Cookie")
     parser.add_argument("--version", action="version", version=VERSION)
-    args = parser.parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(raw_argv)
     os.umask(0o077)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
@@ -4889,6 +5099,7 @@ def main(argv=None):
         if not 1 <= args.port <= 65535:
             raise ValueError("监听端口必须是 1–65535")
         origin = normalize_origin(args.origin, args.dev)
+        update_url = normalize_update_url(args.update_url, args.dev)
         store = Store(args.data_dir)
         if args.init_admin or args.reset_admin:
             password = os.environ.pop("YSQ_ADMIN_PASSWORD", None)
@@ -4913,7 +5124,7 @@ def main(argv=None):
             return 0
         if not store.has_admin():
             raise ValueError("尚未创建管理员。请先执行 --init-admin admin；不会开放匿名初始化页面。")
-        server = CenterServer((args.host, args.port), store, origin, args.dev)
+        server = CenterServer((args.host, args.port), store, origin, args.dev, update_url=update_url)
         def stop_server(signum, frame):
             threading.Thread(target=server.shutdown, daemon=True).start()
         signal.signal(signal.SIGTERM, stop_server)
@@ -4925,6 +5136,9 @@ def main(argv=None):
             server.serve_forever(poll_interval=0.5)
         finally:
             server.server_close()
+        if server.restart_requested:
+            LOG.info("正在加载新版中控并原地重启…")
+            os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve()), *raw_argv])
         return 0
     except (APIError, ValueError, OSError, sqlite3.Error, RuntimeError) as exc:
         LOG.error("%s", str(exc))

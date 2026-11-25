@@ -5606,7 +5606,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-VERSION = "2026.10.24.2"
+VERSION = "2026.11.26"
 PROTOCOL = 1
 SAMPLE_SECONDS = 10
 SYNC_SECONDS = 15
