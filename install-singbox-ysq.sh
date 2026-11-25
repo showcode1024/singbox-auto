@@ -27,7 +27,7 @@ set -euo pipefail
 #   - Alpine(OpenRC)：日志写入单个文件，busybox cron 每小时检查，达 9MB 裁剪、保留最后 2MB
 # ============================================================
 
-YSQ_VERSION="2026.10.24.6"
+YSQ_VERSION="2026.11.26"
 INSTALLER_NAME="install-singbox-ysq.sh"
 DEFAULT_SCRIPT_URL="https://raw.githubusercontent.com/showcode1024/singbox-auto/main/install-singbox-ysq.sh"
 
