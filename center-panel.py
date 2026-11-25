@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """YSQ 中控：Python 标准库单文件网页服务，供本机 Nginx 反向代理。
 
-首次初始化：python3 center-panel.py --init-admin admin
-运行：python3 center-panel.py
-默认 HTTP 127.0.0.1:8099，对外 https://panel.eulmo.com（可用 --origin 或 YSQ_CENTER_ORIGIN 覆盖）。
+首次初始化：python3 ysq-center.py --init-admin admin
+运行：python3 ysq-center.py
+默认 HTTP 127.0.0.1:8099，对外 https://panel.eulmo.com。
 数据库、凭据和会话位于 --data-dir 指定的目录；不要公开该目录。
-Nginx 反代须设置 `proxy_set_header X-Real-IP $remote_addr;`，建议对 `/sub/` 配置 `access_log off;` 防止日志落盘订阅 token。
 """
 from __future__ import annotations
 
@@ -14,7 +13,6 @@ import base64
 import contextlib
 import datetime as dt
 import getpass
-import gzip
 import hashlib
 import hmac
 import http.cookies
@@ -29,26 +27,18 @@ import signal
 import socket
 import socketserver
 import sqlite3
-import ssl
-import stat
-import sys
 import tempfile
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 import uuid
 from pathlib import Path
 
-VERSION = "2026.11.25.2"
-DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/showcode1024/singbox-auto/main/center-panel.py"
-MAX_UPDATE_BYTES = 8 * 1024 * 1024
+VERSION = "2026.10.23.6"
 PROTOCOL = 1
 MAX_BODY = 2 * 1024 * 1024
 MAX_BYTES = (1 << 63) - 1
 DETAIL_RETENTION_DAYS = 100
-BATCH_RECEIPT_DAYS = 30
 MAX_CHART_DAYS = 90
 PASSWORD_ITERATIONS = 600_000
 SESSION_SECONDS = 8 * 3600
@@ -213,10 +203,6 @@ CREATE TABLE IF NOT EXISTS batches(
  node_id TEXT NOT NULL REFERENCES nodes(id),epoch TEXT NOT NULL,seq INTEGER NOT NULL,
  payload_hash TEXT NOT NULL,received_at INTEGER NOT NULL,row_count INTEGER NOT NULL,up INTEGER NOT NULL,down INTEGER NOT NULL,
  PRIMARY KEY(node_id,epoch,seq));
-CREATE INDEX IF NOT EXISTS batches_received ON batches(received_at);
-CREATE TABLE IF NOT EXISTS batch_watermarks(
- node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,epoch TEXT NOT NULL,pruned_seq INTEGER NOT NULL,
- PRIMARY KEY(node_id,epoch));
 CREATE TABLE IF NOT EXISTS usage(
  node_id TEXT NOT NULL REFERENCES nodes(id),user_id TEXT NOT NULL REFERENCES users(id),ts INTEGER NOT NULL,
  up INTEGER NOT NULL,down INTEGER NOT NULL,PRIMARY KEY(node_id,user_id,ts));
@@ -233,14 +219,11 @@ CREATE TABLE IF NOT EXISTS activity_events(
 CREATE INDEX IF NOT EXISTS activity_events_time ON activity_events(ts);
 CREATE INDEX IF NOT EXISTS activity_events_user_time ON activity_events(user_id,ts);
 CREATE INDEX IF NOT EXISTS activity_events_node_time ON activity_events(node_id,ts);
-CREATE INDEX IF NOT EXISTS activity_events_node_kind_time ON activity_events(node_id,kind,ts);
-CREATE INDEX IF NOT EXISTS activity_events_user_kind_time ON activity_events(user_id,kind,ts);
 CREATE TABLE IF NOT EXISTS activity_receipts(
  node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,event_id TEXT NOT NULL,
  user_id TEXT REFERENCES users(id) ON DELETE CASCADE,ts INTEGER NOT NULL,payload_hash TEXT NOT NULL,
  PRIMARY KEY(node_id,event_id));
 CREATE INDEX IF NOT EXISTS activity_receipts_time ON activity_receipts(ts);
-CREATE INDEX IF NOT EXISTS activity_receipts_user ON activity_receipts(user_id) WHERE user_id IS NOT NULL;
 CREATE TABLE IF NOT EXISTS activity_hourly(
  node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,user_id TEXT NOT NULL,hour INTEGER NOT NULL,
  connections INTEGER NOT NULL,errors INTEGER NOT NULL,gaps INTEGER NOT NULL,last_at INTEGER NOT NULL,
@@ -265,14 +248,10 @@ class Store:
         os.chmod(self.directory, 0o700)
         self.path = self.directory / "center.db"
         self.maintenance_lock = threading.Lock()
-        self.backup_lock = threading.Lock()
         self.changes = threading.Condition()
-        self.change_version = 0
-        self.closing = False
         self.last_maintenance = 0.0
-        self._last_quota_month = None
+        self._last_quota_period = None
         with self.connect() as db:
-            db.execute("PRAGMA auto_vacuum=INCREMENTAL")
             db.execute("PRAGMA journal_mode=WAL")
             db.executescript(SCHEMA)
             version = db.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
@@ -300,14 +279,9 @@ class Store:
                 self._purge_user(db, old["id"])
             for old in db.execute("SELECT id FROM nodes WHERE status IN ('revoked','detached')").fetchall():
                 self._purge_node(db, old["id"])
-            # Ensure every active user has a user_policies row so GET paths remain strictly read-only.
-            for missing in db.execute("SELECT id FROM users WHERE deleted=0 AND id NOT IN (SELECT user_id FROM user_policies)").fetchall():
-                self._policy(db, missing["id"])
             self._refresh_quotas(db)
-            _, _, init_month = self._time_bounds(db)
             for old in db.execute("SELECT id FROM nodes WHERE status='pending' ORDER BY created_at,id").fetchall():
                 self._activate_node(db, self._node(db, old["id"]), "system-upgrade")
-        self._last_quota_month = init_month
 
     @contextlib.contextmanager
     def connect(self):
@@ -315,42 +289,22 @@ class Store:
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA foreign_keys=ON")
         db.execute("PRAGMA busy_timeout=10000")
-        db.execute("PRAGMA synchronous=NORMAL")
+        db.execute("PRAGMA synchronous=FULL")
         try:
             yield db
         finally:
             db.close()
 
     @contextlib.contextmanager
-    def readonly(self):
-        with self.connect() as db:
-            db.execute("BEGIN DEFERRED")
-            try:
-                yield db
-            finally:
-                if db.in_transaction:
-                    db.execute("ROLLBACK")
-
-    def notify_changes(self):
-        with self.changes:
-            self.change_version += 1
-            self.changes.notify_all()
-
-    def signal_shutdown(self):
-        with self.changes:
-            self.closing = True
-            self.change_version += 1
-            self.changes.notify_all()
-
-    @contextlib.contextmanager
-    def transaction(self, notify=False):
+    def transaction(self, notify=True):
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             try:
                 yield db
                 db.execute("COMMIT")
                 if notify:
-                    self.notify_changes()
+                    with self.changes:
+                        self.changes.notify_all()
             except BaseException:
                 if db.in_transaction:
                     db.execute("ROLLBACK")
@@ -495,14 +449,9 @@ class Store:
                                    "tag": text_value(value.get("tag", "unknown"), "入口标签", 1, 160),
                                    "type": text_value(value.get("type", "unknown"), "入口类型", 1, 64),
                                    "port": integer(value.get("port"), "入口端口", 1, 65535)}
-            is_vless = item["type"].lower().startswith("vless")
             for key in ("server", "sni", "public_key", "short_id"):
                 if key in value:
-                    raw_field = "" if value[key] is None else value[key]
-                    if key in ("public_key", "short_id") and not is_vless:
-                        item[key] = ""
-                        continue
-                    field = text_value(raw_field, "订阅 " + key, 0, 253)
+                    field = text_value(value[key], "订阅 " + key, 0, 253)
                     if any(c.isspace() or c in "/?#@\\" for c in field):
                         raise APIError(400, "订阅 " + key + " 格式不正确")
                     if key == "public_key" and field and not re.fullmatch(r"[A-Za-z0-9_-]{43}", field):
@@ -517,9 +466,7 @@ class Store:
 
     def register(self, data):
         self._protocol(data)
-        code = text_value(data.get("join_code"), "接入码", 32, 256)
-        if not TOKEN_RE.fullmatch(code):
-            raise APIError(400, "接入码格式不正确")
+        code = text_value(data.get("join_code"), "接入码", 16, 256)
         registration_id = text_value(data.get("registration_id"), "注册标识", 8, 128)
         token = data.get("node_token")
         if not isinstance(token, str) or not TOKEN_RE.fullmatch(token):
@@ -529,20 +476,7 @@ class Store:
         agent_version = text_value(data.get("agent_version", "unknown"), "Agent 版本", 1, 64)
         registration_hash = digest(canonical({"inventory": inventory, "hostname": hostname, "agent_version": agent_version}))
         token_hash = digest(token)
-        code_hash = digest(code)
-        # Pre-check credentials read-only before acquiring the exclusive SQLite write lock.
-        with self.readonly() as db:
-            old = db.execute("SELECT status,token_hash,registration_hash FROM nodes WHERE registration_id=?", (registration_id,)).fetchone()
-            if old:
-                if old["status"] not in ("pending", "active") or not hmac.compare_digest(old["token_hash"] or "", token_hash):
-                    raise APIError(403, "注册恢复失败，请在中控检查服务器状态")
-                if not hmac.compare_digest(old["registration_hash"] or "", registration_hash):
-                    raise APIError(409, "同一注册标识的清单发生变化，请恢复原始注册请求")
-            else:
-                node = db.execute("SELECT status,join_expires FROM nodes WHERE join_hash=?", (code_hash,)).fetchone()
-                if not node or node["status"] != "created" or node["join_expires"] <= now():
-                    raise APIError(403, "接入码不存在、已过期或已使用")
-        with self.transaction(notify=True) as db:
+        with self.transaction() as db:
             old = db.execute("SELECT * FROM nodes WHERE registration_id=?", (registration_id,)).fetchone()
             if old:
                 if old["status"] not in ("pending", "active") or not hmac.compare_digest(old["token_hash"] or "", token_hash):
@@ -553,7 +487,7 @@ class Store:
                     return self._activate_node(db, old, "automatic-retry")
                 return {"protocol": PROTOCOL, "node_id": old["id"], "status": old["status"],
                         "revision": old["revision"], "imported": json.loads(old["inventory"]).get("imported", [])}
-            node = db.execute("SELECT * FROM nodes WHERE join_hash=?", (code_hash,)).fetchone()
+            node = db.execute("SELECT * FROM nodes WHERE join_hash=?", (digest(code),)).fetchone()
             if not node or node["status"] != "created" or node["join_expires"] <= now():
                 raise APIError(403, "接入码不存在、已过期或已使用")
             db.execute("UPDATE nodes SET status='pending',token_hash=?,join_hash=NULL,join_expires=0,registration_id=?,registration_hash=?,inventory=?,hostname=?,agent_version=?,last_seen=? WHERE id=?",
@@ -581,7 +515,6 @@ class Store:
             name = existing["name"] if existing else original["name"]
             if not existing:
                 db.execute("INSERT INTO users VALUES(?,?,?,?,1,0,?,?,?)", (uid, name, original["uuid"], original["tuic_pass"], node["id"], now(), now()))
-                self._policy(db, uid)
             collision = db.execute("SELECT u.name FROM users u JOIN assignments a ON a.user_id=u.id WHERE a.node_id=? AND a.active=1 AND u.uuid=? AND u.id!=?",
                                    (node["id"], existing["uuid"] if existing else original["uuid"], uid)).fetchone()
             if collision:
@@ -598,7 +531,7 @@ class Store:
     def approve_node(self, ident, actor):
         """Legacy API for old browser versions; no manual approval is needed."""
         node_id_valid(ident)
-        with self.transaction(notify=True) as db:
+        with self.transaction() as db:
             node = self._node(db, ident)
             return self._activate_node(db, node, actor)
 
@@ -608,14 +541,14 @@ class Store:
 
     @staticmethod
     def _purge_node(db, ident):
-        for table in ("assignments", "usage", "totals", "batches", "batch_watermarks"):
+        for table in ("assignments", "usage", "totals", "batches"):
             db.execute(f"DELETE FROM {table} WHERE node_id=?", (ident,))
         db.execute("UPDATE users SET origin_node=NULL WHERE origin_node=?", (ident,))
         db.execute("DELETE FROM nodes WHERE id=?", (ident,))
 
     def delete_node(self, ident, actor):
         node_id_valid(ident)
-        with self.transaction(notify=True) as db:
+        with self.transaction() as db:
             node = self._node(db, ident)
             self._purge_node(db, ident)
             self._refresh_quotas(db)
@@ -645,34 +578,24 @@ class Store:
         applied = integer(data.get("applied_revision", 0), "已应用版本", 0)
         timeout = integer(data.get("timeout", 20), "等待时间", 1, 25)
         deadline = time.monotonic() + timeout
-        # Never hold self.changes while performing SQLite I/O.
-        while True:
-            with self.changes:
-                if self.closing:
-                    return {"protocol": PROTOCOL, "changed": False, "revision": applied}
-                seen_version = self.change_version
-            with self.readonly() as db:
-                node = self._authenticated_node(db, ident, token)
-                revision = node["revision"]
-            if revision != applied:
-                return {"protocol": PROTOCOL, "changed": True, "revision": revision}
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return {"protocol": PROTOCOL, "changed": False, "revision": revision}
-            with self.changes:
-                if self.closing:
+        # Read and enter wait under one condition to avoid missing a committed change.
+        with self.changes:
+            while True:
+                with self.connect() as db:
+                    node = self._authenticated_node(db, ident, token)
+                    revision = node["revision"]
+                if revision != applied:
+                    return {"protocol": PROTOCOL, "changed": True, "revision": revision}
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
                     return {"protocol": PROTOCOL, "changed": False, "revision": revision}
-                if self.change_version == seen_version:
-                    self.changes.wait(remaining)
+                self.changes.wait(remaining)
 
     @staticmethod
     def _snapshot(db, ident, revision):
         rows = db.execute("SELECT u.id,u.name,u.uuid,u.tuic_pass,u.enabled,COALESCE(p.quota_blocked,0) blocked FROM users u JOIN assignments a ON a.user_id=u.id LEFT JOIN user_policies p ON p.user_id=u.id WHERE a.node_id=? AND a.active=1 AND u.deleted=0 ORDER BY u.id", (ident,)).fetchall()
         users = [{"id": r["id"], "name": r["name"], "uuid": r["uuid"], "tuic_pass": r["tuic_pass"], "enabled": bool(r["enabled"] and not r["blocked"])} for r in rows]
-        snapshot = {"node_id": ident, "revision": revision, "users": users}
-        if len(canonical(snapshot).encode("utf-8")) > MAX_BODY - 65536:
-            LOG.warning("服务器 %s 的用户快照接近 2 MiB 响应上限（%d 位用户）", ident, len(users))
-        return snapshot
+        return {"node_id": ident, "revision": revision, "users": users}
 
     def sync(self, data, token):
         self._protocol(data)
@@ -687,29 +610,22 @@ class Store:
         last_sample = integer(data.get("last_sample_at", 0), "采集时间", 0, now() + 300)
         pending = integer(data.get("pending_batches", 0), "待上传批次", 0, 10_000_000)
         running = boolean(data.get("service_running", False), "运行状态")
-        parsed_inbounds = self._inventory({"inbounds": data["inbounds"]})["inbounds"] if "inbounds" in data else None
-        # Pre-authenticate read-only before acquiring the exclusive write lock.
-        with self.readonly() as db:
-            self._authenticated_node(db, ident, token)
         ack = []
-        quota_changed = False
+        added_traffic = False
+        notify_needed = False
+        quota_period = None
         with self.transaction(notify=False) as db:
             node = self._authenticated_node(db, ident, token)
-            if parsed_inbounds is not None:
+            if "inbounds" in data:
+                inventory = self._inventory({"inbounds": data["inbounds"]})
                 stored_inventory = json.loads(node["inventory"])
-                if stored_inventory.get("inbounds") != parsed_inbounds:
-                    stored_inventory["inbounds"] = parsed_inbounds
+                if stored_inventory.get("inbounds") != inventory["inbounds"]:
+                    stored_inventory["inbounds"] = inventory["inbounds"]
                     db.execute("UPDATE nodes SET inventory=? WHERE id=?", (canonical(stored_inventory), ident))
             if applied > node["revision"]:
                 raise APIError(409, "节点配置版本领先于中控，请检查数据库恢复或重新绑定")
             if batches and node["status"] != "active":
                 raise APIError(409, "服务器尚未完成接入，暂不能上传流量")
-            if batches:
-                valid_users = {r[0] for r in db.execute("SELECT id FROM users")}
-                assigned_users = {r[0] for r in db.execute("SELECT user_id FROM assignments WHERE node_id=?", (ident,))}
-                node_totals = {r[0]: [r[1], r[2]] for r in db.execute("SELECT user_id,up,down FROM totals WHERE node_id=?", (ident,))}
-                watermarks = {r[0]: r[1] for r in db.execute("SELECT epoch,pruned_seq FROM batch_watermarks WHERE node_id=?", (ident,))}
-            has_new_traffic = False
             for batch in batches:
                 if not isinstance(batch, dict):
                     raise APIError(400, "流量批次格式错误")
@@ -720,9 +636,6 @@ class Store:
                 rows = batch.get("rows")
                 if not isinstance(rows, list) or len(rows) > 12000:
                     raise APIError(400, "流量批次记录不合法或过大")
-                if seq <= watermarks.get(epoch, 0):
-                    ack.append({"epoch": epoch, "seq": seq})
-                    continue
                 payload_hash = digest(canonical({"epoch": epoch, "seq": seq, "rows": rows}))
                 existing = db.execute("SELECT payload_hash FROM batches WHERE node_id=? AND epoch=? AND seq=?", (ident, epoch, seq)).fetchone()
                 if existing:
@@ -730,8 +643,7 @@ class Store:
                         raise APIError(409, "重复批次的内容不一致，已拒绝覆盖")
                     ack.append({"epoch": epoch, "seq": seq})
                     continue
-                total_agg, usage_agg = {}, {}
-                sums, clean_count = [0, 0], 0
+                clean, sums = [], [0, 0]
                 for item in rows:
                     if not isinstance(item, dict):
                         raise APIError(400, "流量行格式错误")
@@ -740,61 +652,41 @@ class Store:
                     up, down = integer(item.get("up"), "上传字节"), integer(item.get("down"), "下载字节")
                     # A queued batch can arrive after a permanent user deletion.
                     # ACK it without recreating data or blocking the remaining users.
-                    if uid not in valid_users:
+                    if not db.execute("SELECT 1 FROM users WHERE id=?", (uid,)).fetchone():
                         continue
-                    if uid not in assigned_users:
+                    if not db.execute("SELECT 1 FROM assignments WHERE node_id=? AND user_id=?", (ident, uid)).fetchone():
                         raise APIError(403, "上报包含从未分配给本服务器的用户")
                     sums[0] += up
                     sums[1] += down
                     if sums[0] > MAX_BYTES or sums[1] > MAX_BYTES:
                         raise APIError(400, "流量批次超出整数范围")
-                    clean_count += 1
-                    cur = total_agg.get(uid)
-                    if cur is None:
-                        total_agg[uid] = [up, down]
-                    else:
-                        cur[0] += up
-                        cur[1] += down
-                    if up or down:
-                        bucket = (uid, timestamp // 60 * 60)
-                        u_cur = usage_agg.get(bucket)
-                        if u_cur is None:
-                            usage_agg[bucket] = [up, down]
-                        else:
-                            u_cur[0] += up
-                            u_cur[1] += down
-                for uid, (up, down) in total_agg.items():
-                    prev = node_totals.get(uid, [0, 0])
-                    if prev[0] + up > MAX_BYTES or prev[1] + down > MAX_BYTES:
+                    clean.append((uid, timestamp // 60 * 60, up, down))
+                db.execute("INSERT INTO batches VALUES(?,?,?,?,?,?,?,?)", (ident, epoch, seq, payload_hash, now(), len(clean), sums[0], sums[1]))
+                if sums[0] > 0 or sums[1] > 0:
+                    added_traffic = True
+                for uid, timestamp, up, down in clean:
+                    total = db.execute("SELECT up,down FROM totals WHERE node_id=? AND user_id=?", (ident, uid)).fetchone()
+                    if total and (total[0] + up > MAX_BYTES or total[1] + down > MAX_BYTES):
                         raise APIError(400, "累计流量超出整数范围")
-                    node_totals[uid] = [prev[0] + up, prev[1] + down]
-                db.execute("INSERT INTO batches VALUES(?,?,?,?,?,?,?,?)", (ident, epoch, seq, payload_hash, now(), clean_count, sums[0], sums[1]))
-                if total_agg:
-                    db.executemany(
-                        "INSERT INTO totals VALUES(?,?,?,?) ON CONFLICT(node_id,user_id) DO UPDATE SET up=totals.up+excluded.up,down=totals.down+excluded.down",
-                        ((ident, uid, up, down) for uid, (up, down) in total_agg.items()),
-                    )
-                if usage_agg:
-                    db.executemany(
-                        "INSERT INTO usage VALUES(?,?,?,?,?) ON CONFLICT(node_id,user_id,ts) DO UPDATE SET up=usage.up+excluded.up,down=usage.down+excluded.down",
-                        ((ident, uid, ts, up, down) for (uid, ts), (up, down) in usage_agg.items()),
-                    )
-                    has_new_traffic = True
+                    db.execute("INSERT INTO totals VALUES(?,?,?,?) ON CONFLICT(node_id,user_id) DO UPDATE SET up=totals.up+excluded.up,down=totals.down+excluded.down", (ident, uid, up, down))
+                    if up or down:
+                        db.execute("INSERT INTO usage VALUES(?,?,?,?,?) ON CONFLICT(node_id,user_id,ts) DO UPDATE SET up=usage.up+excluded.up,down=usage.down+excluded.down", (ident, uid, timestamp, up, down))
                 ack.append({"epoch": epoch, "seq": seq})
             db.execute("UPDATE nodes SET applied_revision=?,last_seen=?,agent_version=?,last_error=?,sample_error=?,service_running=?,last_sample_at=?,pending_batches=? WHERE id=?",
                        (applied, now(), version, apply_error, collector_error, int(running), last_sample, pending, ident))
-            _, _, cur_month = self._time_bounds(db)
-            if has_new_traffic or (
-                cur_month != self._last_quota_month
-                and db.execute("SELECT 1 FROM user_policies WHERE quota_blocked=1 AND quota_period='monthly' LIMIT 1").fetchone()
-            ):
-                _, quota_changed = self._refresh_quotas(db)
+            offset, today, month = self._time_bounds(db)
+            if added_traffic or self._last_quota_period != (offset, month):
+                _, revision_bumped, quota_period = self._refresh_quotas_checked(db, (offset, today, month))
+                if revision_bumped:
+                    notify_needed = True
             node = self._node(db, ident)
             desired = self._snapshot(db, ident, node["revision"]) if node["status"] == "active" and node["revision"] != applied else None
             result = {"protocol": PROTOCOL, "node_id": ident, "status": node["status"], "server_time": now(), "ack": ack, "desired": desired}
-        self._last_quota_month = cur_month
-        if quota_changed:
-            self.notify_changes()
+        if quota_period is not None:
+            self._last_quota_period = quota_period
+        if notify_needed:
+            with self.changes:
+                self.changes.notify_all()
         # ACK leaves this method only after the surrounding transaction committed.
         return result
 
@@ -812,98 +704,56 @@ class Store:
         gaps = integer(status.get("gaps", 0), "日志缺口", 0)
         collected = integer(status.get("collected_at", 0), "日志读取时间", 0, now() + 300)
         error = error_text(status.get("error", ""), "日志采集错误")
-        # Pre-validate events and authenticate read-only before acquiring the write lock.
-        ts_now = now()
-        parsed_events = []
-        for event in events:
-            if not isinstance(event, dict):
-                raise APIError(400, "行为记录不合法")
-            eid = event.get("id")
-            if not isinstance(eid, str) or not re.fullmatch(r"[0-9a-f]{64}", eid):
-                raise APIError(400, "行为记录 ID 不合法")
-            ts = integer(event.get("ts"), "行为时间", 1577836800, ts_now + 300)
-            kind = event.get("kind")
-            if kind not in ("connection", "error", "gap"):
-                raise APIError(400, "行为类型不合法")
-            uid = event.get("user_id") or None
-            if uid:
-                user_id_valid(uid)
-            fields = [text_value(event.get(key, ""), key, 0, limit) for key, limit in
-                      (("source_ip", 64), ("target", 512), ("network", 8), ("inbound", 100), ("message", 500))]
-            port = integer(event.get("port", 0), "目标端口", 0, 65535)
-            if fields[2] not in ("", "tcp", "udp"):
-                raise APIError(400, "传输协议不合法")
-            payload_hash = digest(canonical([ts, uid, kind, port, fields]))
-            parsed_events.append((eid, uid, ts, kind, port, fields, payload_hash))
-        with self.readonly() as db:
-            node = self._authenticated_node(db, ident, token)
-            if node["status"] != "active":
-                raise APIError(409, "服务器尚未接入")
         ack = []
         with self.transaction(notify=False) as db:
             node = self._authenticated_node(db, ident, token)
             if node["status"] != "active":
                 raise APIError(409, "服务器尚未接入")
             detail_days, summary_days = self._activity_retention(db)
-            ts_commit = now()
-            summary_cutoff = ts_commit - summary_days * 86400
-            detail_cutoff = ts_commit - detail_days * 86400
-            if parsed_events:
-                valid_users = {r[0] for r in db.execute("SELECT id FROM users")}
-                assigned_users = {r[0] for r in db.execute("SELECT user_id FROM assignments WHERE node_id=?", (ident,))}
-                eids = [item[0] for item in parsed_events]
-                placeholders = ",".join("?" for _ in eids)
-                existing_receipts = {r[0]: r[1] for r in db.execute(
-                    f"SELECT event_id,payload_hash FROM activity_receipts WHERE node_id=? AND event_id IN ({placeholders})",
-                    (ident, *eids),
-                )}
-            else:
-                valid_users, assigned_users, existing_receipts = set(), set(), {}
-            receipts_rows, events_rows, hourly_agg = [], [], {}
-            seen_batch = {}
-            for eid, uid, ts, kind, port, fields, payload_hash in parsed_events:
+            for event in events:
+                if not isinstance(event, dict):
+                    raise APIError(400, "行为记录不合法")
+                eid = event.get("id")
+                if not isinstance(eid, str) or not re.fullmatch(r"[0-9a-f]{64}", eid):
+                    raise APIError(400, "行为记录 ID 不合法")
+                ts = integer(event.get("ts"), "行为时间", 1577836800, now() + 300)
+                kind = event.get("kind")
+                if kind not in ("connection", "error", "gap"):
+                    raise APIError(400, "行为类型不合法")
+                uid = event.get("user_id") or None
                 if uid:
-                    if uid not in valid_users:
+                    user_id_valid(uid)
+                    # Late reports must not recreate permanently deleted users.
+                    if not db.execute("SELECT 1 FROM users WHERE id=?", (uid,)).fetchone():
                         ack.append(eid)
                         continue
-                    if uid not in assigned_users:
+                    if not db.execute("SELECT 1 FROM assignments WHERE user_id=? AND node_id=?", (uid, ident)).fetchone():
                         raise APIError(403, "行为用户未分配给本服务器")
-                prev_hash = existing_receipts.get(eid) or seen_batch.get(eid)
-                if prev_hash is not None:
-                    if prev_hash != payload_hash:
+                fields = [text_value(event.get(key, ""), key, 0, limit) for key, limit in
+                          (("source_ip", 64), ("target", 512), ("network", 8), ("inbound", 100), ("message", 500))]
+                port = integer(event.get("port", 0), "目标端口", 0, 65535)
+                if fields[2] not in ("", "tcp", "udp"):
+                    raise APIError(400, "传输协议不合法")
+                payload_hash = digest(canonical([ts, uid, kind, port, fields]))
+                previous = db.execute("SELECT payload_hash FROM activity_receipts WHERE node_id=? AND event_id=?", (ident, eid)).fetchone()
+                if previous:
+                    if previous[0] != payload_hash:
                         raise APIError(409, "重复行为记录的内容不一致")
-                elif ts >= summary_cutoff:
-                    seen_batch[eid] = payload_hash
-                    receipts_rows.append((ident, eid, uid, ts, payload_hash))
-                    if ts >= detail_cutoff:
-                        events_rows.append((ident, eid, uid, ts, kind, fields[0], fields[1], port, fields[2], fields[3], fields[4], ts_commit))
-                    h_key = (uid or "", ts // 3600 * 3600)
-                    h_cur = hourly_agg.get(h_key)
-                    if h_cur is None:
-                        hourly_agg[h_key] = [int(kind == "connection"), int(kind == "error"), int(kind == "gap"), ts]
-                    else:
-                        h_cur[0] += int(kind == "connection")
-                        h_cur[1] += int(kind == "error")
-                        h_cur[2] += int(kind == "gap")
-                        if ts > h_cur[3]:
-                            h_cur[3] = ts
+                elif ts >= now() - summary_days * 86400:
+                    db.execute("INSERT INTO activity_receipts VALUES(?,?,?,?,?)", (ident, eid, uid, ts, payload_hash))
+                    if ts >= now() - detail_days * 86400:
+                        db.execute("INSERT INTO activity_events VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                                   (ident, eid, uid, ts, kind, fields[0], fields[1], port, fields[2], fields[3], fields[4], now()))
+                    db.execute("""INSERT INTO activity_hourly VALUES(?,?,?,?,?,?,?)
+                               ON CONFLICT(node_id,user_id,hour) DO UPDATE SET
+                               connections=connections+excluded.connections,errors=errors+excluded.errors,
+                               gaps=gaps+excluded.gaps,last_at=MAX(last_at,excluded.last_at)""",
+                               (ident, uid or "", ts // 3600 * 3600, int(kind == "connection"), int(kind == "error"), int(kind == "gap"), ts))
                 ack.append(eid)
-            if receipts_rows:
-                db.executemany("INSERT INTO activity_receipts VALUES(?,?,?,?,?)", receipts_rows)
-            if events_rows:
-                db.executemany("INSERT INTO activity_events VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", events_rows)
-            if hourly_agg:
-                db.executemany(
-                    """INSERT INTO activity_hourly VALUES(?,?,?,?,?,?,?)
-                       ON CONFLICT(node_id,user_id,hour) DO UPDATE SET
-                       connections=connections+excluded.connections,errors=errors+excluded.errors,
-                       gaps=gaps+excluded.gaps,last_at=MAX(last_at,excluded.last_at)""",
-                    ((ident, u_key, hour, v[0], v[1], v[2], v[3]) for (u_key, hour), v in hourly_agg.items()),
-                )
             db.execute("""INSERT INTO activity_status VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(node_id) DO UPDATE SET
                        received_at=excluded.received_at,collected_at=excluded.collected_at,pending=excluded.pending,
                        dropped=excluded.dropped,gaps=excluded.gaps,error=excluded.error,source=excluded.source""",
-                       (ident, ts_commit, collected, pending, dropped, gaps, error, "file"))
+                       (ident, now(), collected, pending, dropped, gaps, error, "file"))
         return {"protocol": PROTOCOL, "ack": ack}
 
     @staticmethod
@@ -923,12 +773,11 @@ class Store:
             page = integer(int(query.get("page", ["1"])[0]), "页码", 1, 1000000)
         except (ValueError, TypeError):
             raise APIError(400, "时间范围或页码不合法")
-        with self.readonly() as db:
+        with self.connect() as db:
             detail_days, summary_days = self._activity_retention(db)
             hours = min(hours, summary_days * 24)
-            ts_now = now()
-            since = ts_now // 3600 * 3600 - (hours - 1) * 3600
-            detail_since = max(since, ts_now - detail_days * 86400)
+            since = now() // 3600 * 3600 - (hours - 1) * 3600
+            detail_since = max(since, now() - detail_days * 86400)
             conditions, params = [], []
             for key, value in (("user_id", uid), ("node_id", nid)):
                 if value:
@@ -959,20 +808,18 @@ class Store:
         return {"summary": summary, "hourly": hourly, "events": events, "users": users, "nodes": nodes,
                 **rankings, "telemetry": telemetry, "page": page, "total": total, "page_size": 50,
                 "since": since, "detail_since": detail_since, "detail_days": detail_days,
-                "summary_days": summary_days, "hours": hours, "server_time": ts_now}
+                "summary_days": summary_days, "hours": hours}
 
 
     def detach(self, data, token):
         self._protocol(data)
         ident = node_id_valid(data.get("node_id"))
-        with self.readonly() as db:
-            self._authenticated_node(db, ident, token)
-        with self.transaction(notify=True) as db:
+        with self.transaction() as db:
             node = self._authenticated_node(db, ident, token)
             self._purge_node(db, ident)
             self._refresh_quotas(db)
             self.audit(db, ident, "node.detach", node["name"] + "：主动解绑并删除服务器及关联流量")
-        return {"ok": True, "protocol": PROTOCOL, "node_id": ident}
+        return {"ok": True, "protocol": PROTOCOL}
 
     @staticmethod
     def _check_assignments(db, uid, user_uuid, node_ids):
@@ -992,8 +839,7 @@ class Store:
             raise APIError(400, "用户资料格式错误")
         if uid:
             user_id_valid(uid)
-        requires_sync = False
-        with self.transaction(notify=False) as db:
+        with self.transaction() as db:
             old = db.execute("SELECT * FROM users WHERE id=? AND deleted=0", (uid,)).fetchone() if uid else None
             if uid and not old:
                 raise APIError(404, "用户不存在或已删除")
@@ -1034,8 +880,6 @@ class Store:
                 self.audit(db, actor, "user.update" if old else "user.create", f"{name}：{'启用' if enabled else '禁用'}，授权 {len(node_ids)} 台服务器" + ("，重置凭据" if reset else ""))
             self._refresh_quotas(db)
             requires_sync = any(r["id"] in revisions and r["revision"] != revisions[r["id"]] for r in db.execute("SELECT id,revision FROM nodes"))
-        if requires_sync:
-            self.notify_changes()
         return {"id": uid, "ok": True, "changed": bool(changed), "requires_sync": requires_sync}
 
     @staticmethod
@@ -1054,7 +898,7 @@ class Store:
 
     def delete_user(self, uid, actor):
         user_id_valid(uid)
-        with self.transaction(notify=True) as db:
+        with self.transaction() as db:
             user = db.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
             if not user:
                 raise APIError(404, "用户不存在")
@@ -1068,69 +912,48 @@ class Store:
                    (uid, secrets.token_urlsafe(32)))
         return db.execute("SELECT * FROM user_policies WHERE user_id=?", (uid,)).fetchone()
 
-    def _quota_values(self, db, uid=None, limited_only=False):
-        offset, today, month = self._time_bounds(db)
+    def _quota_values(self, db, bounds=None):
+        offset, today, month = bounds if bounds is not None else self._time_bounds(db)
         tz = dt.timezone(dt.timedelta(minutes=offset))
         current = dt.datetime.fromtimestamp(month, tz)
         end = int(dt.datetime(current.year + (current.month == 12), current.month % 12 + 1, 1, tzinfo=tz).timestamp())
-        clauses = ["u.deleted=0"]
-        params = []
-        if uid is not None:
-            clauses.append("p.user_id=?")
-            params.append(uid)
-        elif limited_only:
-            clauses.append("(p.quota_bytes>0 OR p.quota_blocked=1)")
-        policy_rows = db.execute("SELECT p.* FROM user_policies p JOIN users u ON u.id=p.user_id WHERE " + " AND ".join(clauses), params).fetchall()
-        if not policy_rows:
-            return {}
         values = {r["user_id"]: {"quota_bytes": r["quota_bytes"], "quota_period": r["quota_period"],
                                    "quota_up": 0, "quota_down": 0,
                                    "quota_reset": end if r["quota_period"] == "monthly" else 0}
-                  for r in policy_rows}
-        has_total = any(r["quota_period"] == "total" for r in policy_rows)
-        has_monthly = any(r["quota_period"] == "monthly" for r in policy_rows)
-        if has_total:
-            if uid is not None:
-                t_rows = db.execute("SELECT user_id,up,down FROM totals WHERE user_id=?", (uid,))
-            else:
-                extra = " AND (p.quota_bytes>0 OR p.quota_blocked=1)" if limited_only else ""
-                t_rows = db.execute("SELECT t.user_id,t.up,t.down FROM totals t JOIN user_policies p ON p.user_id=t.user_id WHERE p.quota_period='total'" + extra)
-            for r in t_rows:
-                if r["user_id"] in values:
-                    entry = values[r["user_id"]]
-                    entry["quota_up"] += r["up"]
-                    entry["quota_down"] += r["down"]
-        if has_monthly:
-            if uid is not None:
-                m_rows = db.execute("SELECT user_id,SUM(up) up,SUM(down) down FROM usage WHERE user_id=? AND ts>=? AND ts<? GROUP BY node_id,user_id", (uid, month, end))
-            else:
-                extra = " AND (p.quota_bytes>0 OR p.quota_blocked=1)" if limited_only else ""
-                m_rows = db.execute("SELECT u.user_id,SUM(u.up) up,SUM(u.down) down FROM usage u JOIN user_policies p ON p.user_id=u.user_id WHERE p.quota_period='monthly'" + extra + " AND u.ts>=? AND u.ts<? GROUP BY u.node_id,u.user_id", (month, end))
-            for r in m_rows:
-                if r["user_id"] in values:
-                    entry = values[r["user_id"]]
-                    entry["quota_up"] += r["up"]
-                    entry["quota_down"] += r["down"]
+                  for r in db.execute("SELECT p.* FROM user_policies p JOIN users u ON u.id=p.user_id WHERE u.deleted=0")}
+        for r in db.execute("SELECT t.user_id,t.up,t.down FROM totals t JOIN user_policies p ON p.user_id=t.user_id WHERE p.quota_period='total'"):
+            if r["user_id"] in values:
+                entry = values[r["user_id"]]
+                entry["quota_up"] += r["up"]
+                entry["quota_down"] += r["down"]
+        for r in db.execute("SELECT u.user_id,SUM(u.up) up,SUM(u.down) down FROM usage u JOIN user_policies p ON p.user_id=u.user_id WHERE p.quota_period='monthly' AND u.ts>=? AND u.ts<? GROUP BY u.node_id,u.user_id", (month, end)):
+            if r["user_id"] in values:
+                entry = values[r["user_id"]]
+                entry["quota_up"] += r["up"]
+                entry["quota_down"] += r["down"]
         for entry in values.values():
             entry["quota_used"] = entry["quota_up"] + entry["quota_down"]
             entry["quota_blocked"] = bool(entry["quota_bytes"] and entry["quota_used"] >= entry["quota_bytes"])
             entry["quota_remaining"] = max(0, entry["quota_bytes"] - entry["quota_used"]) if entry["quota_bytes"] else None
         return values
 
-    def _refresh_quotas(self, db):
-        values = self._quota_values(db, limited_only=True)
+    def _refresh_quotas_checked(self, db, bounds=None):
+        offset, today, month = bounds if bounds is not None else self._time_bounds(db)
+        values = self._quota_values(db, (offset, today, month))
         revision_bumped = False
-        if not values:
-            return values, False
-        for policy in db.execute("SELECT p.user_id,p.quota_blocked,u.enabled FROM user_policies p JOIN users u ON u.id=p.user_id WHERE p.quota_bytes>0 OR p.quota_blocked=1").fetchall():
+        for policy in db.execute("SELECT p.user_id,p.quota_blocked,u.enabled FROM user_policies p JOIN users u ON u.id=p.user_id").fetchall():
             entry = values.get(policy["user_id"])
             if entry and bool(policy["quota_blocked"]) != entry["quota_blocked"]:
                 db.execute("UPDATE user_policies SET quota_blocked=? WHERE user_id=?", (int(entry["quota_blocked"]), policy["user_id"]))
                 if policy["enabled"]:
-                    res = db.execute("UPDATE nodes SET revision=revision+1 WHERE status='active' AND id IN (SELECT node_id FROM assignments WHERE user_id=? AND active=1)", (policy["user_id"],))
-                    if res.rowcount:
-                        revision_bumped = True
-        return values, revision_bumped
+                    cur = db.execute("UPDATE nodes SET revision=revision+1 WHERE status='active' AND id IN (SELECT node_id FROM assignments WHERE user_id=? AND active=1)", (policy["user_id"],))
+                    revision_bumped = revision_bumped or bool(cur.rowcount)
+        return values, revision_bumped, (offset, month)
+
+    def _refresh_quotas(self, db):
+        values, _, period = self._refresh_quotas_checked(db)
+        self._last_quota_period = period
+        return values
 
     @staticmethod
     def _subscription_nodes(db, user):
@@ -1179,17 +1002,7 @@ class Store:
 
     def subscription_info(self, uid, actor=None, reset=False, data=None):
         user_id_valid(uid)
-        if not reset and data is None:
-            with self.readonly() as db:
-                user = db.execute("SELECT * FROM users WHERE id=? AND deleted=0", (uid,)).fetchone()
-                if not user:
-                    raise APIError(404, "用户不存在或已删除")
-                policy = db.execute("SELECT * FROM user_policies WHERE user_id=?", (uid,)).fetchone()
-                if not policy:
-                    raise APIError(404, "用户订阅策略缺失")
-                quota = self._quota_values(db, uid=uid)[uid]
-                return self._subscription_metadata(db, user, policy, quota)
-        with self.transaction(notify=False) as db:
+        with self.transaction() as db:
             user = db.execute("SELECT * FROM users WHERE id=? AND deleted=0", (uid,)).fetchone()
             if not user:
                 raise APIError(404, "用户不存在或已删除")
@@ -1206,7 +1019,7 @@ class Store:
                 db.execute("UPDATE user_policies SET subscription_token=? WHERE user_id=?", (secrets.token_urlsafe(32), uid))
                 self.audit(db, actor, "user.subscription.reset", user["name"])
             policy = self._policy(db, uid)
-            quota = self._quota_values(db, uid=uid)[uid]
+            quota = self._refresh_quotas(db)[uid]
             return self._subscription_metadata(db, user, policy, quota)
 
     def _subscription_metadata(self, db, user, policy, quota):
@@ -1219,14 +1032,11 @@ class Store:
                 "url": path, "clash": path + "/clash", "v2ray": path + "/v2ray", "nodes_count": len(proxies), "missing": missing}
 
     def list_subscriptions(self):
-        with self.readonly() as db:
+        with self.transaction() as db:
             users = db.execute("SELECT * FROM users WHERE deleted=0 ORDER BY name COLLATE NOCASE").fetchall()
-            policies = {r["user_id"]: r for r in db.execute("SELECT * FROM user_policies")}
-            quotas = self._quota_values(db)
-            return {"subscriptions": [
-                self._subscription_metadata(db, user, policies[user["id"]], quotas[user["id"]])
-                for user in users if user["id"] in policies and user["id"] in quotas
-            ]}
+            policies = {user["id"]: self._policy(db, user["id"]) for user in users}
+            quotas = self._refresh_quotas(db)
+            return {"subscriptions": [self._subscription_metadata(db, user, policies[user["id"]], quotas[user["id"]]) for user in users]}
 
     @staticmethod
     def subscription_format(kind=None, user_agent="", accept=""):
@@ -1252,23 +1062,19 @@ class Store:
 
     def subscription(self, token, kind=None, user_agent="", accept=""):
         kind = self.subscription_format(kind, user_agent, accept)
-        with self.readonly() as db:
-            row = db.execute(
-                "SELECT u.*, p.quota_bytes, p.quota_period, p.quota_blocked, p.subscription_name, "
-                "p.subscription_enabled, p.subscription_expires_at, p.subscription_token "
-                "FROM users u JOIN user_policies p ON p.user_id=u.id "
-                "WHERE p.subscription_token=? AND u.deleted=0", (token,),
-            ).fetchone()
-            if not row:
+        with self.transaction() as db:
+            user = db.execute("SELECT u.* FROM users u JOIN user_policies p ON p.user_id=u.id WHERE p.subscription_token=? AND u.deleted=0", (token,)).fetchone()
+            if not user:
                 raise APIError(404, "订阅不存在")
-            if not row["subscription_enabled"]:
+            policy = self._policy(db, user["id"])
+            if not policy["subscription_enabled"]:
                 raise APIError(403, "订阅已停用")
-            if row["subscription_expires_at"] and row["subscription_expires_at"] <= now():
+            if policy["subscription_expires_at"] and policy["subscription_expires_at"] <= now():
                 raise APIError(403, "订阅已过期")
-            quota = self._quota_values(db, uid=row["id"])[row["id"]]
-            if not row["enabled"] or quota["quota_blocked"]:
-                raise APIError(403, "用户已停用" if not row["enabled"] else "流量额度已用尽")
-            proxies, links, missing = self._subscription_nodes(db, row)
+            quota = self._refresh_quotas(db)[user["id"]]
+            if not user["enabled"] or quota["quota_blocked"]:
+                raise APIError(403, "用户已停用" if not user["enabled"] else "流量额度已用尽")
+            proxies, links, missing = self._subscription_nodes(db, user)
             if not proxies:
                 raise APIError(409, "没有可导出的节点，请授权服务器，并更新节点端脚本后同步订阅信息")
             if kind == "clash":
@@ -1281,7 +1087,7 @@ class Store:
                 group = {"name": group_name, "type": "select", "proxies": [p["name"] for p in proxies]}
                 replacements = {"proxies": "\n".join("  - " + json.dumps(p, ensure_ascii=False) for p in proxies),
                                 "proxy_names": json.dumps(group["proxies"], ensure_ascii=False),
-                                "subscription_name": json.dumps(row["subscription_name"], ensure_ascii=False),
+                                "subscription_name": json.dumps(policy["subscription_name"], ensure_ascii=False),
                                 "group_name": json.dumps(group_name),
                                 "proxy_groups": "  - " + json.dumps(group, ensure_ascii=False),
                                 "rules": "  - " + json.dumps("MATCH," + group_name)}
@@ -1294,12 +1100,12 @@ class Store:
             userinfo = f"upload={quota['quota_up']}; download={quota['quota_down']}"
             if quota["quota_bytes"]:
                 userinfo += f"; total={quota['quota_bytes']}"
-            if row["subscription_expires_at"]:
-                userinfo += f"; expire={row['subscription_expires_at']}"
+            if policy["subscription_expires_at"]:
+                userinfo += f"; expire={policy['subscription_expires_at']}"
             headers = {"Subscription-Userinfo": userinfo,
-                       "Profile-Title": "base64:" + base64.b64encode(row["subscription_name"].encode("utf-8")).decode("ascii"),
+                       "Profile-Title": "base64:" + base64.b64encode(policy["subscription_name"].encode("utf-8")).decode("ascii"),
                        "Vary": "User-Agent, Accept",
-                       "profile-update-interval": "6", "Content-Disposition": "attachment; filename=\"subscription." + suffix + "\"; filename*=UTF-8''" + urllib.parse.quote(row["subscription_name"] + "." + suffix, safe="")}
+                       "profile-update-interval": "6", "Content-Disposition": "attachment; filename=\"subscription." + suffix + "\"; filename*=UTF-8''" + urllib.parse.quote(policy["subscription_name"] + "." + suffix, safe="")}
             return body.encode("utf-8"), content_type, headers
 
     @staticmethod
@@ -1354,16 +1160,12 @@ class Store:
                 "retained_since": dt.datetime.fromtimestamp(cutoff, tz).strftime("%Y-%m-%d %H:%M")}
 
     def list_users(self, selected_month=None):
-        with self.readonly() as db:
-            ts_now = now()
+        with self.connect() as db:
             offset, today, month = self._time_bounds(db)
-            tz = dt.timezone(dt.timedelta(minutes=offset))
-            cur_m = dt.datetime.fromtimestamp(month, tz)
-            month_end = int(dt.datetime(cur_m.year + (cur_m.month == 12), cur_m.month % 12 + 1, 1, tzinfo=tz).timestamp())
             period = self._month_period(db, offset, today, selected_month)
             rows = db.execute("SELECT u.id,u.name,u.enabled,u.deleted,u.origin_node,u.created_at,u.updated_at,COALESCE(p.quota_bytes,0) quota_bytes,COALESCE(p.quota_period,'monthly') quota_period FROM users u LEFT JOIN user_policies p ON p.user_id=u.id WHERE u.deleted=0 ORDER BY u.name COLLATE NOCASE").fetchall()
             result = []
-            totals, today_values, month_dirs, period_values = {}, {}, {}, {}
+            totals, today_values, month_values, period_values = {}, {}, {}, {}
             for r in db.execute("SELECT user_id,up,down FROM totals"):
                 entry = totals.setdefault(r["user_id"], {"up": 0, "down": 0})
                 entry["up"] += r["up"]
@@ -1372,67 +1174,56 @@ class Store:
             # Group each direction per node/user to retain exact int64 sums in SQL.
             usage = db.execute("""
                 SELECT user_id,
-                       SUM(CASE WHEN ts>=? AND ts<? THEN up ELSE 0 END) month_up,
-                       SUM(CASE WHEN ts>=? AND ts<? THEN down ELSE 0 END) month_down,
+                       SUM(CASE WHEN ts>=? THEN up ELSE 0 END) month_up,
+                       SUM(CASE WHEN ts>=? THEN down ELSE 0 END) month_down,
                        SUM(CASE WHEN ts>=? THEN up ELSE 0 END) today_up,
                        SUM(CASE WHEN ts>=? THEN down ELSE 0 END) today_down,
                        SUM(CASE WHEN ts>=? AND ts<? THEN up ELSE 0 END) period_up,
                        SUM(CASE WHEN ts>=? AND ts<? THEN down ELSE 0 END) period_down
                 FROM usage WHERE ts>=? GROUP BY node_id,user_id
-            """, (month, month_end, month, month_end, today, today, period["start"], period["end"],
+            """, (month, month, today, today, period["start"], period["end"],
                   period["start"], period["end"], min(month, period["start"])))
             for r in usage:
                 uid = r["user_id"]
                 today_values[uid] = today_values.get(uid, 0) + r["today_up"] + r["today_down"]
-                m_entry = month_dirs.setdefault(uid, {"up": 0, "down": 0})
-                m_entry["up"] += r["month_up"]
-                m_entry["down"] += r["month_down"]
+                month_values[uid] = month_values.get(uid, 0) + r["month_up"] + r["month_down"]
                 entry = period_values.setdefault(uid, {"period_up": 0, "period_down": 0})
                 entry["period_up"] += r["period_up"]
                 entry["period_down"] += r["period_down"]
             assignments = {}
             for r in db.execute("SELECT a.user_id,n.id,n.name,n.status,n.revision,n.applied_revision,n.last_seen FROM assignments a JOIN nodes n ON n.id=a.node_id WHERE a.active=1"):
-                assignments.setdefault(r["user_id"], []).append({
-                    **{k: r[k] for k in ("id", "name", "status", "revision", "applied_revision", "last_seen")},
-                    "online": bool(r["last_seen"] >= ts_now - 60 and r["status"] in ("pending", "active")),
-                })
+                assignments.setdefault(r["user_id"], []).append({k: r[k] for k in ("id", "name", "status", "revision", "applied_revision", "last_seen")})
+            quota_values = self._quota_values(db) if any(row["quota_bytes"] for row in rows) else {}
             for row in rows:
                 item = dict(row)
                 item["enabled"], item["deleted"] = bool(item["enabled"]), bool(item["deleted"])
                 item.update(totals.get(row["id"], {"up": 0, "down": 0}))
-                m_dir = month_dirs.get(row["id"], {"up": 0, "down": 0})
-                month_total = m_dir["up"] + m_dir["down"]
-                item.update(total=item["up"] + item["down"], today=today_values.get(row["id"], 0), month=month_total, nodes=assignments.get(row["id"], []))
+                item.update(total=item["up"] + item["down"], today=today_values.get(row["id"], 0), month=month_values.get(row["id"], 0), nodes=assignments.get(row["id"], []))
                 item.update(period_values.get(row["id"], {"period_up": 0, "period_down": 0}))
                 item["period_total"] = item["period_up"] + item["period_down"]
-                is_monthly = item["quota_period"] == "monthly"
-                item["quota_up"] = m_dir["up"] if is_monthly else item["up"]
-                item["quota_down"] = m_dir["down"] if is_monthly else item["down"]
-                item["quota_used"] = item["quota_up"] + item["quota_down"]
+                item["quota_used"] = item["month"] if item["quota_period"] == "monthly" else item["total"]
                 item["quota_blocked"] = bool(item["quota_bytes"] and item["quota_used"] >= item["quota_bytes"])
-                item["quota_remaining"] = max(0, item["quota_bytes"] - item["quota_used"]) if item["quota_bytes"] else None
-                item["quota_reset"] = month_end if is_monthly else 0
+                if item["quota_bytes"]:
+                    item.update(quota_values.get(row["id"], {}))
                 result.append(item)
             return {"users": result, "timezone_offset": offset, "period": period,
-                    "detail_retention_days": DETAIL_RETENTION_DAYS, "server_time": ts_now}
+                    "detail_retention_days": DETAIL_RETENTION_DAYS}
 
     def user_detail(self, uid):
         user_id_valid(uid)
-        with self.readonly() as db:
+        with self.connect() as db:
             row = db.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
             if not row:
                 raise APIError(404, "用户不存在")
             result = dict(row)
-            policy = db.execute("SELECT quota_bytes,quota_period FROM user_policies WHERE user_id=?", (uid,)).fetchone()
-            result.update(quota_bytes=policy["quota_bytes"] if policy else 0,
-                          quota_period=policy["quota_period"] if policy else "monthly")
+            policy = self._policy(db, uid)
+            result.update(quota_bytes=policy["quota_bytes"], quota_period=policy["quota_period"])
             result["enabled"], result["deleted"] = bool(result["enabled"]), bool(result["deleted"])
             result["node_ids"] = [r[0] for r in db.execute("SELECT node_id FROM assignments WHERE user_id=? AND active=1", (uid,))]
             return result
 
     def list_nodes(self):
-        with self.readonly() as db:
-            ts_now = now()
+        with self.connect() as db:
             result, totals = [], {}
             counts = {r["node_id"]: r["count"] for r in db.execute(
                 "SELECT a.node_id,COUNT(*) count FROM assignments a JOIN users u ON u.id=a.user_id "
@@ -1444,7 +1235,7 @@ class Store:
                 entry["total"] += r["up"] + r["down"]
             for row in db.execute("SELECT * FROM nodes ORDER BY created_at DESC,id"):
                 item = {k: row[k] for k in ("id", "name", "status", "hostname", "revision", "applied_revision", "last_seen", "agent_version", "last_error", "sample_error", "service_running", "last_sample_at", "pending_batches", "created_at", "approved_at", "join_expires")}
-                item["online"] = bool(row["last_seen"] >= ts_now - 60 and row["status"] in ("pending", "active"))
+                item["online"] = bool(row["last_seen"] >= now() - 60 and row["status"] in ("pending", "active"))
                 item["service_running"] = bool(item["service_running"])
                 inventory = json.loads(row["inventory"])
                 item["inbounds"] = inventory.get("inbounds", [])
@@ -1452,11 +1243,10 @@ class Store:
                 item["users_count"] = counts.get(row["id"], 0)
                 item.update(totals.get(row["id"], {"up": 0, "down": 0, "total": 0}))
                 result.append(item)
-            return {"nodes": result, "server_time": ts_now}
+            return {"nodes": result, "server_time": now()}
 
     def overview(self):
-        with self.readonly() as db:
-            ts_now = now()
+        with self.connect() as db:
             offset, today, month = self._time_bounds(db)
             all_totals = self._sum(db.execute("SELECT up,down FROM totals"))
             daily, monthly = {"up": 0, "down": 0, "total": 0}, {"up": 0, "down": 0, "total": 0}
@@ -1470,9 +1260,9 @@ class Store:
             nodes = db.execute("SELECT status,last_seen,revision,applied_revision,last_error,sample_error FROM nodes").fetchall()
             users = db.execute("SELECT COUNT(*),COALESCE(SUM(CASE WHEN u.enabled=1 AND COALESCE(p.quota_blocked,0)=0 THEN 1 ELSE 0 END),0) FROM users u LEFT JOIN user_policies p ON p.user_id=u.id WHERE u.deleted=0").fetchone()
             active = [n for n in nodes if n["status"] == "active"]
-            return {"version": VERSION, "server_time": ts_now, "timezone_offset": offset,
+            return {"version": VERSION, "server_time": now(), "timezone_offset": offset,
                     "users": users[0], "enabled_users": users[1], "nodes": len(active),
-                    "online_nodes": sum(n["last_seen"] >= ts_now - 60 for n in active),
+                    "online_nodes": sum(n["last_seen"] >= now() - 60 for n in active),
                     "pending_nodes": sum(n["status"] == "pending" for n in nodes),
                     "unsynced_nodes": sum(n["revision"] != n["applied_revision"] for n in active),
                     "error_nodes": sum(bool(n["last_error"] or n["sample_error"]) for n in active),
@@ -1493,8 +1283,7 @@ class Store:
             clauses.append("u.node_id=?")
             params.append(node_id)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
-        with self.readonly() as db:
-            ts_now = now()
+        with self.connect() as db:
             offset, today, month = self._time_bounds(db)
             totals = self._sum(db.execute("SELECT u.up,u.down FROM totals u" + where, params))
             # Dates derive from sample timestamps, not upload arrival timestamps.
@@ -1528,7 +1317,7 @@ class Store:
             if period is not None:
                 period.update(self._sum((row["up"], row["down"]) for row in daily))
                 names = {r["id"]: r["name"] for r in db.execute("SELECT id,name FROM nodes")}
-                by_node = [{"id": ident, "name": names.get(ident, ident), **values,
+                by_node = [{"id": ident, "name": names[ident], **values,
                             "total": values["up"] + values["down"]}
                            for ident, values in period_nodes.items()]
                 by_node.sort(key=lambda node: node["total"], reverse=True)
@@ -1542,29 +1331,26 @@ class Store:
                 by_node = sorted(node_totals.values(), key=lambda n: n["total"], reverse=True)
             return {"lifetime": totals, "daily": daily, "by_node": by_node, "timezone_offset": offset,
                     "sample_time_basis": True, "detail_retention_days": DETAIL_RETENTION_DAYS,
-                    "period": period, "server_time": ts_now}
+                    "period": period}
 
     def logs(self):
-        with self.readonly() as db:
+        with self.connect() as db:
             return {"logs": [dict(r) for r in db.execute("SELECT * FROM audit ORDER BY id DESC LIMIT 200")]}
 
     def settings(self):
-        with self.readonly() as db:
+        with self.connect() as db:
             return {r[0]: int(r[1]) if r[0] in ("timezone_offset", "activity_detail_days", "activity_summary_days") else r[1] for r in db.execute("SELECT key,value FROM settings")}
 
     def save_settings(self, data, actor):
         if not isinstance(data, dict):
             raise APIError(400, "设置格式错误")
-        quota_changed = False
-        new_quota_month = None
-        with self.transaction(notify=False) as db:
+        with self.transaction() as db:
             if "timezone_offset" in data:
                 offset = integer(data["timezone_offset"], "时区偏移", -720, 840)
                 if offset % 15:
                     raise APIError(400, "时区偏移必须是 15 分钟的整数倍")
                 db.execute("UPDATE settings SET value=? WHERE key='timezone_offset'", (str(offset),))
-                _, quota_changed = self._refresh_quotas(db)
-                _, _, new_quota_month = self._time_bounds(db)
+                self._refresh_quotas(db)
                 self.audit(db, actor, "settings.timezone", f"UTC 偏移 {offset} 分钟")
             detail, summary = self._activity_retention(db)
             detail = integer(data.get("activity_detail_days", detail), "行为明细保留天数", 1, 30)
@@ -1579,7 +1365,7 @@ class Store:
                     continue
                 value = data[key]
                 limit = 64000 if key == "clash_template" else 160
-                if not isinstance(value, str) or not value.strip() or len(value) > limit or any((ord(c) < 32 and c not in "\n\r\t") or ord(c) == 127 for c in value):
+                if not isinstance(value, str) or not value.strip() or len(value) > limit or any(ord(c) < 32 and c not in "\n\r\t" for c in value):
                     raise APIError(400, "模板为空、过长或包含无效字符")
                 if key == "node_name_template" and any(c in value for c in "\n\r\t"):
                     raise APIError(400, "节点名称模板须为单行文本")
@@ -1590,10 +1376,6 @@ class Store:
                     raise APIError(400, "Clash 模板必须包含一个 {{proxies}} 占位符")
                 db.execute("UPDATE settings SET value=? WHERE key=?", (value, key))
                 self.audit(db, actor, "settings.subscription", "更新订阅模板")
-        if new_quota_month is not None:
-            self._last_quota_month = new_quota_month
-        if quota_changed:
-            self.notify_changes()
         return {"ok": True}
 
     def maintain(self, force=False):
@@ -1602,80 +1384,22 @@ class Store:
         if not self.maintenance_lock.acquire(blocking=False):
             return
         try:
-            with self.readonly() as db:
-                detail, summary = self._activity_retention(db)
-                _, _, cur_month = self._time_bounds(db)
-            if cur_month != self._last_quota_month:
-                quota_changed = False
-                with self.transaction(notify=False) as db:
-                    _, _, cur_month = self._time_bounds(db)
-                    if db.execute("SELECT 1 FROM user_policies WHERE quota_blocked=1 AND quota_period='monthly' LIMIT 1").fetchone():
-                        _, quota_changed = self._refresh_quotas(db)
-                self._last_quota_month = cur_month
-                if quota_changed:
-                    self.notify_changes()
-            ts_now = now()
-            # Keep each cleanup transaction short (5,000 rows) to avoid blocking live traffic writes.
             with self.transaction(notify=False) as db:
-                db.execute("DELETE FROM sessions WHERE expires_at<=?", (ts_now,))
+                db.execute("DELETE FROM sessions WHERE expires_at<=?", (now(),))
+                db.execute("DELETE FROM usage WHERE rowid IN (SELECT rowid FROM usage WHERE ts<? LIMIT 25000)", (now() - DETAIL_RETENTION_DAYS * 86400,))
+                detail, summary = self._activity_retention(db)
+                for table, column, days in (("activity_events", "ts", detail), ("activity_receipts", "ts", summary), ("activity_hourly", "hour", summary)):
+                    db.execute(f"DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} WHERE {column}<? LIMIT 25000)", (now() - days * 86400,))
                 db.execute("DELETE FROM audit WHERE id NOT IN (SELECT id FROM audit ORDER BY id DESC LIMIT 10000)")
-            for table, column, cutoff in (
-                ("usage", "ts", ts_now - DETAIL_RETENTION_DAYS * 86400),
-                ("activity_events", "ts", ts_now - detail * 86400),
-                ("activity_receipts", "ts", ts_now - summary * 86400),
-                ("activity_hourly", "hour", ts_now - summary * 86400),
-            ):
-                if self.closing:
-                    break
-                with self.transaction(notify=False) as db:
-                    db.execute(f"DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} WHERE {column}<? LIMIT 5000)", (cutoff,))
-            if not self.closing:
-                batch_cutoff = ts_now - BATCH_RECEIPT_DAYS * 86400
-                with self.transaction(notify=False) as db:
-                    # Advance per-(node, epoch) watermarks only across contiguous sequences before pruning.
-                    stale = db.execute(
-                        "SELECT rowid,node_id,epoch,seq FROM batches WHERE received_at<? ORDER BY node_id,epoch,seq LIMIT 5000",
-                        (batch_cutoff,),
-                    ).fetchall()
-                    if stale:
-                        current_wm = {}
-                        for _, nid, ep, _ in stale:
-                            if (nid, ep) not in current_wm:
-                                row = db.execute("SELECT pruned_seq FROM batch_watermarks WHERE node_id=? AND epoch=?", (nid, ep)).fetchone()
-                                current_wm[(nid, ep)] = row[0] if row else 0
-                        prunable_rowids = []
-                        updated_wm = {}
-                        for rowid, nid, ep, seq in stale:
-                            wm = updated_wm.get((nid, ep), current_wm[(nid, ep)])
-                            if seq <= wm + 1:
-                                prunable_rowids.append((rowid,))
-                                if seq > wm:
-                                    updated_wm[(nid, ep)] = seq
-                        if updated_wm:
-                            db.executemany(
-                                "INSERT INTO batch_watermarks(node_id,epoch,pruned_seq) VALUES(?,?,?) "
-                                "ON CONFLICT(node_id,epoch) DO UPDATE SET pruned_seq=MAX(batch_watermarks.pruned_seq,excluded.pruned_seq)",
-                                ((nid, ep, seq) for (nid, ep), seq in updated_wm.items()),
-                            )
-                        if prunable_rowids:
-                            db.executemany("DELETE FROM batches WHERE rowid=?", prunable_rowids)
-            with self.connect() as db:
-                db.execute("PRAGMA incremental_vacuum(256)")
-                db.execute("PRAGMA wal_checkpoint(PASSIVE)")
-                db.execute("PRAGMA optimize")
             self.last_maintenance = time.monotonic()
         finally:
             self.maintenance_lock.release()
 
     @contextlib.contextmanager
-    def backup(self, actor="admin"):
-        if not self.backup_lock.acquire(blocking=False):
-            raise APIError(429, "已有其他备份任务正在执行，请稍后再试")
+    def backup(self):
         handle, pathname = tempfile.mkstemp(prefix="ysq-backup-", suffix=".db", dir=self.directory)
         os.close(handle)
         try:
-            with self.transaction(notify=False) as db:
-                self.audit(db, actor, "admin.backup", "导出数据库备份")
             with self.connect() as src:
                 dest = sqlite3.connect(pathname)
                 try:
@@ -1688,281 +1412,35 @@ class Store:
         finally:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(pathname)
-            self.backup_lock.release()
 
 
 class RateLimiter:
-    """Per-IP frequency + per-account and per-(IP,account) failure limiter."""
-
-    def __init__(self, ip_per_min=20, key_fail_limit=8, user_fail_limit=20, window=900):
+    def __init__(self):
         self.lock = threading.Lock()
-        self.ip_hits = {}
-        self.key_failures = {}
-        self.user_failures = {}
-        self.ip_per_min = ip_per_min
-        self.key_fail_limit = key_fail_limit
-        self.user_fail_limit = user_fail_limit
-        self.window = window
+        self.failures = {}
+        self.total = []
 
-    @staticmethod
-    def _prune(store, cutoff, max_entries=5000):
-        if len(store) > max_entries:
-            pruned = {k: [v for v in vals if v > cutoff] for k, vals in store.items()}
-            store.clear()
-            store.update({k: v for k, v in pruned.items() if v})
-
-    def check(self, ip, username):
-        stamp = time.monotonic()
-        u_key = username.lower()
-        pair = ip + "|" + u_key
-        with self.lock:
-            hits = [x for x in self.ip_hits.get(ip, []) if x > stamp - 60]
-            if len(hits) >= self.ip_per_min:
-                self.ip_hits[ip] = hits
-                raise APIError(429, "请求过于频繁，请一分钟后重试")
-            hits.append(stamp)
-            self.ip_hits[ip] = hits
-
-            k_fails = [x for x in self.key_failures.get(pair, []) if x > stamp - self.window]
-            self.key_failures[pair] = k_fails
-            if len(k_fails) >= self.key_fail_limit:
-                raise APIError(429, "失败次数过多，请 15 分钟后重试")
-
-            u_fails = [x for x in self.user_failures.get(u_key, []) if x > stamp - self.window]
-            self.user_failures[u_key] = u_fails
-            if len(u_fails) >= self.user_fail_limit:
-                raise APIError(429, "该账号近期失败次数过多，请 15 分钟后重试")
-
-            self._prune(self.ip_hits, stamp - 60)
-            self._prune(self.key_failures, stamp - self.window)
-            self._prune(self.user_failures, stamp - self.window)
-
-    def fail(self, ip, username):
-        stamp = time.monotonic()
-        u_key = username.lower()
-        pair = ip + "|" + u_key
-        with self.lock:
-            self.key_failures.setdefault(pair, []).append(stamp)
-            self.user_failures.setdefault(u_key, []).append(stamp)
-
-    def success(self, ip, username):
-        u_key = username.lower()
-        pair = ip + "|" + u_key
-        with self.lock:
-            self.key_failures.pop(pair, None)
-            self.user_failures.pop(u_key, None)
-
-
-class IpRateLimiter:
-    """Sliding-window per-IP limiter for anonymous endpoints."""
-
-    def __init__(self, limit_per_min):
-        self.lock = threading.Lock()
-        self.hits = {}
-        self.limit = limit_per_min
-
-    def check(self, ip):
+    def check(self, key):
         stamp = time.monotonic()
         with self.lock:
-            vals = [x for x in self.hits.get(ip, []) if x > stamp - 60]
-            if len(vals) >= self.limit:
-                self.hits[ip] = vals
-                raise APIError(429, "请求过于频繁，请稍后重试")
-            vals.append(stamp)
-            self.hits[ip] = vals
-            if len(self.hits) > 5000:
-                self.hits = {k: [t for t in v if t > stamp - 60] for k, v in self.hits.items() if any(t > stamp - 60 for t in v)}
+            self.total = [x for x in self.total if x > stamp - 60]
+            if len(self.total) >= 60:
+                raise APIError(429, "登录请求过于频繁，请一分钟后重试")
+            self.total.append(stamp)
+            values = [x for x in self.failures.get(key, []) if x > stamp - 900]
+            self.failures[key] = values
+            if len(values) >= 8:
+                raise APIError(429, "登录失败次数过多，请 15 分钟后重试")
+            if len(self.failures) > 5000:
+                self.failures = {k: [v for v in times if v > stamp-900] for k, times in self.failures.items() if any(v > stamp-900 for v in times)}
 
+    def fail(self, key):
+        with self.lock:
+            self.failures.setdefault(key, []).append(time.monotonic())
 
-def validate_update_url(value, dev=False):
-    if not isinstance(value, str) or not value.strip() or len(value) > 2048 or any(ord(c) < 32 or ord(c) == 127 for c in value):
-        raise ValueError("更新地址格式不合法")
-    parsed = urllib.parse.urlsplit(value.strip())
-    if parsed.username is not None or parsed.password is not None or parsed.fragment or not parsed.hostname:
-        raise ValueError("更新地址不能包含认证信息或无效主机")
-    if parsed.scheme != "https":
-        if not dev or parsed.scheme != "http" or parsed.hostname not in ("127.0.0.1", "localhost", "::1"):
-            raise ValueError("更新地址必须使用 HTTPS")
-    return value.strip()
-
-
-def version_key(value):
-    core = str(value).split("-", 1)[0]
-    parts = []
-    for seg in core.split("."):
-        if not seg.isdigit():
-            return ()
-        parts.append(int(seg))
-    return tuple(parts)
-
-
-class _SafeUpdateRedirect(urllib.request.HTTPRedirectHandler):
-    def __init__(self, dev=False):
-        self.dev = dev
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        validate_update_url(newurl, self.dev)
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
-
-
-class PanelUpdater:
-    """Verified self-updater for the single-file center panel."""
-
-    VERSION_RE = re.compile(r'^VERSION\s*=\s*["\']([0-9]+(?:\.[0-9]+){1,4}(?:-[A-Za-z0-9.]+)?)["\']\s*$', re.M)
-
-    def __init__(self, script_path, update_url=DEFAULT_UPDATE_URL, dev=False, require_sha256=False):
-        self.script_path = Path(script_path).resolve()
-        self.update_url = validate_update_url(update_url, dev)
-        self.dev = dev
-        self.require_sha256 = require_sha256
-        self.lock = threading.Lock()
-
-    def _opener(self):
-        handlers = [_SafeUpdateRedirect(self.dev)]
-        if not self.dev:
-            handlers.append(urllib.request.HTTPSHandler(context=ssl.create_default_context()))
-        return urllib.request.build_opener(*handlers)
-
-    def _fetch(self, url, limit=MAX_UPDATE_BYTES, timeout=20):
-        req = urllib.request.Request(url, headers={"User-Agent": f"YSQ-Center/{VERSION}", "Cache-Control": "no-cache"})
-        try:
-            with self._opener().open(req, timeout=timeout) as resp:
-                raw = resp.read(limit + 1)
-                if len(raw) > limit:
-                    raise APIError(502, "远端更新文件体积超出允许上限")
-                return raw
-        except urllib.error.HTTPError as exc:
-            raise APIError(502, f"下载更新失败（HTTP {exc.code}）") from None
-        except (urllib.error.URLError, OSError, ValueError) as exc:
-            raise APIError(502, "无法连接更新源：" + str(exc)[:120]) from None
-
-    @classmethod
-    def inspect_source(cls, raw):
-        if not raw or len(raw) > MAX_UPDATE_BYTES:
-            raise APIError(502, "远端脚本体积异常")
-        try:
-            text = raw.decode("utf-8")
-        except UnicodeDecodeError:
-            raise APIError(502, "远端脚本不是有效的 UTF-8 文本") from None
-        if "# YSQ_CENTER_STDLIB_V1" not in text:
-            raise APIError(502, "远端内容缺少中控脚本标识，已拒绝更新")
-        match = cls.VERSION_RE.search(text)
-        if not match:
-            raise APIError(502, "远端脚本缺少有效的 VERSION 版本号，已拒绝更新")
-        try:
-            compile(text, "center-panel.py", "exec")
-        except SyntaxError as exc:
-            raise APIError(502, f"远端脚本语法校验失败（第 {exc.lineno} 行），已拒绝更新") from None
-        return match.group(1), hashlib.sha256(raw).hexdigest()
-
-    def _is_writable(self):
-        parent = self.script_path.parent
-        return os.access(parent, os.W_OK | os.X_OK) and (not self.script_path.exists() or os.access(self.script_path, os.W_OK))
-
-    def _fetch_and_verify(self):
-        raw = self._fetch(self.update_url, MAX_UPDATE_BYTES, timeout=20)
-        remote_version, actual_sha = self.inspect_source(raw)
-        expected_sha = os.environ.get("YSQ_CENTER_UPDATE_SHA256", "").strip()
-        if not expected_sha:
-            try:
-                sums_raw = self._fetch(self.update_url + ".sha256", 4096, timeout=10)
-                first_token = sums_raw.decode("utf-8", "replace").strip().split()
-                if first_token:
-                    expected_sha = first_token[0]
-            except APIError:
-                expected_sha = ""
-        sha_verified = False
-        if expected_sha:
-            if not re.fullmatch(r"[0-9a-fA-F]{64}", expected_sha) or not hmac.compare_digest(expected_sha.lower(), actual_sha.lower()):
-                raise APIError(502, "远端脚本 SHA256 校验失败，已拒绝更新")
-            sha_verified = True
-        elif self.require_sha256:
-            raise APIError(502, "已启用强制 SHA256 校验，但远端缺少配套 .sha256 校验文件，已拒绝更新")
-        local_sha = hashlib.sha256(self.script_path.read_bytes()).hexdigest() if self.script_path.is_file() else ""
-        same_content = bool(local_sha and hmac.compare_digest(local_sha, actual_sha))
-        cur_k, rem_k = version_key(VERSION), version_key(remote_version)
-        has_update = (rem_k > cur_k) if (cur_k and rem_k) else (remote_version != VERSION and not same_content)
-        return raw, remote_version, actual_sha, sha_verified, same_content, has_update
-
-    def check(self):
-        if not self.lock.acquire(blocking=False):
-            raise APIError(409, "已有面板更新任务正在进行，请稍后重试")
-        try:
-            _, remote_version, actual_sha, sha_verified, same_content, has_update = self._fetch_and_verify()
-            return {
-                "current_version": VERSION,
-                "remote_version": remote_version,
-                "has_update": has_update,
-                "same_content": same_content,
-                "sha256": actual_sha,
-                "sha256_verified": sha_verified,
-                "writable": self._is_writable(),
-                "update_url": self.update_url,
-                "script_path": str(self.script_path),
-            }
-        finally:
-            self.lock.release()
-
-    def apply(self, store=None, actor="local", force=False):
-        if not self.lock.acquire(blocking=False):
-            raise APIError(409, "已有面板更新任务正在进行，请稍后重试")
-        try:
-            if not self._is_writable():
-                raise APIError(403, f"当前运行用户无权写入 {self.script_path}，请以具备写权限的用户或 CLI 执行 --update")
-            raw, remote_version, actual_sha, sha_verified, same_content, has_update = self._fetch_and_verify()
-            if same_content and not force:
-                return {
-                    "ok": True,
-                    "updated": False,
-                    "restarting": False,
-                    "current_version": VERSION,
-                    "new_version": remote_version,
-                    "sha256": actual_sha,
-                    "sha256_verified": sha_verified,
-                    "message": "远端脚本与当前文件完全一致，无需更新",
-                }
-            parent = self.script_path.parent
-            old_mode = stat.S_IMODE(self.script_path.stat().st_mode) if self.script_path.exists() else 0o755
-            bak_path = self.script_path.with_name(self.script_path.name + ".bak")
-            if self.script_path.is_file():
-                b_fd, b_tmp = tempfile.mkstemp(prefix=".center-panel-bak-", dir=str(parent))
-                try:
-                    with os.fdopen(b_fd, "wb") as bf:
-                        bf.write(self.script_path.read_bytes())
-                        bf.flush()
-                        os.fsync(bf.fileno())
-                    os.chmod(b_tmp, old_mode)
-                    os.replace(b_tmp, bak_path)
-                finally:
-                    with contextlib.suppress(FileNotFoundError):
-                        os.unlink(b_tmp)
-            fd, tmp_name = tempfile.mkstemp(prefix=".center-panel-new-", dir=str(parent))
-            try:
-                with os.fdopen(fd, "wb") as out:
-                    out.write(raw)
-                    out.flush()
-                    os.fsync(out.fileno())
-                os.chmod(tmp_name, old_mode)
-                os.replace(tmp_name, self.script_path)
-            finally:
-                with contextlib.suppress(FileNotFoundError):
-                    os.unlink(tmp_name)
-            if store is not None:
-                with store.transaction(notify=False) as db:
-                    store.audit(db, actor, "admin.update", f"更新面板：{VERSION} → {remote_version} ({actual_sha[:12]})")
-            LOG.info("面板脚本已更新：%s → %s（备份：%s）", VERSION, remote_version, bak_path)
-            return {
-                "ok": True,
-                "updated": True,
-                "restarting": True,
-                "old_version": VERSION,
-                "new_version": remote_version,
-                "sha256": actual_sha,
-                "sha256_verified": sha_verified,
-                "backup_path": str(bak_path),
-            }
-        finally:
-            self.lock.release()
+    def success(self, key):
+        with self.lock:
+            self.failures.pop(key, None)
 
 
 class CenterServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -1970,67 +1448,17 @@ class CenterServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     allow_reuse_address = True
     request_queue_size = 64
 
-    def __init__(self, address, store, origin, dev=False, workers=24, trust_proxy_header=True, updater=None):
+    def __init__(self, address, store, origin, dev=False, workers=24):
         self.store, self.origin, self.dev = store, origin.rstrip("/"), dev
-        self.trust_proxy_header = trust_proxy_header
-        self.updater = updater or PanelUpdater(__file__, DEFAULT_UPDATE_URL, dev=dev)
-        self.restart_requested = False
-        self._restart_callback = None
         if ":" in address[0]:
             self.address_family = socket.AF_INET6
         self.public = urllib.parse.urlsplit(self.origin)
         self.worker_slots = threading.BoundedSemaphore(workers)
-        self.sub_slots = threading.BoundedSemaphore(max(4, workers // 2))
         self.wait_slots = threading.BoundedSemaphore(256)
-        self.wait_lock = threading.Lock()
-        self.wait_per_node = {}
         self.request_context = threading.local()
         self.password_slots = threading.BoundedSemaphore(2)
-        self.login_limiter = RateLimiter(ip_per_min=20, key_fail_limit=8, user_fail_limit=20)
-        self.password_limiter = RateLimiter(ip_per_min=10, key_fail_limit=5, user_fail_limit=5)
-        self.sub_limiter = IpRateLimiter(60)
-        self.register_limiter = IpRateLimiter(20)
-        # Pre-encode and pre-compress static assets once at startup.
-        html_bytes = HTML.replace("/assets/app.css", "/assets/app.css?v=" + VERSION).replace("/assets/app.js", "/assets/app.js?v=" + VERSION).encode("utf-8")
-        self.assets = {}
-        for asset_path, raw, ctype, cacheable in (
-            ("/", html_bytes, "text/html; charset=utf-8", False),
-            ("/assets/app.css", CSS.encode("utf-8"), "text/css; charset=utf-8", True),
-            ("/assets/app.js", JS.encode("utf-8"), "text/javascript; charset=utf-8", True),
-            ("/favicon.svg", SITE_ICON_SVG.encode("utf-8"), "image/svg+xml", True),
-            ("/favicon.ico", SITE_ICON_ICO, "image/x-icon", True),
-        ):
-            gz = gzip.compress(raw, compresslevel=6) if len(raw) >= 512 and ctype != "image/x-icon" else None
-            etag = '"' + hashlib.sha256(raw).hexdigest()[:16] + '"'
-            self.assets[asset_path] = (raw, gz, ctype, etag, cacheable)
+        self.login_limiter = RateLimiter()
         super().__init__(address, Handler)
-
-    def schedule_restart(self):
-        self.restart_requested = True
-        def _trigger():
-            time.sleep(0.6)
-            if self._restart_callback:
-                self._restart_callback()
-            else:
-                self.store.signal_shutdown()
-                self.shutdown()
-        threading.Thread(target=_trigger, name="ysq-restart", daemon=True).start()
-
-    def acquire_node_wait(self, node_id, limit=2):
-        with self.wait_lock:
-            cur = self.wait_per_node.get(node_id, 0)
-            if cur >= limit:
-                return False
-            self.wait_per_node[node_id] = cur + 1
-            return True
-
-    def release_node_wait(self, node_id):
-        with self.wait_lock:
-            cur = self.wait_per_node.get(node_id, 0)
-            if cur <= 1:
-                self.wait_per_node.pop(node_id, None)
-            else:
-                self.wait_per_node[node_id] = cur - 1
 
     def get_request(self):
         request, address = super().get_request()
@@ -2072,8 +1500,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
         # Do not log request paths, tokens, cookies, query strings, or submitted secrets.
-        if len(args) >= 2 and str(args[1]).startswith("5"):
-            LOG.warning("HTTP %s 请求失败", args[1])
+        if args and isinstance(args[0], str) and " 5" in args[0]:
+            LOG.warning("HTTP 请求失败")
 
     def send_error(self, code, message=None, explain=None):
         self.respond(code, {"error": "请求格式不合法"})
@@ -2086,39 +1514,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(body)
 
     def response_headers(self, status, length, content_type, headers=None):
-        extra = dict(headers or {})
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(length))
-        if not any(k.lower() == "cache-control" for k in extra):
-            self.send_header("Cache-Control", "no-store, private")
+        self.send_header("Cache-Control", "no-store, private")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
         self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
-        if not self.server.dev:
-            self.send_header("Strict-Transport-Security", "max-age=31536000")
         self.send_header("Connection", "close")
-        for key, val in extra.items():
+        for key, val in (headers or {}).items():
             self.send_header(key, val)
         self.end_headers()
         self.close_connection = True
-
-    def respond_asset(self, asset_path, query=""):
-        raw, gz, ctype, etag, cacheable = self.server.assets[asset_path]
-        headers = {"ETag": etag}
-        if cacheable and "v=" in query:
-            headers["Cache-Control"] = "public, max-age=86400, immutable"
-        elif cacheable:
-            headers["Cache-Control"] = "public, max-age=300"
-        if self.headers.get("If-None-Match", "").strip() == etag:
-            return self.respond(304, b"", headers, ctype)
-        if gz is not None and "gzip" in self.headers.get("Accept-Encoding", "").lower():
-            headers["Content-Encoding"] = "gzip"
-            headers["Vary"] = "Accept-Encoding"
-            return self.respond(200, gz, headers, ctype)
-        return self.respond(200, raw, headers, ctype)
 
     def respond_file(self, path, filename):
         with path.open("rb") as source:
@@ -2135,17 +1544,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raise APIError(431, "请求头过大")
         if len(self.headers.get_all("Host", [])) != 1:
             raise APIError(400, "Host 请求头不合法")
-        host_header = self.headers.get("Host", "").strip()
-        if host_header.lower() != self.server.public.netloc.lower():
-            # Health probe is intentionally allowed locally without the public Host header (IPv4 & IPv6).
-            loopback_ok = False
-            if self.path == "/healthz":
-                try:
-                    hname = urllib.parse.urlsplit("//" + host_header).hostname or ""
-                    loopback_ok = hname == "localhost" or ipaddress.ip_address(hname).is_loopback
-                except ValueError:
-                    loopback_ok = False
-            if not loopback_ok:
+        if self.headers.get("Host", "").lower() != self.server.public.netloc.lower():
+            # Health probe is intentionally allowed locally without the public Host header.
+            if not (self.path == "/healthz" and self.headers.get("Host", "").split(":")[0] in ("127.0.0.1", "localhost")):
                 raise APIError(400, "域名不匹配，请使用已配置的中控域名访问")
         parsed = urllib.parse.urlsplit(self.path)
         if parsed.scheme or parsed.netloc or "\\" in parsed.path or "%2f" in parsed.path.lower() or "%5c" in parsed.path.lower():
@@ -2163,19 +1564,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raise APIError(413, "请求体过大")
         if self.headers.get("Content-Type", "").split(";")[0].strip().lower() != "application/json":
             raise APIError(415, "请使用 application/json")
-        # Read with a total deadline to defend against slowloris request bodies.
-        deadline = time.monotonic() + 10.0
-        chunks = []
-        remaining = length
-        while remaining > 0:
-            if time.monotonic() > deadline:
-                raise APIError(408, "请求体接收超时")
-            chunk = self.rfile.read(min(remaining, 65536))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        raw = b"".join(chunks)
+        raw = self.rfile.read(length)
         if len(raw) != length:
             raise APIError(400, "请求体不完整")
         try:
@@ -2218,17 +1607,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             value += "; Secure"
         return value
 
-    def client_ip(self):
-        # Only the trusted, same-host reverse proxy may supply a single X-Real-IP header.
+    def client_key(self, username):
+        # Only the trusted, same-host reverse proxy may supply X-Real-IP.
         address = self.client_address[0]
-        if self.server.trust_proxy_header and ipaddress.ip_address(address).is_loopback:
-            forwarded = self.headers.get_all("X-Real-IP", [])
-            if len(forwarded) == 1:
-                try:
-                    address = str(ipaddress.ip_address(forwarded[0].strip()))
-                except ValueError:
-                    pass
-        return address
+        if ipaddress.ip_address(address).is_loopback:
+            forwarded = self.headers.get("X-Real-IP", "")
+            try:
+                address = str(ipaddress.ip_address(forwarded))
+            except ValueError:
+                pass
+        return address + "|" + username.lower()
 
     def do_GET(self):
         self.dispatch("GET")
@@ -2246,28 +1634,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             parsed = self.validate_request()
             path, store = parsed.path, self.server.store
+            if path in ("/api/agent/sync", "/api/agent/activity", "/api/admin/overview", "/api/admin/activity"):
+                store.maintain()
             if method in ("GET", "HEAD"):
                 if path == "/healthz":
                     return self.respond(200, {"ok": True, "version": VERSION})
                 if path in ("/", "/login"):
-                    return self.respond_asset("/", parsed.query)
-                if path in ("/assets/app.css", "/assets/app.js", "/favicon.svg", "/favicon.ico"):
-                    return self.respond_asset(path, parsed.query)
+                    return self.respond(200, HTML.encode("utf-8"), content_type="text/html; charset=utf-8")
+                if path == "/assets/app.css":
+                    return self.respond(200, CSS.encode("utf-8"), content_type="text/css; charset=utf-8")
+                if path == "/assets/app.js":
+                    return self.respond(200, JS.encode("utf-8"), content_type="text/javascript; charset=utf-8")
+                if path == "/favicon.svg":
+                    return self.respond(200, SITE_ICON_SVG.encode("utf-8"), content_type="image/svg+xml")
+                if path == "/favicon.ico":
+                    return self.respond(200, SITE_ICON_ICO, content_type="image/x-icon")
                 subscription = re.fullmatch(r"/sub/([A-Za-z0-9_-]{43})(?:/(clash|v2ray))?/?", path)
                 if subscription:
-                    self.server.sub_limiter.check(self.client_ip())
-                    if not self.server.sub_slots.acquire(blocking=False):
-                        raise APIError(503, "订阅服务繁忙，请稍后重试")
-                    try:
-                        token, kind = subscription.groups()
-                        formats = urllib.parse.parse_qs(parsed.query, keep_blank_values=True).get("format", [])
-                        if len(formats) > 1 or (kind and formats and formats[0] != kind):
-                            raise APIError(400, "请只指定一种订阅格式")
-                        kind = kind or (formats[0] if formats else None)
-                        body, content_type, headers = store.subscription(token, kind, self.headers.get("User-Agent", ""), self.headers.get("Accept", ""))
-                        return self.respond(200, body, headers, content_type)
-                    finally:
-                        self.server.sub_slots.release()
+                    token, kind = subscription.groups()
+                    formats = urllib.parse.parse_qs(parsed.query, keep_blank_values=True).get("format", [])
+                    if len(formats) > 1 or (kind and formats and formats[0] != kind):
+                        raise APIError(400, "请只指定一种订阅格式")
+                    kind = kind or (formats[0] if formats else None)
+                    body, content_type, headers = store.subscription(token, kind, self.headers.get("User-Agent", ""), self.headers.get("Accept", ""))
+                    return self.respond(200, body, headers, content_type)
                 session = self.admin()
                 if path == "/api/admin/session":
                     return self.respond(200, {"username": session["username"], "csrf": session["csrf"], "version": VERSION, "origin": self.server.origin})
@@ -2300,9 +1690,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         raise APIError(400, "日期范围不合法")
                     return self.respond(200, store.traffic(query.get("user_id", [None])[0], query.get("node_id", [None])[0], days, query.get("month", [None])[0]))
                 if path == "/api/admin/backup":
-                    if method == "HEAD":
-                        raise APIError(405, "不支持 HEAD 请求触发备份")
-                    with store.backup(session["username"]) as backup_path:
+                    with store.backup() as backup_path:
                         return self.respond_file(backup_path, "ysq-center-backup-" + dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S") + ".db")
                 raise APIError(404, "接口不存在")
             data = self.body()
@@ -2312,21 +1700,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 password = data.get("password")
                 if not isinstance(password, str) or not 1 <= len(password) <= 256:
                     raise APIError(400, "请输入有效密码")
-                ip = self.client_ip()
-                self.server.login_limiter.check(ip, username)
+                key = self.client_key(username)
+                self.server.login_limiter.check(key)
                 if not self.server.password_slots.acquire(blocking=False):
                     raise APIError(429, "正在处理其他登录请求，请稍后重试")
                 try:
                     token, value = store.login(username, password)
                 except APIError:
-                    self.server.login_limiter.fail(ip, username)
+                    self.server.login_limiter.fail(key)
                     raise
                 finally:
                     self.server.password_slots.release()
-                self.server.login_limiter.success(ip, username)
+                self.server.login_limiter.success(key)
                 return self.respond(200, value, {"Set-Cookie": self.cookie_header(token)})
             if method == "POST" and path == "/api/agent/register":
-                self.server.register_limiter.check(self.client_ip())
                 return self.respond(200, store.register(data))
             if method == "POST" and path == "/api/agent/sync":
                 return self.respond(200, store.sync(data, self.token()))
@@ -2334,22 +1721,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.respond(200, store.ingest_activity(data, self.token()))
             if method == "POST" and path == "/api/agent/wait":
                 token = self.token()
-                ident = node_id_valid(data.get("node_id"))
                 # Authenticate before dedicating a long-lived notification slot.
-                with store.readonly() as db:
-                    store._authenticated_node(db, ident, token)
-                if not self.server.acquire_node_wait(ident, limit=2):
-                    raise APIError(429, "该服务器变更通知连接过多，请稍后重试")
+                with store.connect() as db:
+                    store._authenticated_node(db, data.get("node_id"), token)
+                if not self.server.wait_slots.acquire(blocking=False):
+                    raise APIError(429, "变更通知连接已满，请稍后重试")
+                self.server.release_worker_slot()
                 try:
-                    if not self.server.wait_slots.acquire(blocking=False):
-                        raise APIError(429, "变更通知连接已满，请稍后重试")
-                    try:
-                        self.server.release_worker_slot()
-                        return self.respond(200, store.wait_for_changes(data, token))
-                    finally:
-                        self.server.wait_slots.release()
+                    return self.respond(200, store.wait_for_changes(data, token))
                 finally:
-                    self.server.release_node_wait(ident)
+                    self.server.wait_slots.release()
             if method == "POST" and path == "/api/agent/detach":
                 return self.respond(200, store.detach(data, self.token()))
             session = self.admin(mutate=True)
@@ -2357,35 +1738,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if method == "POST" and path == "/api/auth/logout":
                 store.logout(self.cookie_token())
                 return self.respond(200, {"ok": True}, {"Set-Cookie": self.cookie_header("", clear=True)})
-            if method == "POST" and path == "/api/admin/backup":
-                with store.backup(actor) as backup_path:
-                    return self.respond_file(backup_path, "ysq-center-backup-" + dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S") + ".db")
-            if method == "POST" and path == "/api/admin/update/check":
-                return self.respond(200, self.server.updater.check())
-            if method == "POST" and path == "/api/admin/update/apply":
-                force = boolean(data.get("force", False), "强制覆盖")
-                result = self.server.updater.apply(store, actor, force=force)
-                self.respond(200, result)
-                if result.get("updated") and result.get("restarting"):
-                    self.server.schedule_restart()
-                return
             if method == "POST" and path == "/api/admin/password":
                 old = data.get("old_password")
                 if not isinstance(old, str) or len(old) > 256:
                     raise APIError(400, "当前密码格式不正确")
-                ip = self.client_ip()
-                self.server.password_limiter.check(ip, actor)
-                if not self.server.password_slots.acquire(blocking=False):
-                    raise APIError(429, "正在处理其他密码校验请求，请稍后重试")
-                try:
-                    store.change_password(actor, old, data.get("new_password"))
-                except APIError as exc:
-                    if exc.status == 403:
-                        self.server.password_limiter.fail(ip, actor)
-                    raise
-                finally:
-                    self.server.password_slots.release()
-                self.server.password_limiter.success(ip, actor)
+                store.change_password(actor, old, data.get("new_password"))
                 return self.respond(200, {"ok": True}, {"Set-Cookie": self.cookie_header("", clear=True)})
             if method == "POST" and path == "/api/admin/settings":
                 return self.respond(200, store.save_settings(data, actor))
@@ -4102,6 +3459,94 @@ dialog::backdrop {
   background: #fff;
 }
 
+.login-story {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding: 49px 65px;
+  border-right: 1px solid #e5e5e5;
+  background: #ffffff;
+}
+
+.login-story:after {
+  position: absolute;
+  right: -150px;
+  bottom: -220px;
+  width: 520px;
+  height: 520px;
+  border: 1px solid #e3e3e3;
+  border-radius: 50%;
+  box-shadow: 0 0 0 65px #ebebeb66, 0 0 0 130px #eeeeee66;
+  content: "";
+  pointer-events: none;
+}
+
+.login-story .brand {
+  position: relative;
+  z-index: 1;
+}
+
+.login-story .brand-mark {
+  border-color: #dbdbdb;
+  background: #ececec;
+}
+
+.story-copy {
+  position: relative;
+  z-index: 1;
+  margin: auto 0;
+  padding: 80px 0;
+}
+
+.story-copy > .eyebrow {
+  color: #919191;
+  font-size: 10px;
+}
+
+.story-copy h1 {
+  margin: 27px 0 24px;
+  color: #4c4c4c;
+  font-size: clamp(36px, 3.5vw, 54px);
+  font-weight: 550;
+  letter-spacing: -1.8px;
+  line-height: 1.45;
+}
+
+.story-copy p {
+  color: #959595;
+  font-size: 14px;
+  line-height: 2;
+}
+
+.story-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 18px 24px;
+  max-width: 330px;
+  margin-top: 42px;
+  color: #8a8a8a;
+  font-size: 11px;
+}
+
+.story-grid span:before {
+  display: inline-block;
+  width: 4px;
+  height: 4px;
+  margin: 0 10px 2px 0;
+  border-radius: 50%;
+  background: #a4a4a4;
+  content: "";
+}
+
+.story-foot {
+  position: relative;
+  z-index: 1;
+  color: #a4a4a4;
+  font-size: 9px;
+  letter-spacing: 2px;
+}
+
 .login-side {
   display: flex;
   align-items: center;
@@ -4217,6 +3662,10 @@ dialog::backdrop {
     gap: 18px;
   }
 
+  .login-story {
+    padding: 42px;
+  }
+
   .login-side {
     padding: 42px;
   }
@@ -4297,8 +3746,22 @@ dialog::backdrop {
     margin-left: 90px;
   }
 
+  .login-story {
+    padding: 34px;
+  }
+
   .login-side {
     padding: 34px;
+  }
+
+  .story-grid {
+    gap: 17px 13px;
+    font-size: 10px;
+  }
+
+  .story-foot {
+    font-size: 8px;
+    letter-spacing: 1.4px;
   }
 
 }
@@ -4573,6 +4036,46 @@ dialog::backdrop {
     background: #fafafa;
   }
 
+  .login-story {
+    min-height: 190px;
+    padding: 25px 27px;
+    border-right: 0;
+    border-bottom: 1px solid #e5e5e5;
+  }
+
+  .login-story .brand {
+    font-size: 20px;
+  }
+
+  .login-story .brand b {
+    font-size: 7px;
+  }
+
+  .login-story .brand-mark {
+    width: 35px;
+    height: 37px;
+  }
+
+  .story-copy {
+    margin: 25px 0 0;
+    padding: 0;
+  }
+
+  .story-copy h1 {
+    margin: 0;
+    font-size: 25px;
+    line-height: 1.5;
+    letter-spacing: -.8px;
+  }
+
+  .story-copy h1 br {
+    display: none;
+  }
+
+  .story-copy > .eyebrow, .story-copy p, .story-grid, .story-foot {
+    display: none;
+  }
+
   .login-side {
     padding: 34px 24px 40px;
   }
@@ -4626,7 +4129,7 @@ dialog::backdrop {
 .detail-metrics .traffic-up { color: var(--upload); }
 .detail-metrics .traffic-down { color: var(--download); }
 .metric-primary .metric-icon { background: #f8fafc; color: var(--accent); }
-.main, .workspace, .login-page, .login-side { background: #fff; }
+.main, .workspace, .login-page, .login-story, .login-side { background: #fff; }
 .card { box-shadow: 0 2px 12px #11182704; }
 .month-picker { display: flex; align-items: center; gap: 10px; white-space: nowrap; color: var(--muted); font-weight: 500; }
 .month-picker select { width: auto; min-width: 164px; margin: 0; background: #fff; font-size: 12px; color: var(--ink); }
@@ -4951,15 +4454,12 @@ JS = r'''
 'use strict';
 const $=id=>document.getElementById(id);
 const esc=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const state={activity:null,activityFilter:{user_id:'',node_id:'',hours:24,q:'',page:1},view:'overview',session:null,users:[],nodes:[],subscriptions:[],overview:null,chart:null,logs:[],settings:{timezone_offset:480},settingsLoaded:false,settingsDirty:false,activityRetentionDirty:false,templatesDirty:false,userMonth:'',userPeriod:null,trafficTask:null,trafficUser:null,subscriptionTask:null,syncFollowup:null,epoch:0,refreshTask:null,requests:new Set(),toast:null,clockOffset:0,updateInfo:null};
+const state={activity:null,activityFilter:{user_id:'',node_id:'',hours:24,q:'',page:1},view:'overview',session:null,users:[],nodes:[],subscriptions:[],overview:null,chart:null,logs:[],settings:{timezone_offset:480},settingsLoaded:false,settingsDirty:false,activityRetentionDirty:false,templatesDirty:false,userMonth:'',userPeriod:null,trafficTask:null,trafficUser:null,subscriptionTask:null,syncFollowup:null,epoch:0,refreshTask:null,requests:new Set(),toast:null};
 const REFRESH_MS=15000, REQUEST_TIMEOUT_MS=15000;
 const views={overview:['运行总览','总览'],users:['用户管理','用户管理'],nodes:['服务器','服务器'],subscriptions:['订阅','订阅'],activity:['行为分析','行为分析'],logs:['操作记录','操作记录'],settings:['设置','设置']};
-function serverNow(){return Date.now()/1000+state.clockOffset;}
-function syncClock(serverTime){if(Number.isFinite(serverTime)&&serverTime>0)state.clockOffset=serverTime-Date.now()/1000;}
-function preserveScroll(el,fn){const scrolls=[...el.querySelectorAll('.table-scroll')].map(n=>n.scrollLeft);fn();el.querySelectorAll('.table-scroll').forEach((n,i)=>{if(scrolls[i])n.scrollLeft=scrolls[i];});}
 function bytes(value){let n=Number(value||0);if(!Number.isFinite(n))return '—';const units=['B','KiB','MiB','GiB','TiB','PiB'];let i=0;while(n>=1024&&i<units.length-1){n/=1024;i++;}return (i?n.toFixed(n>=100?1:2):Math.round(n))+' '+units[i];}
 function stamp(value){if(!value)return '尚未上报';return new Date(Number(value)*1000+Number(state.settings.timezone_offset||0)*60000).toISOString().slice(0,19).replace('T',' ');}
-function relative(value){if(!value)return '尚未上报';let s=Math.max(0,Math.floor(serverNow()-Number(value)));if(s<10)return '刚刚';if(s<60)return s+' 秒前';if(s<3600)return Math.floor(s/60)+' 分钟前';if(s<86400)return Math.floor(s/3600)+' 小时前';return Math.floor(s/86400)+' 天前';}
+function relative(value){if(!value)return '尚未上报';let s=Math.max(0,Math.floor(Date.now()/1000-Number(value)));if(s<10)return '刚刚';if(s<60)return s+' 秒前';if(s<3600)return Math.floor(s/60)+' 分钟前';if(s<86400)return Math.floor(s/3600)+' 小时前';return Math.floor(s/86400)+' 天前';}
 function tzName(){const o=Number(state.settings.timezone_offset||0);return 'UTC'+(o>=0?'+':'−')+Math.floor(Math.abs(o)/60)+((Math.abs(o)%60)?':'+String(Math.abs(o)%60).padStart(2,'0'):'');}
 function toast(message,error=false){clearTimeout(state.toast);$('toast').textContent=message;$('toast').className=error?'error':'';$('toast').hidden=false;state.toast=setTimeout(()=>$('toast').hidden=true,5000);}
 function cancelled(){const error=new Error('请求已取消');error.name='AbortError';return error;}
@@ -4984,13 +4484,13 @@ async function api(path,method='GET',body,{signal}={}){
     throw error;
   }finally{clearTimeout(timer);signal?.removeEventListener('abort',abort);state.requests.delete(controller);}
 }
-function showLogin(){cancelRequests();Object.assign(state,{activity:null,activityFilter:{user_id:'',node_id:'',hours:24,q:'',page:1},session:null,users:[],nodes:[],subscriptions:[],overview:null,chart:null,logs:[],settings:{timezone_offset:480},settingsLoaded:false,settingsDirty:false,activityRetentionDirty:false,templatesDirty:false,userMonth:'',userPeriod:null,updateInfo:null});$('app').hidden=true;$('loading').hidden=true;$('login').hidden=false;closeModal();}
+function showLogin(){cancelRequests();Object.assign(state,{activity:null,activityFilter:{user_id:'',node_id:'',hours:24,q:'',page:1},session:null,users:[],nodes:[],subscriptions:[],overview:null,chart:null,logs:[],settings:{timezone_offset:480},settingsLoaded:false,settingsDirty:false,activityRetentionDirty:false,templatesDirty:false,userMonth:'',userPeriod:null});$('app').hidden=true;$('loading').hidden=true;$('login').hidden=false;closeModal();}
 function showApp(){cancelRequests();$('login').hidden=true;$('loading').hidden=true;$('app').hidden=false;$('account').textContent=state.session.username;$('version').textContent=state.session.version;$('sidebar-origin').textContent=location.host;const selected=location.hash.slice(1);state.view=views[selected]?selected:'overview';setView(state.view,false);}
 function empty(title,description='',action=''){return `<div class="empty"><span class="empty-icon">◫</span><h3>${esc(title)}</h3>${description?`<p>${esc(description)}</p>`:''}${action}</div>`;}
 function badge(label,color=''){return `<span class="badge ${color}">${esc(label)}</span>`;}
 function nodeBadge(node){if(node.status==='created')return badge('等待接入','gray');if(node.status==='pending')return badge('自动接管中','amber');if(node.status==='revoked')return badge('已撤销','gray');if(node.status==='detached')return badge('已解绑','gray');if(!node.online)return badge('离线','gray');if(node.last_error)return badge('配置失败','red');if(node.revision!==node.applied_revision)return badge('待同步','amber');return badge('在线');}
 function userNodes(user){return user.nodes.length?`<div class="node-tags">${user.nodes.map(n=>`<span class="tag" title="${esc(n.name)}">${esc(n.name)}</span>`).join('')}</div>`:'<span class="muted small">未分配</span>';}
-function userStatus(user){const pending=user.nodes.some(n=>n.status==='active'&&(n.revision!==n.applied_revision||(typeof n.online==='boolean'?!n.online:n.last_seen<serverNow()-60)));return (user.enabled?(user.quota_blocked?badge('额度用尽','amber'):badge('已启用')):badge('已禁用','gray'))+(pending?' '+badge('待节点确认','amber'):'');}
+function userStatus(user){const pending=user.nodes.some(n=>n.status==='active'&&(n.revision!==n.applied_revision||n.last_seen<Date.now()/1000-60));return (user.enabled?(user.quota_blocked?badge('额度用尽','amber'):badge('已启用')):badge('已禁用','gray'))+(pending?' '+badge('待节点确认','amber'):'');}
 function userRows(users,compact=false){
   return users.map(user=>`<tr>
     <td><div class="user-cell"><span class="avatar">${esc(user.name.slice(0,1).toUpperCase())}</span><div><div class="cell-title">${esc(user.name)}</div><div class="cell-sub">${user.quota_bytes?`${bytes(user.quota_used)} / ${bytes(user.quota_bytes)} · ${user.quota_period==='monthly'?'本月':'累计'}`:esc(user.id.slice(0,14))+'…'}</div></div></div></td>
@@ -5058,13 +4558,13 @@ function subscriptionRows(rows=filteredSubscriptions()){
 }
 function renderSubscriptions(listOnly=false){
   const rows=filteredSubscriptions();
-  if(listOnly){preserveScroll($('subscription-list'),()=>{$('subscription-list').innerHTML=subscriptionRows(rows);});$('subscription-count').textContent=rows.length+' 个';return;}
-  $('content').innerHTML=`<section class="card table-card"><div class="table-heading"><h3>用户订阅</h3><span id="subscription-count">${rows.length} 个</span></div><div id="subscription-list">${subscriptionRows(rows)}</div></section><details class="card subscription-templates"><summary>订阅模板</summary><form id="subscription-template-form" class="form-grid"><label>节点名称模板<input name="node_name_template" value="${esc(state.settings.node_name_template||'{{server}} · {{inbound}}')}" maxlength="160" required></label><p class="form-help">{{server}} 服务器 · {{inbound}} 入口 · {{username}} 用户 · {{index}} 序号</p><label>Clash / Mihomo 模板<textarea name="clash_template" rows="9" required spellcheck="false">${esc(state.settings.clash_template||'')}</textarea></label><p class="form-help">{{proxies}} 节点列表 · {{proxy_names}} 节点名称 · {{subscription_name}} 订阅名称 · {{group_name}} 策略组名 · {{proxy_groups}} 策略组 · {{rules}} 规则</p><div class="form-footer"><button type="submit" class="primary">保存模板</button></div></form></details>`;
+  if(listOnly){$('subscription-list').innerHTML=subscriptionRows(rows);$('subscription-count').textContent=rows.length+' 个';return;}
+  $('content').innerHTML=`<section class="card table-card"><div class="table-heading"><h3>用户订阅</h3><span id="subscription-count">${rows.length} 个</span></div><div id="subscription-list">${subscriptionRows(rows)}</div></section><details class="card subscription-templates"><summary>订阅模板</summary><form id="subscription-template-form" class="form-grid"><label>节点名称模板<input name="node_name_template" value="${esc(state.settings.node_name_template||'{{server}} · {{inbound}}')}" maxlength="300" required></label><p class="form-help">{{server}} 服务器 · {{inbound}} 入口 · {{username}} 用户 · {{index}} 序号</p><label>Clash / Mihomo 模板<textarea name="clash_template" rows="9" required spellcheck="false">${esc(state.settings.clash_template||'')}</textarea></label><p class="form-help">{{proxies}} 节点列表 · {{proxy_names}} 节点名称 · {{subscription_name}} 订阅名称 · {{group_name}} 策略组名 · {{proxy_groups}} 策略组 · {{rules}} 规则</p><div class="form-footer"><button type="submit" class="primary">保存模板</button></div></form></details>`;
 }
 function activityPath(){return 'activity?'+Object.entries(state.activityFilter).map(([key,value])=>encodeURIComponent(key)+'='+encodeURIComponent(value)).join('&');}
 function activityBars(data){
   const step=([1,3,6,12,24,72].find(n=>n>=data.hours/48)||72)*3600, bins=new Map();
-  const first=Math.floor(data.since/step)*step,last=Math.floor((data.server_time||serverNow())/step)*step;
+  const first=Math.floor(data.since/step)*step,last=Math.floor(Date.now()/1000/step)*step;
   for(let at=first;at<=last;at+=step)bins.set(at,0);
   for(const row of data.hourly){const at=Math.floor(row.hour/step)*step;bins.set(at,(bins.get(at)||0)+row.connections);}
   const max=Math.max(1,...bins.values());
@@ -5077,38 +4577,25 @@ function renderActivity(bodyOnly=false){
     $('content').innerHTML=`<form id="activity-filter-form" class="activity-filters"><label>用户<select name="user_id"><option value="">全部用户</option>${options(data?.users||state.users,filter.user_id)}</select></label><label>服务器<select name="node_id"><option value="">全部服务器</option>${options(data?.nodes||state.nodes,filter.node_id)}</select></label><label>时间<select name="hours">${[[24,'近 24 小时'],[168,'近 7 天'],[720,'近 30 天'],[2160,'近 90 天']].map(([value,label])=>`<option value="${value}" ${Number(filter.hours)===value?'selected':''}>${label}</option>`).join('')}</select></label><label class="activity-search">明细目标<input name="q" value="${esc(filter.q)}" maxlength="100" placeholder="域名或目标 IP"></label><button type="submit" class="primary">查询</button></form><div id="activity-body"></div>`;
   }
   if(!data){$('activity-body').innerHTML=empty('正在读取行为记录…');return;}
-  // Sync selector options whenever users or nodes change, preserving current draft selection.
-  for(const [name,rows,allLabel] of [['user_id',data.users,'全部用户'],['node_id',data.nodes,'全部服务器']]){
+  // Populate initially empty selectors after the first fetch, without replacing
+  // draft filter values on the 15-second refresh.
+  for(const [name,rows] of [['user_id',data.users],['node_id',data.nodes]]){
     const select=$('activity-filter-form')?.elements.namedItem(name);
-    if(select){
-      const sig=rows.map(r=>r.id+':'+r.name).join('|');
-      if(select.dataset.sig!==sig){
-        const current=select.value||filter[name]||'';
-        select.innerHTML=`<option value="">${allLabel}</option>${options(rows,current)}`;
-        select.value=rows.some(r=>r.id===current)?current:'';
-        select.dataset.sig=sig;
-      }
-    }
+    if(select&&select.options?.length===1)select.insertAdjacentHTML('beforeend',options(rows,filter[name]));
   }
-  const s=data.summary,pages=Math.max(1,Math.ceil(data.total/data.page_size)),nowTs=data.server_time||serverNow();
+  const s=data.summary,pages=Math.max(1,Math.ceil(data.total/data.page_size));
   const ranking=(title,rows)=>`<section class="card activity-ranking"><div class="card-head"><h3>${title}</h3></div>${rows.length?rows.map((row,index)=>`<div class="activity-rank-row"><span class="activity-rank-index">${index+1}</span><span class="mono" title="${esc(row.name)}">${esc(row.name)}</span><strong>${row.count.toLocaleString()}</strong></div>`).join(''):'<div class="activity-no-data muted">暂无连接记录</div>'}</section>`;
-  const warnings=data.telemetry.filter(row=>row.error||row.dropped||row.gaps||row.pending>800||!row.received_at||nowTs-row.received_at>90);
-  preserveScroll($('activity-body'),()=>{$('activity-body').innerHTML=`<div class="cards activity-metrics"><div class="card metric-primary"><div class="metric-title">发起连接</div><div class="metric-value">${s.connections.toLocaleString()}</div></div><div class="card"><div class="metric-title">明确错误</div><div class="metric-value ${s.errors?'red':''}">${s.errors.toLocaleString()}</div></div><div class="card"><div class="metric-title">来源 IP <span class="muted small">· 明细期</span></div><div class="metric-value">${s.source_ips.toLocaleString()}</div></div><div class="card"><div class="metric-title">最近行为</div><div class="activity-last">${s.last_at?esc(stamp(s.last_at)):'暂无'}</div></div></div>
-    ${warnings.length?`<div class="activity-health">${warnings.map(row=>`<div><strong>${esc(row.name)}</strong><span>${!row.received_at?'待上传：请更新 VPS 脚本并同步':nowTs-row.received_at>90?'行为上报中断':row.error?esc(row.error):row.gaps||row.dropped?'已记录裁剪或缓存缺口':'行为记录上传积压'}${row.pending?' · 待上传 '+row.pending+' 条':''}${row.dropped?' · 缓存丢弃 '+row.dropped+' 条':''}${row.gaps?' · 日志缺口 '+row.gaps+' 次':''}</span></div>`).join('')}</div>`:''}
+  const warnings=data.telemetry.filter(row=>row.error||row.dropped||row.gaps||row.pending>800||!row.received_at||Date.now()/1000-row.received_at>90);
+  $('activity-body').innerHTML=`<div class="cards activity-metrics"><div class="card metric-primary"><div class="metric-title">发起连接</div><div class="metric-value">${s.connections.toLocaleString()}</div></div><div class="card"><div class="metric-title">明确错误</div><div class="metric-value ${s.errors?'red':''}">${s.errors.toLocaleString()}</div></div><div class="card"><div class="metric-title">来源 IP <span class="muted small">· 明细期</span></div><div class="metric-value">${s.source_ips.toLocaleString()}</div></div><div class="card"><div class="metric-title">最近行为</div><div class="activity-last">${s.last_at?esc(stamp(s.last_at)):'暂无'}</div></div></div>
+    ${warnings.length?`<div class="activity-health">${warnings.map(row=>`<div><strong>${esc(row.name)}</strong><span>${!row.received_at?'待上传：请更新 VPS 脚本并同步':Date.now()/1000-row.received_at>90?'行为上报中断':row.error?esc(row.error):row.gaps||row.dropped?'已记录裁剪或缓存缺口':'行为记录上传积压'}${row.pending?' · 待上传 '+row.pending+' 条':''}${row.dropped?' · 缓存丢弃 '+row.dropped+' 条':''}${row.gaps?' · 日志缺口 '+row.gaps+' 次':''}</span></div>`).join('')}</div>`:''}
     <section class="card activity-chart"><div class="card-head"><h3>连接趋势</h3><span class="muted small">${esc(stamp(data.since).slice(5,16))} 起</span></div>${activityBars(data)}</section>
     <div class="activity-rankings">${ranking('常用目标 · 明细期',data.targets)}${ranking('来源 IP · 明细期',data.sources)}</div>
     <section class="card table-card activity-event-card"><div class="table-heading"><h3>行为明细 <span class="muted small">${data.total.toLocaleString()} 条</span></h3><span class="muted small">${esc(stamp(data.detail_since).slice(5,16))} 起 · 保留 ${data.detail_days} 天</span></div>${data.events.length?`<div class="table-scroll"><table class="activity-table"><thead><tr><th>时间（${tzName()}）</th><th>用户 / 服务器</th><th>来源 IP</th><th>目标</th><th>类型</th></tr></thead><tbody>${data.events.map(row=>`<tr><td class="mono">${esc(stamp(row.ts).slice(5))}</td><td><div class="cell-title">${esc(row.user_name)}</div><div class="cell-sub">${esc(row.node_name)}${row.inbound?' · '+esc(row.inbound):''}</div></td><td class="mono">${esc(row.source_ip||'—')}</td><td class="activity-target"><div class="mono" title="${esc(row.target)}">${esc(row.target||'—')}${row.port?':'+row.port:''}</div>${row.message?`<div class="cell-sub activity-message" title="${esc(row.message)}">${esc(row.message)}</div>`:''}</td><td>${row.kind==='connection'?badge((row.network||'TCP').toUpperCase(),'blue'):row.kind==='error'?badge('错误','red'):badge('缺口','amber')}</td></tr>`).join('')}</tbody></table></div>`:empty(filter.q?'没有匹配的目标':'暂无行为记录')}
-    <div class="activity-pagination"><span class="muted small">第 ${data.page} / ${pages} 页</span><div><button data-action="activity-prev" ${data.page<=1?'disabled':''}>上一页</button><button data-action="activity-next" ${data.page>=pages?'disabled':''}>下一页</button></div></div></section>`;});
+    <div class="activity-pagination"><span class="muted small">第 ${data.page} / ${pages} 页</span><div><button data-action="activity-prev" ${data.page<=1?'disabled':''}>上一页</button><button data-action="activity-next" ${data.page>=pages?'disabled':''}>下一页</button></div></div></section>`;
 }
 
 function renderLogs(){$('content').innerHTML=`<section class="card table-card">${state.logs.length?`<div class="table-scroll"><table><thead><tr><th>时间（${tzName()}）</th><th>操作者</th><th>操作</th><th>详情</th></tr></thead><tbody>${state.logs.map(l=>`<tr><td>${stamp(l.ts)}</td><td class="mono">${esc(l.actor.length>18?l.actor.slice(0,16)+'…':l.actor)}</td><td class="log-action">${esc(l.action)}</td><td class="log-detail">${esc(l.detail)}</td></tr>`).join('')}</tbody></table></div>`:empty('暂无操作记录')}</section>`;}
-function updateCardBody(){
-  const cur=state.session?.version||'—',u=state.updateInfo;
-  if(!u)return `<div class="node-line"><span>当前版本</span><b class="mono">${esc(cur)}</b></div><p class="form-help">将从服务端配置的 HTTPS 更新源下载、验证语法与标识后原地重启，保留数据库与节点数据。</p><div class="form-footer"><button type="button" data-action="check-update">检查更新</button></div>`;
-  const statusBadge=u.has_update?badge('发现新版本 '+u.remote_version,'blue'):u.same_content?badge('已是最新'):badge('内容有差异','amber');
-  return `<div class="node-line"><span>当前版本</span><b class="mono">${esc(u.current_version)}</b></div><div class="node-line"><span>远端版本</span><b class="mono">${esc(u.remote_version)}</b></div><div class="node-line"><span>状态</span>${statusBadge}</div>${u.sha256_verified?'<p class="form-help">已通过配套 SHA256 完整性校验。</p>':''}${u.writable?'':`<p class="form-error">当前运行用户无权写入 ${esc(u.script_path)}，请通过终端执行 --update。</p>`}<div class="form-footer"><button type="button" data-action="check-update">重新检查</button><button type="button" class="${u.has_update?'primary':''}" data-action="apply-update" ${u.writable?'':'disabled'}>${u.has_update?'立即更新并重启':u.same_content?'强制重新安装':'应用远端版本并重启'}</button></div>`;
-}
-function renderSettings(){$('content').innerHTML=`<div class="settings-grid"><section class="card"><div class="card-head"><div><h3>修改管理员密码</h3><p>修改后，所有已登录会话都会退出。</p></div></div><form id="password-form"><label>当前密码<input name="old_password" type="password" required autocomplete="current-password" maxlength="256"></label><label>新密码<input name="new_password" type="password" required minlength="12" maxlength="256" autocomplete="new-password" placeholder="至少 12 个字符"></label><label>再次输入新密码<input name="confirm_password" type="password" required minlength="12" maxlength="256" autocomplete="new-password"></label><div class="form-footer"><button class="primary" type="submit">更新密码</button></div></form></section><div class="form-grid"><section class="card"><div class="card-head"><div><h3>面板更新</h3></div></div><div id="update-card-body">${updateCardBody()}</div></section><section class="card"><div class="card-head"><div><h3>数据备份</h3></div></div><p class="muted">备份包含代理认证资料，请妥善保管。</p><div class="form-footer"><button type="button" data-action="download-backup">下载数据库备份 ↓</button></div></section><section class="card"><div class="card-head"><div><h3>统计时区</h3></div></div><form id="timezone-form"><label>时区偏移（分钟）<input name="timezone_offset" type="number" min="-720" max="840" step="15" value="${Number(state.settings.timezone_offset)}" required></label><p class="form-help">UTC+8 = 480；UTC = 0。明细保留 100 天，累计永久保留。</p><div class="form-footer"><button type="submit">保存时区</button></div></form></section><section class="card"><div class="card-head"><h3>行为记录保留</h3></div><form id="activity-retention-form"><div class="form-row"><label>明细（天）<input name="activity_detail_days" type="number" min="1" max="30" value="${Number(state.settings.activity_detail_days||7)}" required></label><label>汇总（天）<input name="activity_summary_days" type="number" min="1" max="90" value="${Number(state.settings.activity_summary_days||90)}" required></label></div><div class="form-footer"><button type="submit">保存期限</button></div></form></section></div></div>`;}
+function renderSettings(){$('content').innerHTML=`<div class="settings-grid"><section class="card"><div class="card-head"><div><h3>修改管理员密码</h3><p>修改后，所有已登录会话都会退出。</p></div></div><form id="password-form"><label>当前密码<input name="old_password" type="password" required autocomplete="current-password" maxlength="256"></label><label>新密码<input name="new_password" type="password" required minlength="12" maxlength="256" autocomplete="new-password" placeholder="至少 12 个字符"></label><label>再次输入新密码<input name="confirm_password" type="password" required minlength="12" maxlength="256" autocomplete="new-password"></label><div class="form-footer"><button class="primary" type="submit">更新密码</button></div></form></section><div class="form-grid"><section class="card"><div class="card-head"><div><h3>数据备份</h3></div></div><p class="muted">备份包含代理认证资料，请妥善保管。</p><div class="form-footer"><a class="inline-link" href="/api/admin/backup">下载数据库备份 ↓</a></div></section><section class="card"><div class="card-head"><div><h3>统计时区</h3></div></div><form id="timezone-form"><label>时区偏移（分钟）<input name="timezone_offset" type="number" min="-720" max="840" step="15" value="${Number(state.settings.timezone_offset)}" required></label><p class="form-help">UTC+8 = 480；UTC = 0。明细保留 100 天，累计永久保留。</p><div class="form-footer"><button type="submit">保存时区</button></div></form></section><section class="card"><div class="card-head"><h3>行为记录保留</h3></div><form id="activity-retention-form"><div class="form-row"><label>明细（天）<input name="activity_detail_days" type="number" min="1" max="30" value="${Number(state.settings.activity_detail_days||7)}" required></label><label>汇总（天）<input name="activity_summary_days" type="number" min="1" max="90" value="${Number(state.settings.activity_summary_days||90)}" required></label></div><div class="form-footer"><button type="submit">保存期限</button></div></form></section></div></div>`;}
 function render() {
   let status = state.view === 'overview' ? state.overview : null;
   if (state.view === 'nodes' || state.view === 'users') {
@@ -5126,7 +4613,7 @@ function render() {
   $('notice').hidden = !messages.length;
   $('notice').className = 'notice';
   $('notice').textContent = messages.join(' ');
-  preserveScroll($('content'), () => ({overview: renderOverview, users: renderUsers, nodes: renderNodes, subscriptions:renderSubscriptions, activity:renderActivity, logs: renderLogs, settings: renderSettings}[state.view])());
+  ({overview: renderOverview, users: renderUsers, nodes: renderNodes, subscriptions:renderSubscriptions, activity:renderActivity, logs: renderLogs, settings: renderSettings}[state.view])();
 }
 function setView(view,fetchNow=true){
   if(!views[view])return;
@@ -5139,19 +4626,18 @@ function setView(view,fetchNow=true){
   render();if(fetchNow)return refresh(true);
 }
 async function refresh(force=false){
-  if(!state.session||(!force&&(document.hidden||$('modal').open||state.view==='settings'||(state.view==='activity'&&(state.activityFilter.q||state.activityFilter.page>1)))))return false;
+  if(!state.session||(!force&&(document.hidden||$('modal').open||state.view==='settings')))return false;
   if(state.refreshTask){if(!force)return false;state.refreshTask.controller.abort();}
   const task={view:state.view,epoch:state.epoch,controller:new AbortController()};state.refreshTask=task;
-  const paths={overview:['overview','users','traffic?days=7'],users:[state.userMonth?'users?month='+encodeURIComponent(state.userMonth):'users','nodes'],nodes:['nodes'],subscriptions:['subscriptions','settings'],activity:[activityPath()],logs:['logs'],settings:['settings']}[task.view].slice();
+  const paths={overview:['overview','users','traffic?days=7'],users:[state.userMonth?'users?month='+encodeURIComponent(state.userMonth):'users','nodes'],nodes:['nodes'],subscriptions:['subscriptions'],activity:[activityPath()],logs:['logs'],settings:['settings']}[task.view].slice();
   if(!state.settingsLoaded&&!paths.includes('settings'))paths.push('settings');
   try{
     const results=await Promise.all(paths.map(path=>api('/api/admin/'+path,'GET',undefined,{signal:task.controller.signal})));
     if(task!==state.refreshTask||task.epoch!==state.epoch||task.view!==state.view||!state.session)return false;
     paths.forEach((path,index)=>{
       const data=results[index];
-      syncClock(data.server_time);
       if(path==='overview')state.overview=data;else if(path.split('?')[0]==='users'){state.users=data.users;state.userPeriod=data.period||null;}else if(path==='nodes')state.nodes=data.nodes;else if(path==='subscriptions')state.subscriptions=data.subscriptions;else if(path.split('?')[0]==='activity')state.activity=data;else if(path==='logs')state.logs=data.logs;else if(path==='settings'){state.settings=data;state.settingsLoaded=true;}else state.chart=data;
-      if(Number.isFinite(data.timezone_offset)){state.settings={...state.settings,timezone_offset:data.timezone_offset};}
+      if(Number.isFinite(data.timezone_offset)){state.settings={...state.settings,timezone_offset:data.timezone_offset};state.settingsLoaded=true;}
     });
     if(task.view==='settings'){
       const input=$('timezone-form')?.elements.namedItem('timezone_offset');if(input&&!state.settingsDirty)input.value=state.settings.timezone_offset;
@@ -5161,7 +4647,7 @@ async function refresh(force=false){
       renderSubscriptions(true);
       if(!state.templatesDirty){const form=$('subscription-template-form');for(const key of ['node_name_template','clash_template']){const input=form?.elements.namedItem(key);if(input)input.value=state.settings[key]||'';}}
     }else if(task.view==='activity')renderActivity(true);else render();
-    $('last-refresh').textContent='更新于 '+stamp(Math.floor(serverNow())).slice(11)+' · '+tzName();$('clock').textContent=stamp(Math.floor(serverNow())).slice(0,10);
+    $('last-refresh').textContent='更新于 '+stamp(Math.floor(Date.now()/1000)).slice(11)+' · '+tzName();$('clock').textContent=stamp(Math.floor(Date.now()/1000)).slice(0,10);
     return true;
   }catch(error){
     task.controller.abort();
@@ -5240,7 +4726,7 @@ function renderTraffic(user,data){
     <div class="section-header"><h3>服务器流量</h3></div>
     ${data.by_node.length?`<div class="table-scroll"><table><thead><tr><th>服务器</th><th>上传</th><th>下载</th><th>合计</th></tr></thead><tbody>${data.by_node.map(node=>`<tr><td>${esc(node.name)}</td><td class="traffic-up">${bytes(node.up)}</td><td class="traffic-down">${bytes(node.down)}</td><td><strong>${bytes(node.total)}</strong></td></tr>`).join('')}</tbody></table></div>`:'<p class="muted small">此月没有上报记录。</p>'}
     ${periodNote(period)}<p class="form-help">历史累计：上传 ${bytes(data.lifetime.up)} · 下载 ${bytes(data.lifetime.down)} · 合计 ${bytes(data.lifetime.total)}。</p></div>`,true);
-  const today=stamp(data.server_time||serverNow()).slice(0,10);
+  const today=stamp(Date.now()/1000).slice(0,10);
   drawChart('detail-chart',data.daily.filter(row=>row.date<=today),true);
 }
 async function showTraffic(uid,selectedMonth){
@@ -5255,7 +4741,6 @@ async function showTraffic(uid,selectedMonth){
   try{
     const data=await api('/api/admin/traffic?user_id='+encodeURIComponent(uid)+'&month='+encodeURIComponent(selectedMonth),'GET',undefined,{signal:task.controller.signal});
     if(task!==state.trafficTask||task.epoch!==state.epoch||!$('modal').open)return false;
-    syncClock(data.server_time);
     if(Number.isFinite(data.timezone_offset))state.settings.timezone_offset=data.timezone_offset;
     renderTraffic(user,data);return true;
   }catch(error){
@@ -5263,26 +4748,7 @@ async function showTraffic(uid,selectedMonth){
     return false;
   }finally{if(state.trafficTask===task)state.trafficTask=null;}
 }
-function nodeDetail(n){if(!n)return;modal(n.name+' · 详情',`<div class="form-grid"><div>${nodeBadge(n)}</div><div class="node-line"><span>服务器 ID</span><b class="mono">${esc(n.id)}</b></div><div class="node-line"><span>主机名</span><b>${esc(n.hostname||'—')}</b></div><div class="node-line"><span>Agent 版本</span><b>${esc(n.agent_version||'—')}</b></div><div class="node-line"><span>最后心跳</span><b>${stamp(n.last_seen)}</b></div><div class="node-line"><span>最后采集</span><b>${stamp(n.last_sample_at)}</b></div><div class="node-line"><span>已应用 / 目标版本</span><b>${n.applied_revision} / ${n.revision}</b></div>${n.last_error?`<div class="node-error">${esc(n.last_error)}</div>`:''}${n.sample_error?`<div class="node-error">${esc(n.sample_error)}</div>`:''}<div><h3>注册时的入口信息</h3>${n.inbounds.length?`<div class="table-scroll"><table><thead><tr><th>名称</th><th>类型</th><th>端口</th></tr></thead><tbody>${n.inbounds.map(i=>`<tr><td>${esc(i.name)}</td><td>${esc(i.type)}</td><td>${Number(i.port)}</td></tr>`).join('')}</tbody></table></div>`:'<p class="muted small">注册时没有入口节点。</p>'}</div>${['revoked','detached'].includes(n.status)?'<p class="inline-note">中控已停止接受此服务器的同步。服务器上保留的代理配置可能仍在运行，需在节点本机确认。</p>':''}<div class="form-footer"><button data-action="close-modal">关闭</button></div></div>`);}
-async function downloadBackup(){
-  const headers={'Content-Type':'application/json'};if(state.session)headers['X-CSRF-Token']=state.session.csrf;
-  const response=await fetch('/api/admin/backup',{method:'POST',headers,body:'{}',credentials:'same-origin',cache:'no-store'});
-  if(!response.ok){let msg='备份下载失败';try{msg=(await response.json()).error||msg;}catch{}throw new Error(msg);}
-  const blob=await response.blob(),cd=response.headers.get('content-disposition')||'',m=cd.match(/filename="([^"]+)"/);
-  const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=m?m[1]:'ysq-center-backup.db';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);
-}
-async function waitForPanelRestart(expectedVersion){
-  const deadline=Date.now()+30000;
-  await new Promise(r=>setTimeout(r,1200));
-  while(Date.now()<deadline){
-    try{
-      const resp=await fetch('/healthz',{cache:'no-store'});
-      if(resp.ok){const info=await resp.json();toast('面板已重启（'+(info.version||expectedVersion)+'），正在刷新…');setTimeout(()=>location.reload(),600);return;}
-    }catch{}
-    await new Promise(r=>setTimeout(r,1200));
-  }
-  toast('重启耗时较长，请稍后手动刷新页面',true);
-}
+function nodeDetail(n){modal(n.name+' · 详情',`<div class="form-grid"><div>${nodeBadge(n)}</div><div class="node-line"><span>服务器 ID</span><b class="mono">${esc(n.id)}</b></div><div class="node-line"><span>主机名</span><b>${esc(n.hostname||'—')}</b></div><div class="node-line"><span>Agent 版本</span><b>${esc(n.agent_version||'—')}</b></div><div class="node-line"><span>最后心跳</span><b>${stamp(n.last_seen)}</b></div><div class="node-line"><span>最后采集</span><b>${stamp(n.last_sample_at)}</b></div><div class="node-line"><span>已应用 / 目标版本</span><b>${n.applied_revision} / ${n.revision}</b></div>${n.last_error?`<div class="node-error">${esc(n.last_error)}</div>`:''}${n.sample_error?`<div class="node-error">${esc(n.sample_error)}</div>`:''}<div><h3>注册时的入口信息</h3>${n.inbounds.length?`<div class="table-scroll"><table><thead><tr><th>名称</th><th>类型</th><th>端口</th></tr></thead><tbody>${n.inbounds.map(i=>`<tr><td>${esc(i.name)}</td><td>${esc(i.type)}</td><td>${Number(i.port)}</td></tr>`).join('')}</tbody></table></div>`:'<p class="muted small">注册时没有入口节点。</p>'}</div>${['revoked','detached'].includes(n.status)?'<p class="inline-note">中控已停止接受此服务器的同步。服务器上保留的代理配置可能仍在运行，需在节点本机确认。</p>':''}<div class="form-footer"><button data-action="close-modal">关闭</button></div></div>`);}
 async function action(button){
   const key=button.dataset.action,id=button.dataset.id;if(!key)return;
   if(['show-secret','copy','close-modal','join-done'].includes(key)){
@@ -5293,21 +4759,6 @@ async function action(button){
   button.disabled=true;
   try{
     if(key==='refresh'&&await refresh(true))toast('已刷新');
-    if(key==='download-backup'){await downloadBackup();toast('备份已开始下载');}
-    if(key==='check-update'){
-      state.updateInfo=await api('/api/admin/update/check','POST',{});
-      if($('update-card-body'))$('update-card-body').innerHTML=updateCardBody();
-      toast(state.updateInfo.has_update?'发现新版本 '+state.updateInfo.remote_version:'当前已是最新版本 '+state.updateInfo.current_version);
-    }
-    if(key==='apply-update'){
-      const u=state.updateInfo,force=Boolean(u&&u.same_content);
-      const tip=force?'远端脚本与当前一致，确认强制重新安装并重启面板？':'确认更新中控面板'+(u?'（'+u.current_version+' → '+u.remote_version+'）':'')+'并自动重启？数据库和节点数据将保留。';
-      if(confirm(tip)){
-        const res=await api('/api/admin/update/apply','POST',{force});
-        if(!res.updated){toast(res.message||'当前已是最新');}
-        else{toast('更新成功（'+res.new_version+'），面板正在重启…');await waitForPanelRestart(res.new_version);}
-      }
-    }
     if(key==='new-user'){state.nodes=(await api('/api/admin/nodes')).nodes;userForm();}
     if(key==='new-node')newNode();
     if(key==='edit-user'||key==='quota-user'){const [user,nodes]=await Promise.all([api('/api/admin/users/'+id),api('/api/admin/nodes')]);state.nodes=nodes.nodes;userForm(user);if(key==='quota-user')document.querySelector('#user-form input[name="quota_gib"]')?.focus();}
@@ -5322,8 +4773,8 @@ async function action(button){
     if(key==='subscription')await showSubscription(id);
     if(key==='reset-subscription'&&confirm('重置后旧订阅链接立即失效，继续？'))await showSubscription(id,true);
     if(key==='invalidate-subscription'&&await showSubscription(id,{subscription_enabled:false}))toast('订阅链接已失效');
-    if(key==='toggle-user'){const u=state.users.find(x=>x.id===id);if(!u)return;if(!u.enabled||confirm('禁用 '+u.name+'？')){await api('/api/admin/users/'+id,'POST',{enabled:!u.enabled});toast('用户状态已保存');await refresh(true);followSync();}}
-    if(key==='delete-user'){const u=state.users.find(x=>x.id===id);if(!u)return;if(confirm('彻底删除 '+u.name+'？用户、流量记录和订阅链接将一并清除。')){await api('/api/admin/users/'+id,'DELETE',{});toast('用户和相关数据已删除');await refresh(true);followSync();}}
+    if(key==='toggle-user'){const u=state.users.find(x=>x.id===id);if(!u.enabled||confirm('禁用 '+u.name+'？')){await api('/api/admin/users/'+id,'POST',{enabled:!u.enabled});toast('用户状态已保存');await refresh(true);followSync();}}
+    if(key==='delete-user'){const u=state.users.find(x=>x.id===id);if(confirm('彻底删除 '+u.name+'？用户、流量记录和订阅链接将一并清除。')){await api('/api/admin/users/'+id,'DELETE',{});toast('用户和相关数据已删除');await refresh(true);followSync();}}
     if(key==='reset-user'&&confirm('重置 UUID 和 TUIC 密码？此用户所有客户端都需要更新认证资料。')){await api('/api/admin/users/'+id,'POST',{reset_credentials:true});userForm(await api('/api/admin/users/'+id));toast('认证凭据已重置，请更新客户端');await refresh(true);}
     if(key==='join-code')showJoin(await api('/api/admin/nodes/'+id+'/join-code','POST',{}));
     if(key==='rename-node')renameNode(state.nodes.find(n=>n.id===id));if(key==='node-detail')nodeDetail(state.nodes.find(n=>n.id===id));
@@ -5401,12 +4852,12 @@ setInterval(()=>refresh(false),REFRESH_MS);
 
 def normalize_origin(value, dev=False):
     parsed = urllib.parse.urlsplit(value)
-    if parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment or parsed.path not in ("", "/"):
+    if parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path not in ("", "/"):
         raise ValueError("--origin 必须是完整域名来源，不能包含路径、查询参数或认证资料")
     if parsed.scheme not in ("https", "http") or not parsed.hostname:
         raise ValueError("--origin 必须包含 https://")
     try:
-        port = parsed.port
+        parsed.port
     except ValueError:
         raise ValueError("--origin 端口不合法")
     if parsed.scheme != "https":
@@ -5414,41 +4865,25 @@ def normalize_origin(value, dev=False):
             raise ValueError("生产环境 --origin 必须使用 HTTPS；HTTP 仅允许 --dev 的本机地址")
     if dev and parsed.hostname not in ("127.0.0.1", "localhost", "::1"):
         raise ValueError("--dev 只能配合本机 origin，不能用于公网域名")
-    host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
-    default_port = 443 if parsed.scheme == "https" else 80
-    netloc = host if (port is None or port == default_port) else f"{host}:{port}"
-    return f"{parsed.scheme}://{netloc}"
+    return f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
 
 
 def main(argv=None):
-    raw_argv = list(sys.argv[1:]) if argv is None else list(argv)
     parser = argparse.ArgumentParser(description="YSQ 单文件中控（Python 标准库 / SQLite / 内置网页）")
     parser.add_argument("--data-dir", default="/var/lib/ysq-center", help="数据库目录（默认 /var/lib/ysq-center）")
     parser.add_argument("--host", default="127.0.0.1", help="只允许回环地址，供同机 Nginx 代理")
     parser.add_argument("--port", type=int, default=8099)
-    parser.add_argument("--origin", default=os.environ.get("YSQ_CENTER_ORIGIN", "https://panel.eulmo.com"), help="浏览器和 Agent 使用的公开 HTTPS 来源")
-    parser.add_argument("--update-url", default=os.environ.get("YSQ_CENTER_UPDATE_URL", DEFAULT_UPDATE_URL), help="面板更新源 HTTPS 地址")
-    parser.add_argument("--require-update-sha256", action="store_true", default=os.environ.get("YSQ_CENTER_REQUIRE_SHA256") == "1", help="更新面板时强制要求配套 .sha256 校验")
-    parser.add_argument("--no-trust-proxy-header", action="store_true", help="忽略回环连接上的 X-Real-IP 头（无反代直连时启用）")
+    parser.add_argument("--origin", default="https://panel.eulmo.com", help="浏览器和 Agent 使用的公开 HTTPS 来源")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--init-admin", metavar="USER", help="创建管理员后退出")
     group.add_argument("--reset-admin", metavar="USER", help="重置管理员密码并注销会话后退出")
     group.add_argument("--check", action="store_true", help="检查数据库与管理员；无管理员退出码 3")
-    group.add_argument("--update", action="store_true", help="从更新源下载校验并原地更新当前中控脚本后退出")
     parser.add_argument("--dev", action="store_true", help="仅本机测试：允许 HTTP origin 和非 Secure Cookie")
     parser.add_argument("--version", action="version", version=VERSION)
     args = parser.parse_args(argv)
     os.umask(0o077)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
-        updater = PanelUpdater(__file__, args.update_url, dev=args.dev, require_sha256=args.require_update_sha256)
-        if args.update:
-            result = updater.apply(store=None, actor="cli", force=False)
-            if not result["updated"]:
-                print(result.get("message", "当前已是最新版本。"))
-            else:
-                print(f"面板已更新：{result['old_version']} → {result['new_version']}（旧文件备份：{result['backup_path']}），请重启中控服务生效。")
-            return 0
         if not ipaddress.ip_address(args.host).is_loopback:
             raise ValueError("中控只允许监听回环地址。请由 Nginx 对外提供 HTTPS。")
         if not 1 <= args.port <= 65535:
@@ -5478,30 +4913,9 @@ def main(argv=None):
             return 0
         if not store.has_admin():
             raise ValueError("尚未创建管理员。请先执行 --init-admin admin；不会开放匿名初始化页面。")
-        server = CenterServer((args.host, args.port), store, origin, args.dev,
-                              trust_proxy_header=not args.no_trust_proxy_header, updater=updater)
-        stop_bg = threading.Event()
-
-        def maintenance_worker():
-            while not stop_bg.wait(600):
-                try:
-                    store.maintain(force=True)
-                except Exception:
-                    LOG.exception("后台维护任务失败")
-
-        bg_thread = threading.Thread(target=maintenance_worker, name="ysq-maintenance", daemon=True)
-        bg_thread.start()
-
-        def trigger_shutdown():
-            stop_bg.set()
-            store.signal_shutdown()
-            threading.Thread(target=server.shutdown, daemon=True).start()
-
-        server._restart_callback = trigger_shutdown
-
+        server = CenterServer((args.host, args.port), store, origin, args.dev)
         def stop_server(signum, frame):
-            trigger_shutdown()
-
+            threading.Thread(target=server.shutdown, daemon=True).start()
         signal.signal(signal.SIGTERM, stop_server)
         signal.signal(signal.SIGINT, stop_server)
         LOG.info("YSQ %s 已启动：HTTP %s:%s；公开地址 %s", VERSION, args.host, args.port, origin)
@@ -5510,12 +4924,7 @@ def main(argv=None):
         try:
             server.serve_forever(poll_interval=0.5)
         finally:
-            stop_bg.set()
-            store.signal_shutdown()
             server.server_close()
-        if server.restart_requested:
-            LOG.info("正在原地重启以加载新版中控面板...")
-            os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve()), *raw_argv])
         return 0
     except (APIError, ValueError, OSError, sqlite3.Error, RuntimeError) as exc:
         LOG.error("%s", str(exc))
