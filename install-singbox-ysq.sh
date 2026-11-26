@@ -24,16 +24,18 @@ set -euo pipefail
 #   - 所有修改先写临时文件；配置通过 sing-box check 后才替换（低内存机器上 check 被杀时改用 jq 校验 JSON，由启动服务验证）；失败自动回滚 state
 #   - 面板里每个操作都在子 shell 中运行，die 只会中止当前操作，不会退出面板
 #   - 节点管理与落地管理解耦：落地的增删改只在「落地节点池管理」里做，节点只能选择已有落地
-#   - Alpine(OpenRC)：日志写入单个文件，busybox cron 每小时检查，达 9MB 裁剪、保留最后 2MB
+#   - 统一由 singbox-plus wrap 托管日志输出与不可变分片轮转（4 MiB × 保留 2 个历史分片），无需定时裁剪
 # ============================================================
 
-YSQ_VERSION="2026.11.26"
+YSQ_VERSION="2026.11.26.2"
 INSTALLER_NAME="install-singbox-ysq.sh"
 DEFAULT_SCRIPT_URL="https://raw.githubusercontent.com/showcode1024/singbox-auto/main/install-singbox-ysq.sh"
 
-# sing-box 内核统一从自编译 Release 下载（支持 linux-amd64 / linux-arm64）
+# sing-box 内核与 singbox-plus 统一从自编译 Release 下载（支持 linux-amd64 / linux-arm64）
 SINGBOX_REPO="${SINGBOX_REPO:-showcode1024/singbox-auto}"
 SINGBOX_FALLBACK_VERSION="${SINGBOX_FALLBACK_VERSION:-1.14.3}"
+SINGBOX_PLUS_REPO="${SINGBOX_PLUS_REPO:-$SINGBOX_REPO}"
+SINGBOX_PLUS_FALLBACK_VERSION="${SINGBOX_PLUS_FALLBACK_VERSION:-0.1.0}"
 
 # -------------------------
 # 默认端口
@@ -46,7 +48,6 @@ TUIC_DIRECT_PORT=20002
 V2RAY_API_PORT=41453
 # 主备落地切换只通过本机鉴权 API 控制，不对公网开放。
 FAILOVER_API_PORT=41452
-GRPCURL_VERSION="1.9.4"
 # YSQ_TEST_ROOT isolates helper tests; never repurpose HOME or system environment paths.
 YSQ_TEST_ROOT="${YSQ_TEST_ROOT:-}"
 if [ -n "$YSQ_TEST_ROOT" ]; then
@@ -60,7 +61,7 @@ if [ -n "$YSQ_TEST_ROOT" ]; then
   esac
   export YSQ_TEST_ROOT
 fi
-GRPCURL_YSQ_BIN="${YSQ_TEST_ROOT}/usr/local/libexec/ysq-grpcurl"
+SINGBOX_PLUS_BIN="${YSQ_TEST_ROOT}/usr/local/libexec/singbox-plus"
 
 # -------------------------
 # 预设默认参数（命令行加 -y，或交互时选择“使用默认参数”时使用）
@@ -82,18 +83,12 @@ CERT_FILE="${YSQ_TEST_ROOT}/etc/sing-box/cert/tuic.crt"
 KEY_FILE="${YSQ_TEST_ROOT}/etc/sing-box/cert/tuic.key"
 CERT_SNI_FILE="${YSQ_TEST_ROOT}/etc/sing-box/cert/tuic.sni"
 LOG_FILE="${YSQ_TEST_ROOT}/var/log/sing-box/sing-box.log"
-# 统一 info 文件日志：Agent 连续读取；systemd timer / OpenRC cron 提供容量检查兜底
-LOG_TRIM_MAX_MB=9      # 日志文件达到 9MB 时触发裁剪
-LOG_TRIM_KEEP_MB=2     # 裁剪后保留最后 2MB
-LOG_TRIM_SCRIPT="${YSQ_TEST_ROOT}/usr/local/libexec/ysq-singbox-log-trim"
-LOG_TRIM_LOCK_FILE="${YSQ_TEST_ROOT}/run/ysq-log-trim.lock"
 INFO_FILE="${YSQ_TEST_ROOT}/root/singbox-node-info.txt"
 YAML_FILE="${YSQ_TEST_ROOT}/root/singbox-nodes.yaml"
 PANEL_FILE="${YSQ_TEST_ROOT}/usr/local/bin/ysq"
 INSTALLER_FILE="${YSQ_TEST_ROOT}/root/install-singbox-ysq.sh"
 
 # Agent paths are separate from sing-box-owned directories and survive data-preserving uninstall.
-AGENT_FILE="${YSQ_TEST_ROOT}/usr/local/libexec/ysq-agent.py"
 AGENT_CONFIG_FILE="${YSQ_TEST_ROOT}/etc/ysq-agent/config.json"
 AGENT_DATA_DIR="${YSQ_TEST_ROOT}/var/lib/ysq-agent"
 AGENT_SYSTEMD_FILE="${YSQ_TEST_ROOT}/etc/systemd/system/ysq-agent.service"
@@ -106,15 +101,10 @@ CORE_PID_FILE="${YSQ_TEST_ROOT}/run/sing-box.pid"
 CORE_BIN_FILE="${YSQ_TEST_ROOT}/usr/local/bin/sing-box"
 CORE_SYSTEMD_FILE="${YSQ_TEST_ROOT}/etc/systemd/system/sing-box.service"
 CORE_OPENRC_FILE="${YSQ_TEST_ROOT}/etc/init.d/sing-box"
-FAILOVER_FILE="${YSQ_TEST_ROOT}/usr/local/libexec/ysq-failover.py"
 FAILOVER_SYSTEMD_FILE="${YSQ_TEST_ROOT}/etc/systemd/system/ysq-failover.service"
 FAILOVER_OPENRC_FILE="${YSQ_TEST_ROOT}/etc/init.d/ysq-failover"
 FAILOVER_PID_FILE="${YSQ_TEST_ROOT}/run/ysq-failover.pid"
 FAILOVER_STATUS_FILE="${YSQ_TEST_ROOT}/var/lib/ysq-failover/status.json"
-PERIODIC_DIR="${YSQ_TEST_ROOT}/etc/periodic/hourly"
-CRONTAB_DIR="${YSQ_TEST_ROOT}/etc/crontabs"
-CRONTAB_FILE="${YSQ_TEST_ROOT}/etc/crontabs/root"
-CROND_FILE="${YSQ_TEST_ROOT}/etc/init.d/crond"
 
 # 约定：操作函数返回 3 表示“用户主动取消”，不提示失败、不暂停
 CANCEL_RC=3
@@ -177,7 +167,11 @@ cleanup_tmp() {
     mv -f "$INSTALL_PREV_FILE" "$STATE_FILE" 2>/dev/null || true
   fi
   rm -rf "$WORK_DIR" 2>/dev/null || true
-  rm -f "${STATE_FILE}.tmp.${WORK_TAG}."* "${CONFIG_FILE}.tmp.${WORK_TAG}."* 2>/dev/null || true
+  rm -f "${STATE_FILE}.tmp.${WORK_TAG}."* "${CONFIG_FILE}.tmp.${WORK_TAG}."* \
+    "$(dirname "$INFO_FILE")/.ysq-info.tmp.${WORK_TAG}."* \
+    "$(dirname "$YAML_FILE")/.ysq-yaml.tmp.${WORK_TAG}."* \
+    "${CORE_BIN_FILE}.new.${WORK_TAG}" "${SINGBOX_PLUS_BIN}.new.${WORK_TAG}" \
+    "${CORE_BIN_FILE}.restore.${WORK_TAG}" "${SINGBOX_PLUS_BIN}.restore.${WORK_TAG}" 2>/dev/null || true
 }
 trap cleanup_tmp EXIT
 trap 'exit 130' INT
@@ -244,17 +238,6 @@ while [ "$#" -gt 0 ]; do
 done
 
 ACTION="${ACTION:-install}"
-
-# 显式写了 vless= / tuic= 但值为空
-for arg in "$@"; do
-  case "$arg" in
-    vless=|tuic=)
-      err "参数 ${arg} 的值不能为空。"
-      usage >&2
-      exit 1
-      ;;
-  esac
-done
 
 if [ "$ACTION" != "install" ] && { [ -n "$CLI_VLESS" ] || [ -n "$CLI_TUIC" ] || [ -n "$CLI_YES" ]; }; then
   err "vless= / tuic= / -y 只能用于安装模式。"
@@ -356,23 +339,42 @@ nologin_shell() {
   fi
 }
 
+singbox_group_exists() {
+  getent group sing-box >/dev/null 2>&1 || grep -q '^sing-box:' /etc/group 2>/dev/null
+}
+
 ensure_singbox_user() {
   [ -z "$YSQ_TEST_ROOT" ] || return 0
   local shell_path
-  id sing-box >/dev/null 2>&1 && return 0
 
-  shell_path="$(nologin_shell)"
+  if ! singbox_group_exists; then
+    if command -v groupadd >/dev/null 2>&1; then
+      groupadd --system sing-box 2>/dev/null || groupadd -r sing-box 2>/dev/null || true
+    elif command -v addgroup >/dev/null 2>&1; then
+      addgroup -S sing-box 2>/dev/null || true
+    fi
+  fi
+  singbox_group_exists || die "无法创建 sing-box 系统用户组。"
 
-  if command -v useradd >/dev/null 2>&1; then
-    useradd --system --no-create-home --shell "$shell_path" sing-box 2>/dev/null \
-      || useradd -r -M -s "$shell_path" sing-box 2>/dev/null \
-      || true
-  elif command -v adduser >/dev/null 2>&1; then
-    addgroup -S sing-box 2>/dev/null || true
-    adduser -S -D -H -s "$shell_path" -G sing-box sing-box 2>/dev/null || true
+  if ! id sing-box >/dev/null 2>&1; then
+    shell_path="$(nologin_shell)"
+    if command -v useradd >/dev/null 2>&1; then
+      useradd --system --no-create-home -g sing-box --shell "$shell_path" sing-box 2>/dev/null \
+        || useradd -r -M -g sing-box -s "$shell_path" sing-box 2>/dev/null \
+        || true
+    elif command -v adduser >/dev/null 2>&1; then
+      adduser -S -D -H -s "$shell_path" -G sing-box sing-box 2>/dev/null || true
+    fi
+  elif [ "$(id -gn sing-box 2>/dev/null || true)" != "sing-box" ]; then
+    if command -v usermod >/dev/null 2>&1; then
+      usermod -g sing-box sing-box 2>/dev/null || usermod -aG sing-box sing-box 2>/dev/null || true
+    elif command -v addgroup >/dev/null 2>&1; then
+      addgroup sing-box sing-box 2>/dev/null || true
+    fi
   fi
 
   id sing-box >/dev/null 2>&1 || die "无法创建 sing-box 系统用户。"
+  singbox_group_exists || die "无法创建 sing-box 系统用户组。"
 }
 
 normalize_arch() {
@@ -383,25 +385,36 @@ normalize_arch() {
   esac
 }
 
+resolve_singbox_bin() {
+  if [ -x "$CORE_BIN_FILE" ]; then
+    printf '%s\n' "$CORE_BIN_FILE"
+  else
+    command -v sing-box 2>/dev/null || true
+  fi
+}
+
 singbox_bin_works() {
-  local bin
-  bin="${1:-$(command -v sing-box 2>/dev/null || true)}"
-  [ -n "$bin" ] || return 1
-  [ -x "$bin" ] || return 1
-  "$bin" version >/dev/null 2>&1
+  local bin out
+  bin="${1:-$(resolve_singbox_bin)}"
+  [ -n "$bin" ] && [ -x "$bin" ] || return 1
+  out="$("$bin" version 2>/dev/null)" || return 1
+  printf '%s\n' "$out" | grep -q 'with_v2ray_api' \
+    && printf '%s\n' "$out" | grep -q 'with_clash_api' \
+    && printf '%s\n' "$out" | grep -q 'with_quic' \
+    && printf '%s\n' "$out" | grep -q 'with_utls'
 }
 
 remove_broken_singbox_bins() {
   local bin
   bin="$(command -v sing-box 2>/dev/null || true)"
-  if [ -n "$bin" ] && ! singbox_bin_works "$bin"; then
+  if [ -n "$bin" ] && ! "$bin" version >/dev/null 2>&1; then
     warn "检测到 sing-box 可执行文件存在但无法运行：$bin"
     rm -f "$bin"
   fi
 
-  bin=${CORE_BIN_FILE}
+  bin="$CORE_BIN_FILE"
   if [ -e "$bin" ] && ! singbox_bin_works "$bin"; then
-    warn "删除无法运行的 sing-box：$bin"
+    warn "删除无法运行或缺少必要编译标签的 sing-box：$bin"
     rm -f "$bin"
   fi
 
@@ -432,7 +445,7 @@ get_latest_version() {
 # 统一安装入口：下载自编译 tar.gz → 校验 SHA256 → 安装到 ${CORE_BIN_FILE}
 # 可用 SINGBOX_VERSION=x.y.z 指定版本；否则取仓库最新 Release，取不到时用内置默认版本。
 install_singbox_release() {
-  local arch version base tar_name tmp_dir tar_file sums_file expect actual found_bin
+  local arch version base tar_name tmp_dir tar_file sums_file expect actual found_bin stage
 
   arch="$(normalize_arch)"
   tmp_dir="$(new_work_dir)"
@@ -450,22 +463,31 @@ install_singbox_release() {
   sums_file="${tmp_dir}/SHA256SUMS"
 
   info "正在下载自编译 sing-box ${version} / ${arch}"
-  curl -fL --connect-timeout 10 --retry 3 -o "$tar_file" "${base}/${tar_name}" \
+  curl -fL --connect-timeout 10 --max-time 300 --speed-time 30 --speed-limit 1024 --retry 3 -o "$tar_file" "${base}/${tar_name}" \
     || die "sing-box 下载失败：${base}/${tar_name}"
 
-  # SHA256 校验（Release 里有 SHA256SUMS 才校验；下载不到只警告）
-  if curl -fsSL --connect-timeout 10 --retry 2 -o "$sums_file" "${base}/SHA256SUMS" 2>/dev/null; then
-    expect="$(awk -v f="$tar_name" '{n=$2; sub(/^\.\//,"",n); sub(/^\*/,"",n); if (n==f) print $1}' "$sums_file" | head -n 1)"
+  # SHA256 校验（默认 fail-closed；仅显式设置 SINGBOX_ALLOW_UNVERIFIED=1 时允许跳过缺失的 SHA256SUMS/条目）
+  if curl -fsSL --connect-timeout 10 --max-time 30 --retry 2 -o "$sums_file" "${base}/SHA256SUMS" 2>/dev/null; then
+    expect="$(awk -v f="$tar_name" '{n=$2; sub(/^\.\//,"",n); sub(/^\*/,"",n); if (n==f) {print $1; exit}}' "$sums_file")"
     actual="$(sha256sum "$tar_file" | awk '{print $1}')"
     if [ -z "$expect" ]; then
-      warn "SHA256SUMS 中没有 ${tar_name}，跳过校验。"
-    elif [ "$expect" != "$actual" ]; then
-      die "sing-box 压缩包 SHA256 校验失败（期望 ${expect}，实际 ${actual}）。"
+      if [ "${SINGBOX_ALLOW_UNVERIFIED:-0}" = "1" ]; then
+        warn "SHA256SUMS 中没有 ${tar_name}，已按 SINGBOX_ALLOW_UNVERIFIED=1 跳过校验。"
+      else
+        rm -rf "$tmp_dir"
+        die "SHA256SUMS 中缺少 ${tar_name} 校验记录，已拒绝安装（如确需跳过，请显式设置 SINGBOX_ALLOW_UNVERIFIED=1）。"
+      fi
+    elif ! [[ "$expect" =~ ^[0-9a-fA-F]{64}$ ]] || ! [[ "$actual" =~ ^[0-9a-fA-F]{64}$ ]] || [ "${expect,,}" != "${actual,,}" ]; then
+      rm -rf "$tmp_dir"
+      die "sing-box 压缩包 SHA256 校验失败（期望 ${expect:-缺失}，实际 ${actual:-未知}）。"
     else
       ok "SHA256 校验通过。"
     fi
+  elif [ "${SINGBOX_ALLOW_UNVERIFIED:-0}" = "1" ]; then
+    warn "未能下载 SHA256SUMS，已按 SINGBOX_ALLOW_UNVERIFIED=1 跳过完整性校验。"
   else
-    warn "未能下载 SHA256SUMS，跳过完整性校验。"
+    rm -rf "$tmp_dir"
+    die "无法下载 sing-box SHA256SUMS 校验文件，已拒绝安装（如确需跳过，请显式设置 SINGBOX_ALLOW_UNVERIFIED=1）。"
   fi
 
   tar -xzf "$tar_file" -C "$tmp_dir" || die "sing-box 解压失败。"
@@ -473,9 +495,160 @@ install_singbox_release() {
   found_bin="$(find "$tmp_dir" -type f -name sing-box | head -n 1)"
   [ -n "$found_bin" ] || die "下载包里未找到 sing-box 可执行文件。"
 
-  install -m 755 "$found_bin" ${CORE_BIN_FILE}
+  mkdir -p "$(dirname "$CORE_BIN_FILE")"
+  stage="${CORE_BIN_FILE}.new.${WORK_TAG}"
+  install -m 755 "$found_bin" "$stage"
+  mv -f "$stage" "$CORE_BIN_FILE"
   rm -rf "$tmp_dir"
   hash -r 2>/dev/null || true
+}
+
+singbox_plus_works() {
+  local bin="${1:-$SINGBOX_PLUS_BIN}"
+  [ -n "$bin" ] && [ -x "$bin" ] || return 1
+  "$bin" version >/dev/null 2>&1
+}
+
+singbox_plus_current_version() {
+  local bin="${1:-$SINGBOX_PLUS_BIN}" ver=""
+  [ -n "$bin" ] && [ -x "$bin" ] || return 0
+  ver="$("$bin" version 2>/dev/null | head -n 1 | awk '{print ($2 != "" ? $2 : $1)}' || true)"
+  ver="${ver#v}"
+  printf '%s\n' "$ver"
+}
+
+get_latest_singbox_plus_version() {
+  local version="" page resp count
+
+  for page in 1 2 3; do
+    resp="$(curl -fsSL --max-time 15 "https://api.github.com/repos/${SINGBOX_PLUS_REPO}/releases?per_page=100&page=${page}" 2>/dev/null)" || break
+    count="$(printf '%s' "$resp" | jq -r 'if type == "array" then length else 0 end' 2>/dev/null)" || break
+    [ "${count:-0}" -gt 0 ] || break
+    version="$(printf '%s' "$resp" \
+      | jq -r '[.[] | select(.draft != true and .prerelease != true) | .tag_name | select(test("^singbox-plus-v[0-9]+\\.[0-9]+\\.[0-9]+$")) | sub("^singbox-plus-v"; "")] | sort_by(split(".") | map(tonumber)) | last // empty' 2>/dev/null)" || version=""
+    if valid_version "$version"; then
+      break
+    fi
+    [ "$count" -eq 100 ] || break
+  done
+
+  if ! valid_version "$version"; then
+    version="$(curl -fsSL --max-time 15 "https://github.com/${SINGBOX_PLUS_REPO}/tags" 2>/dev/null \
+      | grep -oE 'singbox-plus-v[0-9]+\.[0-9]+\.[0-9]+' \
+      | sed 's/^singbox-plus-v//' \
+      | sort -t. -k1,1n -k2,2n -k3,3n \
+      | tail -n 1)" || version=""
+  fi
+
+  valid_version "$version" || version=""
+  echo "$version"
+}
+
+# 下载 singbox-plus Release 并强制校验 SHA256SUMS（失败返回 1，不 die，便于上层决定回滚）
+install_singbox_plus_release() {
+  local arch version base tar_name tmp_dir tar_file sums_file expect actual found_bin stage
+
+  [ -z "$YSQ_TEST_ROOT" ] || { err "隔离测试模式禁止联网下载 singbox-plus。"; return 1; }
+  arch="$(normalize_arch)"
+  tmp_dir="$(new_work_dir)" || return 1
+
+  version="${SINGBOX_PLUS_VERSION:-}"
+  [ -n "$version" ] || version="$(get_latest_singbox_plus_version)"
+  if ! valid_version "$version"; then
+    warn "无法获取 singbox-plus 最新版本号，默认安装 ${SINGBOX_PLUS_FALLBACK_VERSION} 版本。"
+    version="$SINGBOX_PLUS_FALLBACK_VERSION"
+  fi
+
+  tar_name="singbox-plus-${version}-linux-${arch}.tar.gz"
+  base="https://github.com/${SINGBOX_PLUS_REPO}/releases/download/singbox-plus-v${version}"
+  tar_file="${tmp_dir}/${tar_name}"
+  sums_file="${tmp_dir}/SHA256SUMS"
+
+  info "正在下载 singbox-plus ${version} / ${arch}"
+  if ! curl -fL --connect-timeout 10 --max-time 300 --speed-time 30 --speed-limit 1024 --retry 3 -o "$tar_file" "${base}/${tar_name}"; then
+    err "singbox-plus 下载失败：${base}/${tar_name}"
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+
+  if ! curl -fsSL --connect-timeout 10 --max-time 30 --retry 2 -o "$sums_file" "${base}/SHA256SUMS"; then
+    err "无法下载 singbox-plus 官方 SHA256SUMS 校验文件，已拒绝安装。"
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+
+  expect="$(awk -v f="$tar_name" '{n=$2; sub(/^\.\//,"",n); sub(/^\*/,"",n); if (n==f) {print $1; exit}}' "$sums_file")"
+  actual="$(sha256sum "$tar_file" | awk '{print $1}')"
+  if ! [[ "$expect" =~ ^[0-9a-fA-F]{64}$ ]] || ! [[ "$actual" =~ ^[0-9a-fA-F]{64}$ ]] || [ "${expect,,}" != "${actual,,}" ]; then
+    err "singbox-plus SHA256 校验失败（期望 ${expect:-缺失}，实际 ${actual:-未知}），已拒绝安装。"
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+  ok "singbox-plus SHA256 校验通过。"
+
+  if ! tar -xzf "$tar_file" -C "$tmp_dir"; then
+    err "singbox-plus 解压失败。"
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+
+  found_bin="$(find "$tmp_dir" -type f -name singbox-plus | head -n 1)"
+  if [ -z "$found_bin" ]; then
+    err "下载包里未找到 singbox-plus 可执行文件。"
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+
+  mkdir -p "$(dirname "$SINGBOX_PLUS_BIN")" || { rm -rf "$tmp_dir"; return 1; }
+  stage="${SINGBOX_PLUS_BIN}.new.${WORK_TAG}"
+  if ! install -m 755 "$found_bin" "$stage" || ! mv -f "$stage" "$SINGBOX_PLUS_BIN"; then
+    rm -f "$stage"
+    rm -rf "$tmp_dir"
+    err "安装 singbox-plus 到 ${SINGBOX_PLUS_BIN} 失败。"
+    return 1
+  fi
+  rm -rf "$tmp_dir"
+
+  if ! singbox_plus_works "$SINGBOX_PLUS_BIN"; then
+    rm -f "$SINGBOX_PLUS_BIN"
+    err "singbox-plus 无法运行，请检查 CPU 架构。"
+    return 1
+  fi
+  ok "singbox-plus 安装完成：$("$SINGBOX_PLUS_BIN" version 2>/dev/null | head -n 1)"
+}
+
+ensure_singbox_plus() {
+  local force="${1:-}"
+  if [ "$force" != "force" ] && singbox_plus_works "$SINGBOX_PLUS_BIN"; then
+    return 0
+  fi
+  if [ -e "$SINGBOX_PLUS_BIN" ] && ! singbox_plus_works "$SINGBOX_PLUS_BIN"; then
+    warn "检测到 singbox-plus 存在但无法运行，将重新安装。"
+    rm -f "$SINGBOX_PLUS_BIN"
+  fi
+  install_singbox_plus_release
+}
+
+upgrade_singbox_plus_if_outdated() {
+  local cur_ver="" latest_ver=""
+  [ -z "$YSQ_TEST_ROOT" ] || return 0
+  singbox_plus_works "$SINGBOX_PLUS_BIN" || return 0
+
+  cur_ver="$(singbox_plus_current_version "$SINGBOX_PLUS_BIN")"
+  latest_ver="${SINGBOX_PLUS_VERSION:-}"
+  [ -n "$latest_ver" ] || latest_ver="$(get_latest_singbox_plus_version)"
+  latest_ver="${latest_ver#v}"
+
+  if ! valid_version "$latest_ver"; then
+    return 0
+  fi
+  if [ "$cur_ver" = "$latest_ver" ]; then
+    return 0
+  fi
+
+  info "检测到 singbox-plus 新版本：${cur_ver:-未知} -> ${latest_ver}，正在同步更新..."
+  SINGBOX_PLUS_VERSION="$latest_ver" ensure_singbox_plus force \
+    || warn "singbox-plus 更新失败，继续使用当前版本 (${cur_ver:-未知})。"
 }
 
 # 仅当内容变化时才覆盖目标文件；内容有变化返回 0，无变化返回 1
@@ -487,130 +660,43 @@ install_if_changed() {
   install -m "$mode" "$src" "$dest"
 }
 
-# 生成日志裁剪脚本：文件 >= MAX 字节时只保留最后 KEEP 字节（Agent 运行中放宽至 FALLBACK_MAX 兜底）
-write_log_trim_script() {
-  local dest="$1"
-  local max_bytes=$((LOG_TRIM_MAX_MB * 1024 * 1024))
-  local fallback_max_bytes=$((LOG_TRIM_MAX_MB * 2 * 1024 * 1024))
-  local keep_bytes=$((LOG_TRIM_KEEP_MB * 1024 * 1024))
-
-  cat > "$dest" <<'TRIM'
-#!/bin/sh
-# ysq: sing-box 日志裁剪。由 install-singbox-ysq.sh 生成，重新安装 / 升级时会被覆盖。
-# 日志文件达到限额时，只保留最后 KEEP 字节；Agent 运行时提高限额至 FALLBACK_MAX 仅作兜底。
-LOG="@LOG@"
-MAX=@MAX@
-FALLBACK_MAX=@FALLBACK_MAX@
-KEEP=@KEEP@
-LOCK="@LOCK@"
-AGENT_DATA_DIR="@AGENT_DATA_DIR@"
-
-[ -f "$LOG" ] || exit 0
-mkdir -p "$(dirname "$LOCK")" 2>/dev/null || true
-exec 9>>"$LOCK" 2>/dev/null || exit 0
-if command -v flock >/dev/null 2>&1; then
-  flock -n 9 || exit 0
-fi
-
-limit="$MAX"
-if command -v flock >/dev/null 2>&1; then
-  for lf in "$AGENT_DATA_DIR"/*.run.lock; do
-    [ -f "$lf" ] || continue
-    if ! ( exec 8>>"$lf" && flock -n 8 ) 2>/dev/null; then
-      limit="$FALLBACK_MAX"
-      break
-    fi
-  done
-fi
-
-size=$(stat -c %s "$LOG" 2>/dev/null || wc -c < "$LOG" 2>/dev/null | tr -d ' ')
-[ "${size:-0}" -ge "$limit" ] || exit 0
-
-tmp="${LOG}.trim.$$"
-# 取最后 KEEP 字节；开头那一行大概率被截断，丢掉它
-if tail -c "$KEEP" "$LOG" | sed '1d' > "$tmp"; then
-  # 原地覆盖，不能 mv：sing-box 以追加模式持有这个文件，inode 不能换
-  cat "$tmp" > "$LOG"
-fi
-rm -f "$tmp"
-TRIM
-  sed -i \
-    -e "s|@LOG@|${LOG_FILE}|" \
-    -e "s|@MAX@|${max_bytes}|" \
-    -e "s|@FALLBACK_MAX@|${fallback_max_bytes}|" \
-    -e "s|@KEEP@|${keep_bytes}|" \
-    -e "s|@LOCK@|${LOG_TRIM_LOCK_FILE}|" \
-    -e "s|@AGENT_DATA_DIR@|${AGENT_DATA_DIR}|" \
-    "$dest"
-  chmod 755 "$dest"
-}
-
-# Agent 读取后检查容量；定时裁剪在 Agent 停止或异常堆积时提供兜底。
-install_log_trim() {
-  local wd
-  wd="$(new_work_dir)"
-  mkdir -p "$(dirname "$LOG_TRIM_SCRIPT")"
-  write_log_trim_script "$wd/trim"
-  install_if_changed "$wd/trim" "$LOG_TRIM_SCRIPT" 755 || true
-  rm -f "${YSQ_TEST_ROOT}/etc/periodic/hourly/ysq-singbox-log-trim"
-  case "$SERVICE_MANAGER" in
-    systemd)
-      cat > "$wd/trim-service" <<EOF
-[Unit]
-Description=YSQ sing-box log size guard
-[Service]
-Type=oneshot
-ExecStart=${LOG_TRIM_SCRIPT}
-EOF
-      cat > "$wd/trim-timer" <<'EOF'
-[Unit]
-Description=YSQ sing-box log size guard timer
-[Timer]
-OnBootSec=2min
-OnUnitActiveSec=5min
-AccuracySec=15s
-[Install]
-WantedBy=timers.target
-EOF
-      install_if_changed "$wd/trim-service" "${YSQ_TEST_ROOT}/etc/systemd/system/ysq-log-trim.service" 644 || true
-      install_if_changed "$wd/trim-timer" "${YSQ_TEST_ROOT}/etc/systemd/system/ysq-log-trim.timer" 644 || true
-      service_daemon_reload
-      systemctl enable --now ysq-log-trim.timer >/dev/null 2>&1 || warn "日志容量检查 timer 启动失败，请检查 ysq-log-trim.timer。"
-      ;;
-    openrc)
-      mkdir -p "${CRONTAB_DIR}"
-      touch "${CRONTAB_FILE}"
-      chmod 600 "${CRONTAB_FILE}"
-      sed -i '/# ysq-log-trim$/d' "${CRONTAB_FILE}"
-      echo "*/5 * * * * ${LOG_TRIM_SCRIPT} # ysq-log-trim" >> "${CRONTAB_FILE}"
-      if [ -x "${CROND_FILE}" ]; then
-        rc-update add crond default >/dev/null 2>&1 || true
-        rc-service crond status >/dev/null 2>&1 || rc-service crond start 9>&- >/dev/null 2>&1 || true
-      else
-        warn "未找到 crond，Agent 停止时日志没有定时裁剪兜底。"
-      fi
-      ;;
-  esac
-  rm -rf "$wd"
-}
-
-remove_log_trim() {
+# 清理旧版本遗留的日志裁剪脚本、timer、cron、grpcurl 与 Python failover worker
+cleanup_legacy_log_trim() {
+  local legacy_crontab="${YSQ_TEST_ROOT}/etc/crontabs/root"
+  local had_systemd_unit=0
+  if [ -e "${YSQ_TEST_ROOT}/etc/systemd/system/ysq-log-trim.timer" ] \
+      || [ -e "${YSQ_TEST_ROOT}/etc/systemd/system/ysq-log-trim.service" ]; then
+    had_systemd_unit=1
+  fi
   if [ "$SERVICE_MANAGER" = "systemd" ]; then
     systemctl disable --now ysq-log-trim.timer >/dev/null 2>&1 || true
+    systemctl stop ysq-log-trim.service >/dev/null 2>&1 || true
   fi
-  rm -f "$LOG_TRIM_SCRIPT" "${YSQ_TEST_ROOT}/etc/periodic/hourly/ysq-singbox-log-trim" \
-    "${YSQ_TEST_ROOT}/etc/systemd/system/ysq-log-trim.timer" "${YSQ_TEST_ROOT}/etc/systemd/system/ysq-log-trim.service"
-  [ ! -f "${CRONTAB_FILE}" ] || sed -i '/# ysq-log-trim$/d' "${CRONTAB_FILE}"
+  rm -f \
+    "${YSQ_TEST_ROOT}/usr/local/libexec/ysq-singbox-log-trim" \
+    "${YSQ_TEST_ROOT}/etc/systemd/system/ysq-log-trim.timer" \
+    "${YSQ_TEST_ROOT}/etc/systemd/system/ysq-log-trim.service" \
+    "${YSQ_TEST_ROOT}/etc/periodic/hourly/ysq-singbox-log-trim" \
+    "${YSQ_TEST_ROOT}/run/ysq-log-trim.lock" \
+    "${YSQ_TEST_ROOT}/usr/local/libexec/ysq-grpcurl" \
+    "${YSQ_TEST_ROOT}/usr/local/libexec/ysq-failover.py"
+  if [ -f "$legacy_crontab" ] && grep -q '# ysq-log-trim$' "$legacy_crontab" 2>/dev/null; then
+    sed -i '/# ysq-log-trim$/d' "$legacy_crontab"
+  fi
+  if [ "$had_systemd_unit" -eq 1 ]; then
+    service_daemon_reload
+  fi
 }
 
 # 只在安装 / 更新内核时调用；restart_singbox 不再重写 unit
 ensure_singbox_service() {
   local wd
 
-  SING_BOX_BIN="$(command -v sing-box 2>/dev/null || true)"
+  SING_BOX_BIN="$(resolve_singbox_bin)"
   if [ -z "$SING_BOX_BIN" ]; then
     die "未找到 sing-box 可执行文件。"
   fi
+  ensure_singbox_plus || die "未找到可用的 singbox-plus 可执行文件。"
 
   wd="$(new_work_dir)"
 
@@ -627,7 +713,7 @@ Wants=network.target
 User=sing-box
 Group=sing-box
 Type=simple
-ExecStart=${SING_BOX_BIN} -D ${CORE_DATA_DIR} -c ${CONFIG_FILE} run
+ExecStart=${SINGBOX_PLUS_BIN} wrap --dir ${CORE_LOG_DIR} --name sing-box.log --max 4M --keep 2 -- ${SING_BOX_BIN} -D ${CORE_DATA_DIR} -c ${CONFIG_FILE} run
 Restart=on-failure
 RestartSec=10s
 LimitNOFILE=infinity
@@ -635,27 +721,26 @@ LimitNOFILE=infinity
 [Install]
 WantedBy=multi-user.target
 EOF
-      if install_if_changed "$wd/unit" ${CORE_SYSTEMD_FILE} 644; then
+      if install_if_changed "$wd/unit" "$CORE_SYSTEMD_FILE" 644; then
         service_daemon_reload
       fi
-      install_log_trim
+      cleanup_legacy_log_trim
       ;;
     openrc)
       cat > "$wd/unit" <<EOF
 #!/sbin/openrc-run
 description="sing-box service"
-command="${SING_BOX_BIN}"
-command_args="-D ${CORE_DATA_DIR} -c ${CONFIG_FILE} run"
+command="${SINGBOX_PLUS_BIN}"
+command_args="wrap --dir ${CORE_LOG_DIR} --name sing-box.log --max 4M --keep 2 -- ${SING_BOX_BIN} -D ${CORE_DATA_DIR} -c ${CONFIG_FILE} run"
 command_user="sing-box:sing-box"
 command_background="yes"
 pidfile="${CORE_PID_FILE}"
-# stdout 与 stderr 都追加（O_APPEND）写入同一个文件，方便 cron 原地裁剪
-output_log="${LOG_FILE}"
-error_log="${LOG_FILE}"
+output_log="/dev/null"
+error_log="/dev/null"
 
 start_pre() {
-  checkpath -d -m 0755 -o sing-box:sing-box ${CORE_DATA_DIR}
-  checkpath -d -m 0755 -o sing-box:sing-box ${CORE_LOG_DIR}
+  checkpath -d -m 0755 -o sing-box:sing-box "${CORE_DATA_DIR}"
+  checkpath -d -m 0755 -o sing-box:sing-box "${CORE_LOG_DIR}"
 }
 
 depend() {
@@ -663,11 +748,12 @@ depend() {
   after firewall
 }
 EOF
-      install_if_changed "$wd/unit" ${CORE_OPENRC_FILE} 755 || true
-      install_log_trim
+      install_if_changed "$wd/unit" "$CORE_OPENRC_FILE" 755 || true
+      cleanup_legacy_log_trim
       ;;
     none)
       warn "未检测到 systemd/openrc，将使用 nohup 后台方式管理 sing-box。"
+      cleanup_legacy_log_trim
       ;;
   esac
 
@@ -692,6 +778,21 @@ service_disable() {
   esac
 }
 
+list_residual_singbox_pids() {
+  local proc_dir proc_pid proc_cmd
+  for proc_dir in /proc/[0-9]*; do
+    [ -r "${proc_dir}/cmdline" ] || continue
+    proc_pid="${proc_dir#/proc/}"
+    [ "$proc_pid" != "$$" ] && [ "$proc_pid" != "${BASHPID:-$$}" ] || continue
+    proc_cmd="$(tr '\0' ' ' < "${proc_dir}/cmdline" 2>/dev/null || true)"
+    if [[ "$proc_cmd" == *sing-box* ]] && [[ "$proc_cmd" == *" ${CONFIG_FILE} "* ]] \
+        && [[ "$proc_cmd" == *" -c "* || "$proc_cmd" == *" -C "* ]] && [[ "$proc_cmd" == *" run"* ]]; then
+      printf '%s\n' "$proc_pid"
+    fi
+  done
+  return 0
+}
+
 service_stop() {
   state_write_guard || return $?
   flush_agent_traffic
@@ -703,21 +804,59 @@ service_stop() {
     systemd) systemctl stop sing-box 2>/dev/null || true ;;
     openrc) rc-service sing-box stop 2>/dev/null || true ;;
     none)
-      if [ -f ${CORE_PID_FILE} ]; then
-        local old_pid
-        old_pid="$(cat ${CORE_PID_FILE} 2>/dev/null || true)"
-        if [ -n "$old_pid" ]; then
-          kill "$old_pid" 2>/dev/null || true
-          # 等旧进程真正退出（最多 15 秒），否则重启时新进程可能和旧进程抢端口
-          for _ in $(seq 1 15); do
-            kill -0 "$old_pid" 2>/dev/null || break
-            sleep 1
-          done
-          kill -0 "$old_pid" 2>/dev/null && kill -9 "$old_pid" 2>/dev/null || true
-        fi
-        rm -f ${CORE_PID_FILE}
+      if [ -f "$CORE_PID_FILE" ]; then
+        local old_pid cmdline=""
+        old_pid="$(cat "$CORE_PID_FILE" 2>/dev/null || true)"
+        case "$old_pid" in
+          ''|*[!0-9]*) ;;
+          *)
+            if [ -r "/proc/${old_pid}/cmdline" ]; then
+              cmdline="$(tr '\0' ' ' < "/proc/${old_pid}/cmdline" 2>/dev/null || true)"
+            fi
+            if [[ "$cmdline" == *singbox-plus* || "$cmdline" == *sing-box* ]]; then
+              kill "$old_pid" 2>/dev/null || true
+              # 等旧进程真正退出（最多 15 秒），否则重启时新进程可能和旧进程抢端口
+              for _ in $(seq 1 15); do
+                kill -0 "$old_pid" 2>/dev/null || break
+                sleep 1
+              done
+              if [ -r "/proc/${old_pid}/cmdline" ]; then
+                cmdline="$(tr '\0' ' ' < "/proc/${old_pid}/cmdline" 2>/dev/null || true)"
+                if [[ "$cmdline" == *singbox-plus* || "$cmdline" == *sing-box* ]]; then
+                  kill -9 "$old_pid" 2>/dev/null || true
+                fi
+              fi
+            fi
+            ;;
+        esac
+        rm -f "$CORE_PID_FILE"
       fi
-      pkill -f "sing-box.*-[cC] /etc/sing-box.*run" 2>/dev/null || true
+      local residual_pids="" rpid i
+      if command -v pkill >/dev/null 2>&1; then
+        pkill -f "sing-box.*-[cC] ${CONFIG_FILE}.*run" 2>/dev/null || true
+      else
+        while IFS= read -r rpid; do
+          [ -n "$rpid" ] || continue
+          kill "$rpid" 2>/dev/null || true
+        done < <(list_residual_singbox_pids)
+      fi
+      # 最多等待 10 秒确认残留进程已完全退出，超时则强制结束，避免重启抢端口失败
+      for i in 1 2 3 4 5 6 7 8 9 10; do
+        residual_pids="$(list_residual_singbox_pids)"
+        [ -n "$residual_pids" ] || break
+        sleep 1
+      done
+      residual_pids="$(list_residual_singbox_pids)"
+      if [ -n "$residual_pids" ]; then
+        if command -v pkill >/dev/null 2>&1; then
+          pkill -9 -f "sing-box.*-[cC] ${CONFIG_FILE}.*run" 2>/dev/null || true
+        fi
+        while IFS= read -r rpid; do
+          [ -n "$rpid" ] || continue
+          kill -9 "$rpid" 2>/dev/null || true
+        done <<< "$residual_pids"
+        sleep 1
+      fi
       ;;
   esac
 }
@@ -745,7 +884,7 @@ service_restart() {
         journalctl -u sing-box -n 20 --no-pager 2>/dev/null >&2 || true
         return 1
       fi
-      sleep 0.5
+      sleep 1
       if ! systemctl is-active --quiet sing-box; then
         err "sing-box 启动后异常退出。"
         [ ! -f "$LOG_FILE" ] || tail -n 20 "$LOG_FILE" >&2
@@ -759,7 +898,7 @@ service_restart() {
         tail -n 20 "$LOG_FILE" 2>/dev/null >&2 || true
         return 1
       fi
-      sleep 0.5
+      sleep 1
       if ! rc-service sing-box status >/dev/null 2>&1; then
         err "sing-box 启动后异常退出。"
         tail -n 20 "$LOG_FILE" 2>/dev/null >&2 || true
@@ -767,25 +906,27 @@ service_restart() {
       fi
       ;;
     none)
-      service_stop
-      SING_BOX_BIN="$(command -v sing-box 2>/dev/null || true)"
+      YSQ_SKIP_AGENT_FLUSH=1 service_stop
+      SING_BOX_BIN="$(resolve_singbox_bin)"
       if [ -z "$SING_BOX_BIN" ]; then
         err "未找到 sing-box 可执行文件。"
         return 1
       fi
-      install -d -m 755 -o sing-box -g sing-box ${CORE_DATA_DIR} ${CORE_LOG_DIR} 2>/dev/null \
-        || mkdir -p ${CORE_DATA_DIR} ${CORE_LOG_DIR}
-      # 没有 cron 可用：每次启动前（进程已停）顺手裁剪一次，并用追加模式写日志
-      local trim_wd
-      trim_wd="$(new_work_dir)"
-      write_log_trim_script "$trim_wd/trim"
-      sh "$trim_wd/trim" || true
-      rm -rf "$trim_wd"
-      nohup "$SING_BOX_BIN" -D ${CORE_DATA_DIR} -c ${CONFIG_FILE} run 9>&- >> "$LOG_FILE" 2>&1 &
-      echo $! > ${CORE_PID_FILE}
-      sleep 0.5
-      if ! kill -0 "$(cat ${CORE_PID_FILE})" 2>/dev/null; then
-        tail -n 20 "$LOG_FILE" >&2 || true
+      ensure_singbox_plus || return 1
+      install -d -m 755 -o sing-box -g sing-box "$CORE_DATA_DIR" "$CORE_LOG_DIR" 2>/dev/null \
+        || mkdir -p "$CORE_DATA_DIR" "$CORE_LOG_DIR"
+      chown -R sing-box:sing-box "$CORE_DATA_DIR" "$CORE_LOG_DIR" 2>/dev/null || true
+      mkdir -p "$(dirname "$CORE_PID_FILE")" || return 1
+      if id sing-box >/dev/null 2>&1 && command -v runuser >/dev/null 2>&1 \
+          && runuser -u sing-box -g sing-box -- true >/dev/null 2>&1; then
+        nohup runuser -u sing-box -g sing-box -- "$SINGBOX_PLUS_BIN" wrap --dir "$CORE_LOG_DIR" --name sing-box.log --max 4M --keep 2 -- "$SING_BOX_BIN" -D "$CORE_DATA_DIR" -c "$CONFIG_FILE" run </dev/null 9>&- >/dev/null 2>&1 &
+      else
+        nohup "$SINGBOX_PLUS_BIN" wrap --dir "$CORE_LOG_DIR" --name sing-box.log --max 4M --keep 2 -- "$SING_BOX_BIN" -D "$CORE_DATA_DIR" -c "$CONFIG_FILE" run </dev/null 9>&- >/dev/null 2>&1 &
+      fi
+      echo $! > "$CORE_PID_FILE"
+      sleep 1
+      if ! kill -0 "$(cat "$CORE_PID_FILE" 2>/dev/null)" 2>/dev/null; then
+        [ ! -f "$LOG_FILE" ] || tail -n 20 "$LOG_FILE" >&2 || true
         err "sing-box 后台启动失败。"
         return 1
       fi
@@ -807,8 +948,8 @@ service_status() {
       tail -n 80 "$LOG_FILE" 2>/dev/null || true
       ;;
     none)
-      if [ -f ${CORE_PID_FILE} ] && kill -0 "$(cat ${CORE_PID_FILE})" 2>/dev/null; then
-        ok "sing-box 正在运行，PID: $(cat ${CORE_PID_FILE})"
+      if is_singbox_running; then
+        ok "sing-box 正在运行，PID: $(get_singbox_pid)"
       else
         warn "sing-box 未运行。"
       fi
@@ -837,30 +978,54 @@ is_singbox_running() {
   case "$SERVICE_MANAGER" in
     systemd) systemctl is-active --quiet sing-box 2>/dev/null ;;
     openrc)  rc-service sing-box status >/dev/null 2>&1 ;;
-    none)    [ -f ${CORE_PID_FILE} ] && kill -0 "$(cat ${CORE_PID_FILE} 2>/dev/null)" 2>/dev/null ;;
+    none)
+      local pid=""
+      [ -f "$CORE_PID_FILE" ] && pid="$(cat "$CORE_PID_FILE" 2>/dev/null || true)"
+      [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null \
+        && [ -r "/proc/${pid}/cmdline" ] \
+        && tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null | grep -Eq 'singbox-plus|sing-box'
+      ;;
   esac
 }
 
 get_singbox_pid() {
   [ "$SERVICE_MANAGER" != "test" ] || return 0
-  local pid=""
+  local main_pid="" pid="" cpid comm=""
   case "$SERVICE_MANAGER" in
     systemd)
-      pid="$(systemctl show -p MainPID --value sing-box 2>/dev/null || true)"
-      [ "$pid" = "0" ] && pid=""
+      main_pid="$(systemctl show -p MainPID --value sing-box 2>/dev/null || true)"
+      [ "$main_pid" = "0" ] && main_pid=""
       ;;
     openrc|none)
-      if [ -f ${CORE_PID_FILE} ]; then
-        pid="$(cat ${CORE_PID_FILE} 2>/dev/null || true)"
+      if [ -f "$CORE_PID_FILE" ]; then
+        main_pid="$(cat "$CORE_PID_FILE" 2>/dev/null || true)"
       fi
       ;;
   esac
+
+  if [[ "$main_pid" =~ ^[0-9]+$ ]] && [ -d "/proc/${main_pid}" ]; then
+    comm="$(cat "/proc/${main_pid}/comm" 2>/dev/null || true)"
+    if [ "$comm" = "sing-box" ]; then
+      pid="$main_pid"
+    else
+      # singbox-plus wrap 是多线程 Go 进程，子进程可能挂在任意 task/<tid>/children 下
+      for cpid in $(cat "/proc/${main_pid}/task/"*/children 2>/dev/null || true); do
+        if [[ "$cpid" =~ ^[0-9]+$ ]] && [ "$(cat "/proc/${cpid}/comm" 2>/dev/null || true)" = "sing-box" ]; then
+          pid="$cpid"
+          break
+        fi
+      done
+      if [ -z "$pid" ] && command -v pgrep >/dev/null 2>&1; then
+        pid="$(pgrep -P "$main_pid" -x sing-box 2>/dev/null | head -n 1 || true)"
+      fi
+    fi
+  fi
 
   if [ -z "$pid" ] && command -v pidof >/dev/null 2>&1; then
     pid="$(pidof sing-box 2>/dev/null | awk '{print $1}' || true)"
   fi
   if [ -z "$pid" ] && command -v pgrep >/dev/null 2>&1; then
-    pid="$(pgrep -f "sing-box.*-[cC] /etc/sing-box.*run" 2>/dev/null | head -n 1 || true)"
+    pid="$(pgrep -f "sing-box.*-[cC] ${CONFIG_FILE}.*run" 2>/dev/null | head -n 1 || true)"
   fi
   echo "$pid"
 }
@@ -888,9 +1053,10 @@ get_singbox_memory() {
 }
 
 print_status_bar() {
-  local status_str ver_str mem_str
-  if command -v sing-box >/dev/null 2>&1; then
-    ver_str="$(sing-box version 2>/dev/null | awk 'NR==1 {print $3}' || true)"
+  local status_str ver_str mem_str sb_bin=""
+  sb_bin="$(resolve_singbox_bin)"
+  if [ -n "$sb_bin" ]; then
+    ver_str="$("$sb_bin" version 2>/dev/null | awk 'NR==1 {print $3}' || true)"
     ver_str="${ver_str:+v${ver_str#v}}"
     ver_str="${ver_str:-未知}"
   else
@@ -912,6 +1078,7 @@ print_status_bar() {
 print_listen_summary() {
   local tcp_bound="" udp_bound="" p
   local tcp_missing="" udp_missing="" issues=""
+  local active_users=0 node_count=0
 
   if ! command -v ss >/dev/null 2>&1; then
     echo -e "监听端口: ${C_RED}○ 无法检测（缺少 ss）${C_RESET}"
@@ -922,19 +1089,26 @@ print_listen_summary() {
   udp_bound="$(ss -H -lnu 2>/dev/null | awk '{s=$4; sub(/^.*:/,"",s); if(s~/^[0-9]+$/) print s}' | sort -u || true)"
 
   if [ -f "$STATE_FILE" ]; then
-    while IFS= read -r p; do
-      [ -n "$p" ] || continue
-      if ! printf '%s\n' "$tcp_bound" | grep -Fxq "$p"; then
-        tcp_missing="${tcp_missing:+${tcp_missing},}${p}"
-      fi
-    done < <(jq -r '.nodes[]? | select((.protocol // "tcp") == "tcp") | .port' "$STATE_FILE" | sort -nu)
+    active_users="$(jq -r '[.users[]? | select(.enabled != false)] | length' "$STATE_FILE" 2>/dev/null || echo 0)"
+    node_count="$(jq -r '(.nodes // []) | length' "$STATE_FILE" 2>/dev/null || echo 0)"
+    [[ "$active_users" =~ ^[0-9]+$ ]] || active_users=0
+    [[ "$node_count" =~ ^[0-9]+$ ]] || node_count=0
 
-    while IFS= read -r p; do
-      [ -n "$p" ] || continue
-      if ! printf '%s\n' "$udp_bound" | grep -Fxq "$p"; then
-        udp_missing="${udp_missing:+${udp_missing},}${p}"
-      fi
-    done < <(jq -r '.nodes[]? | select((.protocol // "tcp") == "udp") | .port' "$STATE_FILE" | sort -nu)
+    if [ "$active_users" -gt 0 ]; then
+      while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        if ! printf '%s\n' "$tcp_bound" | grep -Fxq "$p"; then
+          tcp_missing="${tcp_missing:+${tcp_missing},}${p}"
+        fi
+      done < <(jq -r '.nodes[]? | select((.protocol // "tcp") == "tcp") | .port' "$STATE_FILE" | sort -nu)
+
+      while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        if ! printf '%s\n' "$udp_bound" | grep -Fxq "$p"; then
+          udp_missing="${udp_missing:+${udp_missing},}${p}"
+        fi
+      done < <(jq -r '.nodes[]? | select((.protocol // "tcp") == "udp") | .port' "$STATE_FILE" | sort -nu)
+    fi
   fi
 
   [ -z "$tcp_missing" ] || issues="TCP ${tcp_missing} 未监听"
@@ -944,7 +1118,11 @@ print_listen_summary() {
   fi
 
   if [ -z "$issues" ]; then
-    echo -e "监听端口: ${C_GREEN}● 正常${C_RESET}"
+    if [ "$active_users" -eq 0 ] && [ "$node_count" -gt 0 ]; then
+      echo -e "监听端口: ${C_GREEN}● 正常${C_RESET}（当前无启用用户，入站监听已暂停）"
+    else
+      echo -e "监听端口: ${C_GREEN}● 正常${C_RESET}"
+    fi
   else
     echo -e "监听端口: ${C_RED}○ 异常${C_RESET} | ${issues}"
   fi
@@ -1216,6 +1394,9 @@ check_port_available() {
   if [ "$proto" = "tcp" ] && [ "$port" = "$V2RAY_API_PORT" ]; then
     die "TCP 端口 ${V2RAY_API_PORT} 已预留给本机 V2Ray API，请换一个 VLESS 端口。"
   fi
+  if [ "$proto" = "tcp" ] && [ "$port" = "$FAILOVER_API_PORT" ]; then
+    die "TCP 端口 ${FAILOVER_API_PORT} 已预留给主备切换本机 API，请换一个 VLESS 端口。"
+  fi
 
   if port_used "$port" "$proto" "$ignore_tag"; then
     die "端口 ${port} (${proto^^}) 已经被当前脚本里的其他节点使用，请换一个端口。"
@@ -1232,6 +1413,9 @@ check_port_available() {
 
   warn "检测到系统里已有其他程序在 ${proto^^} 监听 ${port}："
   printf '%s\n' "$foreign" >&2
+  if [ "${CLI_YES:-}" = "1" ]; then
+    die "静默模式（-y）下检测到端口 ${port} (${proto^^}) 已被其他程序占用，已中止安装；请更换端口或释放该端口后重试。"
+  fi
   confirm_or_cancel "仍然继续使用这个端口？输入 y 继续: " || return $?
   return 0
 }
@@ -1271,7 +1455,7 @@ test_tcp_connect() {
 
   # 1. bash 内建 /dev/tcp（host/port 作为位置参数传入）
   if command -v timeout >/dev/null 2>&1; then
-    err="$(timeout "$timeout_sec" bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$host" "$port" 2>&1)" && return 0
+    err="$(LC_ALL=C timeout "$timeout_sec" bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$host" "$port" 2>&1)" && return 0
     # bash 编译时没带 /dev/tcp 支持：报 No such file or directory，才换下一种；否则（超时 124 / 被拒绝）直接判失败
     case "$err" in
       *"No such file or directory"*|*"not supported"*) ;;
@@ -1281,7 +1465,7 @@ test_tcp_connect() {
 
   # 2. nc（-w 是连接超时）；只有 nc 不认 -z / -w 参数时才换 curl
   if command -v nc >/dev/null 2>&1; then
-    err="$(nc -z -w "$timeout_sec" "$host" "$port" 2>&1)" && return 0
+    err="$(LC_ALL=C nc -z -w "$timeout_sec" "$host" "$port" 2>&1)" && return 0
     case "$err" in
       *[Uu]sage*|*"invalid option"*|*"unrecognized option"*|*"illegal option"*) ;;
       *) return 1 ;;
@@ -1311,21 +1495,6 @@ check_landing_connectivity() {
   warn "无法连接到落地节点 ${server}:${port}（TCP 连接超时、被拒绝或防火墙未放行）。"
   confirm_or_cancel "是否仍然继续保存该落地节点？输入 y 继续: " n "已取消保存落地节点。" || return $?
   return 0
-}
-
-# 输入落地 IP / 域名（带格式校验，去掉 IPv6 方括号）
-ask_landing_host() {
-  local prompt="$1" default_value="${2:-}" h=""
-  while true; do
-    h="$(ask_text_default "$prompt" "$default_value")"
-    h="${h#[}"
-    h="${h%]}"
-    if valid_host "$h"; then
-      echo "$h"
-      return 0
-    fi
-    warn "地址格式无效：只允许 IP 或域名（字母、数字、点、冒号、连字符）。"
-  done
 }
 
 # SNI（TLS server_name）合法性：只允许域名 / IPv4 形式（字母、数字、点、连字符），
@@ -1703,33 +1872,44 @@ install_deps() {
 
 # $1 = force：即使已安装可用的 sing-box 也重新下载安装（更新内核时用）
 install_singbox() {
-  local force="${1:-}"
+  local force="${1:-}" sb_bin=""
 
   step "安装 / 检查 sing-box"
 
   ensure_singbox_user
   # 安装、面板升级和内核更新共用运行目录准备；配置目录由安装 / 面板升级另行准备。
-  mkdir -p ${CORE_DATA_DIR} ${CORE_LOG_DIR}
-  chown -R sing-box:sing-box ${CORE_DATA_DIR} ${CORE_LOG_DIR} 2>/dev/null || true
-  chmod 755 ${CORE_DATA_DIR} ${CORE_LOG_DIR}
+  mkdir -p "$CORE_DATA_DIR" "$CORE_LOG_DIR"
+  chown -R sing-box:sing-box "$CORE_DATA_DIR" "$CORE_LOG_DIR" 2>/dev/null || true
+  chmod 755 "$CORE_DATA_DIR" "$CORE_LOG_DIR"
   remove_broken_singbox_bins
 
   if [ "$force" != "force" ] && singbox_bin_works; then
-    ok "检测到 sing-box 已安装：$(sing-box version | head -n 1)"
+    sb_bin="$(resolve_singbox_bin)"
+    ok "检测到 sing-box 已安装：$("$sb_bin" version | head -n 1)"
   else
     info "正在安装 sing-box..."
     install_singbox_release
-    singbox_bin_works || die "当前系统无法执行 sing-box，请检查 CPU 架构。"
-    ok "sing-box 安装完成：$(sing-box version | head -n 1)"
+    singbox_bin_works "$CORE_BIN_FILE" || die "当前系统无法执行 sing-box 或缺少必要编译标签，请检查 CPU 架构。"
+    ok "sing-box 安装完成：$("$CORE_BIN_FILE" version | head -n 1)"
   fi
 
+  if [ "$force" = "force" ] && singbox_plus_works "$SINGBOX_PLUS_BIN"; then
+    ensure_singbox_plus force || warn "singbox-plus 更新失败，继续使用当前已安装版本。"
+  else
+    ensure_singbox_plus "$force" || die "singbox-plus 安装失败。"
+  fi
   ensure_singbox_service
 }
 
 ensure_dirs() {
   mkdir -p "$CONFIG_DIR" "$CERT_DIR"
-  chown -R sing-box:sing-box "$CONFIG_DIR" 2>/dev/null || true
-  chmod 755 "$CONFIG_DIR" "$CERT_DIR"
+  chown root:sing-box "$CONFIG_DIR" "$CERT_DIR" 2>/dev/null || true
+  chmod 750 "$CONFIG_DIR" "$CERT_DIR"
+  [ ! -f "$STATE_FILE" ] || { chown root:root "$STATE_FILE" 2>/dev/null || true; chmod 600 "$STATE_FILE" 2>/dev/null || true; }
+  [ ! -f "$CONFIG_FILE" ] || { chown root:sing-box "$CONFIG_FILE" 2>/dev/null || true; chmod 640 "$CONFIG_FILE" 2>/dev/null || true; }
+  [ ! -f "$KEY_FILE" ] || { chown root:sing-box "$KEY_FILE" 2>/dev/null || true; chmod 640 "$KEY_FILE" 2>/dev/null || true; }
+  [ ! -f "$CERT_FILE" ] || { chown root:sing-box "$CERT_FILE" 2>/dev/null || true; chmod 644 "$CERT_FILE" 2>/dev/null || true; }
+  [ ! -f "$CERT_SNI_FILE" ] || { chown root:root "$CERT_SNI_FILE" 2>/dev/null || true; chmod 600 "$CERT_SNI_FILE" 2>/dev/null || true; }
 }
 
 # -------------------------
@@ -1798,7 +1978,7 @@ state_build() {
 # 直接落盘（不渲染 / 不重启）：用于不影响 sing-box 配置的修改，以及安装流程
 commit_state_plain() {
   [ -n "$NEW_STATE" ] && [ -f "$NEW_STATE" ] || die "内部错误：没有待提交的状态。"
-  chown sing-box:sing-box "$NEW_STATE" 2>/dev/null || true
+  chown root:root "$NEW_STATE" 2>/dev/null || true
   chmod 600 "$NEW_STATE" || return 1
   mv -f "$NEW_STATE" "$STATE_FILE" || return 1
   NEW_STATE=""
@@ -1940,7 +2120,7 @@ ensure_state_defaults() {
     return 1
   fi
 
-  chown sing-box:sing-box "$tmp" 2>/dev/null || true
+  chown root:root "$tmp" 2>/dev/null || true
   chmod 600 "$tmp"
   mv -f "$tmp" "$STATE_FILE"
   return 0
@@ -1958,7 +2138,11 @@ ensure_tuic_cert() {
 
   tuic_sni="$(state_get '.tuic_sni')"
 
-  install -d -m 755 -o sing-box -g sing-box "$CERT_DIR" || return 1
+  if [ -z "$YSQ_TEST_ROOT" ]; then
+    install -d -m 750 -o root -g sing-box "$CERT_DIR" || return 1
+  else
+    mkdir -p "$CERT_DIR" && chmod 750 "$CERT_DIR" || return 1
+  fi
 
   if [ -f "$CERT_FILE" ] && [ -f "$KEY_FILE" ]; then
     if [ -f "$CERT_SNI_FILE" ]; then
@@ -1969,7 +2153,8 @@ ensure_tuic_cert() {
     if [ "$old_sni" = "$tuic_sni" ]; then
       if [ ! -f "$CERT_SNI_FILE" ]; then
         printf '%s' "$tuic_sni" > "$CERT_SNI_FILE"
-        chown sing-box:sing-box "$CERT_SNI_FILE" 2>/dev/null || true
+        chown root:root "$CERT_SNI_FILE" 2>/dev/null || true
+        chmod 600 "$CERT_SNI_FILE" 2>/dev/null || true
       fi
       return 0
     fi
@@ -2015,10 +2200,16 @@ EOF
     return 1
   fi
 
-  install -m 600 -o sing-box -g sing-box "$wd/tuic.key" "$KEY_FILE" || { rm -rf "$wd"; return 1; }
-  install -m 644 -o sing-box -g sing-box "$wd/tuic.crt" "$CERT_FILE" || { rm -rf "$wd"; return 1; }
+  if [ -z "$YSQ_TEST_ROOT" ]; then
+    install -m 640 -o root -g sing-box "$wd/tuic.key" "$KEY_FILE" || { rm -rf "$wd"; return 1; }
+    install -m 644 -o root -g sing-box "$wd/tuic.crt" "$CERT_FILE" || { rm -rf "$wd"; return 1; }
+  else
+    install -m 640 "$wd/tuic.key" "$KEY_FILE" || { rm -rf "$wd"; return 1; }
+    install -m 644 "$wd/tuic.crt" "$CERT_FILE" || { rm -rf "$wd"; return 1; }
+  fi
   printf '%s' "$tuic_sni" > "$CERT_SNI_FILE"
-  chown sing-box:sing-box "$CERT_SNI_FILE" 2>/dev/null || true
+  chown root:root "$CERT_SNI_FILE" 2>/dev/null || true
+  chmod 600 "$CERT_SNI_FILE" 2>/dev/null || true
   rm -rf "$wd"
 
   ok "TUIC 证书生成完成：$CERT_FILE"
@@ -2048,8 +2239,11 @@ create_state_file() {
     case "$key_choice" in
       1)
         info "正在生成新参数..."
-        uuid="$(sing-box generate uuid)"
-        keypair="$(sing-box generate reality-keypair)"
+        local sb_bin
+        sb_bin="$(resolve_singbox_bin)"
+        [ -n "$sb_bin" ] || die "未找到 sing-box 可执行文件。"
+        uuid="$("$sb_bin" generate uuid)"
+        keypair="$("$sb_bin" generate reality-keypair)"
         private_key="$(echo "$keypair" | awk -F': ' '/PrivateKey/ {print $2}')"
         public_key="$(echo "$keypair" | awk -F': ' '/PublicKey/ {print $2}')"
         short_id="$(openssl rand -hex 8)"
@@ -2162,321 +2356,8 @@ landing_count() {
 }
 
 # 分享链接明确携带协议；域名/端口本身不携带协议信息，不能据此猜测。
-write_landing_uri_parser() {
-  cat <<'YSQ_LANDING_PY'
-# BEGIN_EMBEDDED_LANDING_PARSER
-import base64
-import ipaddress
-import json
-import re
-import sys
-import urllib.parse
-import uuid
-
-
-class SafeValidationError(ValueError):
-    """User-facing validation error whose message never embeds secrets or raw input."""
-
-
-def text(value, field, limit=4096, empty=False):
-    if not isinstance(value, str) or len(value) > limit or (not empty and not value) or any(ord(c) < 32 or ord(c) == 127 for c in value):
-        raise SafeValidationError(field + " 格式无效")
-    return value
-
-
-def host(value):
-    value = text(value, "地址", 253)
-    try:
-        return str(ipaddress.ip_address(value))
-    except ValueError:
-        if ":" in value or not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?", value) or ".." in value:
-            raise SafeValidationError("地址格式无效")
-        return value
-
-
-def boolean(value, field):
-    if isinstance(value, bool):
-        return value
-    if str(value).lower() in ("1", "true"):
-        return True
-    if str(value).lower() in ("0", "false"):
-        return False
-    raise SafeValidationError(field + " 必须为 0/1 或 true/false")
-
-
-SS_2022_KEY_LEN = {
-    "2022-blake3-aes-128-gcm": 16,
-    "2022-blake3-aes-256-gcm": 32,
-    "2022-blake3-chacha20-poly1305": 32,
-}
-SS_METHODS = set(SS_2022_KEY_LEN) | {
-    "aes-128-gcm",
-    "aes-192-gcm",
-    "aes-256-gcm",
-    "chacha20-ietf-poly1305",
-    "xchacha20-ietf-poly1305",
-    "none",
-}
-
-
-def b64decode_text(value, field):
-    if not isinstance(value, str) or not value or not re.fullmatch(r"[A-Za-z0-9+/_-]+={0,2}", value) or len(value) % 4 == 1:
-        raise SafeValidationError(field + " Base64 格式无效")
-    padded = value.replace("-", "+").replace("_", "/")
-    padded += "=" * (-len(padded) % 4)
-    try:
-        decoded = base64.b64decode(padded.encode("ascii"), validate=True).decode("utf-8")
-    except (ValueError, UnicodeError):
-        raise SafeValidationError(field + " Base64 解码失败") from None
-    if any(ord(c) < 32 or ord(c) == 127 for c in decoded):
-        raise SafeValidationError(field + " 包含非法控制字符")
-    return decoded
-
-
-def normalize_landing(value):
-    if not isinstance(value, dict):
-        raise SafeValidationError("落地配置必须为 JSON 对象")
-    kind = value.get("type", "vless")
-    if kind not in ("vless", "tuic", "socks", "shadowsocks"):
-        raise SafeValidationError("仅支持 VLESS Reality、TUIC v5、SOCKS5 和 Shadowsocks")
-    port = value.get("port")
-    if isinstance(port, bool) or not str(port).isdigit() or not 1 <= int(port) <= 65535:
-        raise SafeValidationError("端口必须为 1-65535")
-    server = host(value.get("server"))
-    if kind in ("vless", "tuic"):
-        try:
-            user = str(uuid.UUID(text(value.get("uuid"), "UUID", 36)))
-        except (ValueError, AttributeError):
-            raise SafeValidationError("UUID 格式无效") from None
-        sni = host(value.get("sni") or server)
-        result = {"type": kind, "server": server, "port": int(port), "uuid": user, "sni": sni}
-        if kind == "vless":
-            key = text(value.get("public_key"), "Reality PublicKey", 43)
-            try:
-                if not re.fullmatch(r"[A-Za-z0-9_-]{43}", key) or len(base64.urlsafe_b64decode(key + "=")) != 32:
-                    raise ValueError()
-            except ValueError:
-                raise SafeValidationError("Reality PublicKey 格式无效") from None
-            short = text(value.get("short_id", ""), "Reality ShortID", 16, empty=True)
-            if len(short) % 2 or not re.fullmatch(r"[0-9A-Fa-f]*", short):
-                raise SafeValidationError("Reality ShortID 必须为最多16位的偶数长度十六进制")
-            fingerprint = value.get("fingerprint", "chrome")
-            if fingerprint not in ("chrome", "firefox", "edge", "safari", "ios", "android", "random", "randomized", "360", "qq"):
-                raise SafeValidationError("不支持此 TLS 指纹")
-            result.update(public_key=key, short_id=short.lower(), fingerprint=fingerprint)
-        else:
-            password = text(value.get("password"), "TUIC 密码")
-            control = value.get("congestion_control", "bbr")
-            if control not in ("bbr", "cubic", "new_reno"):
-                raise SafeValidationError("拥塞控制仅支持 bbr/cubic/new_reno")
-            alpn = value.get("alpn", ["h3"])
-            if not isinstance(alpn, list) or not 1 <= len(alpn) <= 16:
-                raise SafeValidationError("ALPN 格式无效")
-            alpn = [text(item, "ALPN", 64) for item in alpn]
-            if any(any(c.isspace() for c in item) for item in alpn):
-                raise SafeValidationError("ALPN 不能含空白")
-            stream = boolean(value.get("udp_over_stream", False), "udp_over_stream")
-            mode = value.get("udp_relay_mode", "native")
-            if mode not in ("native", "quic"):
-                raise SafeValidationError("UDP 转发仅支持 native/quic")
-            if stream and "udp_relay_mode" in value:
-                raise SafeValidationError("udp_over_stream 与 udp_relay_mode 不能同时指定")
-            result.update(password=password, congestion_control=control, alpn=alpn,
-                          insecure=boolean(value.get("insecure", False), "insecure"), udp_over_stream=stream)
-            if not stream:
-                result["udp_relay_mode"] = mode
-        return result
-    if kind == "socks":
-        username = text(value.get("username", ""), "SOCKS5 用户名", 255, empty=True)
-        password = text(value.get("password", ""), "SOCKS5 密码", 255, empty=True)
-        if len(username.encode("utf-8")) > 255 or len(password.encode("utf-8")) > 255:
-            raise SafeValidationError("SOCKS5 用户名和密码长度不能超过 255 字节")
-        if password and not username:
-            raise SafeValidationError("SOCKS5 填写密码时必须同时提供用户名")
-        result = {"type": "socks", "server": server, "port": int(port)}
-        if username:
-            result.update(username=username, password=password)
-        return result
-    method = text(value.get("method"), "Shadowsocks 加密方式", 64).lower()
-    if method not in SS_METHODS:
-        raise SafeValidationError("不支持该 Shadowsocks 加密方式")
-    password = text(value.get("password", ""), "Shadowsocks 密码", 4096, empty=(method == "none"))
-    if method in SS_2022_KEY_LEN:
-        key_len = SS_2022_KEY_LEN[method]
-        parts = password.split(":")
-        if any(not part for part in parts):
-            raise SafeValidationError("SS-2022 密钥格式无效")
-        for part in parts:
-            try:
-                if len(base64.b64decode(part.encode("ascii"), validate=True)) != key_len:
-                    raise ValueError()
-            except ValueError:
-                raise SafeValidationError("SS-2022 密钥必须为匹配长度的标准 Base64") from None
-    return {"type": "shadowsocks", "server": server, "port": int(port), "method": method, "password": password}
-
-
-def parse_landing_link(raw):
-    raw = text(raw, "分享链接", 16384)
-    before_fragment = raw.split("#", 1)[0]
-    if re.search(r"%(?![0-9a-fA-F]{2})", before_fragment):
-        raise SafeValidationError("分享链接含无效百分号编码")
-    try:
-        link = urllib.parse.urlsplit(raw)
-        scheme = link.scheme.lower()
-    except ValueError:
-        raise SafeValidationError("分享链接地址或端口无效") from None
-    if scheme not in ("tuic", "vless", "socks", "socks5", "socks5h", "ss") or link.path not in ("", "/"):
-        raise SafeValidationError("仅支持 vless://、tuic://、socks5://、socks:// 或 ss:// 分享链接")
-    values = urllib.parse.parse_qs(link.query, keep_blank_values=True, strict_parsing=True)
-    if any(len(value) != 1 for value in values.values()):
-        raise SafeValidationError("分享链接含重复参数")
-    used = set()
-
-    def option(*names, default=None):
-        found = [name for name in names if name in values]
-        used.update(found)
-        if len(found) > 1:
-            raise SafeValidationError("分享链接同义参数重复")
-        return values[found[0]][0] if found else default
-
-    def require_option(names, supported, default=None):
-        selected = option(*names, default=default)
-        if selected not in supported:
-            raise SafeValidationError("分享链接的 " + names[0] + " 不受支持")
-
-    if scheme == "ss":
-        if values:
-            raise SafeValidationError("暂不支持 Shadowsocks 插件或附加查询参数")
-        if "@" not in link.netloc:
-            decoded = b64decode_text(urllib.parse.unquote(link.netloc, errors="strict"), "Shadowsocks 链接")
-            if "@" not in decoded:
-                raise SafeValidationError("Shadowsocks 链接缺少服务器地址")
-            userinfo, hostport = decoded.rsplit("@", 1)
-            if ":" not in userinfo:
-                raise SafeValidationError("Shadowsocks 链接缺少加密方式或密码")
-            method, password = userinfo.split(":", 1)
-            try:
-                hp = urllib.parse.urlsplit("ss://" + hostport)
-                server, port = hp.hostname, hp.port
-            except ValueError:
-                raise SafeValidationError("Shadowsocks 地址或端口无效") from None
-            if not server or port is None or hp.path not in ("", "/") or hp.query or hp.username is not None:
-                raise SafeValidationError("Shadowsocks 地址或端口无效")
-        else:
-            try:
-                server, port = link.hostname, link.port
-            except ValueError:
-                raise SafeValidationError("Shadowsocks 地址或端口无效") from None
-            if not server or port is None:
-                raise SafeValidationError("Shadowsocks 链接缺少地址或端口")
-            raw_userinfo = link.netloc.rsplit("@", 1)[0]
-            if not raw_userinfo:
-                raise SafeValidationError("Shadowsocks 链接缺少认证信息")
-            if ":" in raw_userinfo:
-                raw_method, raw_pass = raw_userinfo.split(":", 1)
-                method = urllib.parse.unquote(raw_method, errors="strict")
-                password = urllib.parse.unquote(raw_pass, errors="strict")
-            else:
-                decoded = b64decode_text(urllib.parse.unquote(raw_userinfo, errors="strict"), "Shadowsocks 认证信息")
-                if ":" not in decoded:
-                    raise SafeValidationError("Shadowsocks 认证信息格式无效")
-                method, password = decoded.split(":", 1)
-        return normalize_landing({"type": "shadowsocks", "server": server, "port": port, "method": method, "password": password})
-
-    try:
-        server, port = link.hostname, link.port
-    except ValueError:
-        raise SafeValidationError("分享链接地址或端口无效") from None
-    if not server or port is None:
-        raise SafeValidationError("分享链接缺少地址或端口")
-
-    if scheme in ("socks", "socks5", "socks5h"):
-        if values:
-            raise SafeValidationError("SOCKS5 分享链接包含不支持的参数")
-        username, password = "", ""
-        if link.password is not None and not link.username:
-            raise SafeValidationError("SOCKS5 分享链接缺少用户名")
-        elif link.username is not None and link.password is not None:
-            username = urllib.parse.unquote(link.username, errors="strict")
-            password = urllib.parse.unquote(link.password, errors="strict")
-        elif link.username is not None:
-            raw_user = urllib.parse.unquote(link.username, errors="strict")
-            if scheme == "socks":
-                try:
-                    decoded = b64decode_text(raw_user, "SOCKS5 认证信息")
-                    if ":" in decoded:
-                        username, password = decoded.split(":", 1)
-                    else:
-                        username = raw_user
-                except ValueError:
-                    username = raw_user
-            else:
-                username = raw_user
-        result = {"type": "socks", "server": server, "port": port}
-        if username or password:
-            result.update(username=username, password=password)
-        return normalize_landing(result)
-
-    kind = scheme
-    result = {"type": kind, "server": server, "port": port,
-              "uuid": urllib.parse.unquote(link.username or "", errors="strict"),
-              "sni": option("sni", "serverName", "servername", default=server)}
-    if kind == "vless":
-        if link.password is not None:
-            raise SafeValidationError("VLESS 分享链接认证格式无效")
-        require_option(("security",), ("reality",))
-        require_option(("type", "transport"), ("tcp",), "tcp")
-        require_option(("flow",), ("xtls-rprx-vision",))
-        require_option(("encryption",), ("none",), "none")
-        require_option(("headerType",), ("none", ""), "none")
-        require_option(("packetEncoding", "packet_encoding"), ("xudp", ""), "xudp")
-        text(option("spx", "spiderX", default=""), "Reality spx", 256, empty=True)
-        result.update(public_key=option("pbk", "publicKey", "public_key"),
-                      short_id=option("sid", "shortId", "short_id", default=""),
-                      fingerprint=option("fp", "fingerprint", default="chrome"))
-    else:
-        result["password"] = urllib.parse.unquote(link.password or "", errors="strict")
-        require_option(("version", "v"), ("5",), "5")
-        result["congestion_control"] = option("congestion_control", "congestion-controller", "congestion-control", default="bbr")
-        result["insecure"] = option("allow_insecure", "allowInsecure", "insecure", "skip-cert-verify", "skip_cert_verify", default="0")
-        result["alpn"] = option("alpn", default="h3").split(",")
-        if boolean(option("disable_sni", "disable-sni", default="0"), "disable_sni"):
-            raise SafeValidationError("不支持 disable_sni=1，请使用 SNI")
-        if boolean(option("zero_rtt_handshake", "zero-rtt-handshake", default="0"), "zero_rtt_handshake"):
-            raise SafeValidationError("不支持启用 0-RTT")
-        stream = option("udp_over_stream", "udp-over-stream", default="0")
-        result["udp_over_stream"] = boolean(stream, "udp_over_stream")
-        mode = option("udp_relay_mode", "udp-relay-mode")
-        if mode is not None:
-            result["udp_relay_mode"] = mode
-    if set(values) - used:
-        raise SafeValidationError("分享链接包含当前不支持的连接参数，请改为手动填写")
-    return normalize_landing(result)
-
-
-def main():
-    try:
-        raw = sys.stdin.read(16385)
-        result = normalize_landing(json.loads(raw)) if "--json" in sys.argv else parse_landing_link(raw.strip())
-        print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
-        return 0
-    except SafeValidationError as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
-    except (ValueError, TypeError, UnicodeError, KeyError):
-        # Never echo the supplied link, credentials or decoded password.
-        print("落地参数无效或含不支持的选项，请检查协议、认证凭据、加密方式、TLS 与分享链接参数。", file=sys.stderr)
-        return 1
-
-
-if __name__ == "__main__":
-    sys.exit(main())
-# END_EMBEDDED_LANDING_PARSER
-YSQ_LANDING_PY
-}
-
 parse_landing_uri() {
-  python3 -c "$(write_landing_uri_parser)" "$@"
+  "$SINGBOX_PLUS_BIN" parse-landing "$@"
 }
 
 # 密码不套用本机用户密码字符限制，保留冒号、@、+、空格等原始字符。
@@ -2504,7 +2385,7 @@ LANDING_CONFIG_JSON=""
 collect_landing_config() {
   local previous="${1:-}" source old_type type choice server default_port port user password sni pbk sid fp insecure cc mode alpn auth_choice method_pick method json address_hint=""
   [ -n "$previous" ] || previous='{}'
-  ensure_agent_python || return 1
+  ensure_singbox_plus || return 1
   [ -z "$(printf '%s' "$previous" | jq -r '.server // empty')" ] || address_hint="（留空沿用原地址）"
   read_line "落地 IP/域名或 vless://、tuic://、socks5://、ss:// 分享链接${address_hint}，0 返回: " source
   source="$(trim "$source")"
@@ -2555,7 +2436,9 @@ collect_landing_config() {
     json="$(jq -nc --arg type "$type" --arg server "$server" --argjson port "$port" --arg uuid "$user" --arg public_key "$pbk" --arg short_id "$sid" --arg sni "$sni" --arg fingerprint "$fp" '{type:$type,server:$server,port:$port,uuid:$uuid,public_key:$public_key,short_id:$short_id,sni:$sni,fingerprint:$fingerprint}')"
   elif [ "$type" = "tuic" ]; then
     user="$(ask_landing_secret "落地 TUIC UUID" "$(printf '%s' "$previous" | jq -r '.uuid // empty')")"
+    [ -n "$user" ] || return 1
     password="$(ask_landing_secret "落地 TUIC 密码" "$(printf '%s' "$previous" | jq -r '.password // empty')")"
+    [ -n "$password" ] || return 1
     sni="$(ask_text_default "落地 TUIC SNI" "$(printf '%s' "$previous" | jq -r --arg server "$server" '.sni // $server')")"
     if [ "$(printf '%s' "$previous" | jq -r '.insecure // false')" = true ]; then choice=2; else choice=1; fi
     echo "1) 校验证书  2) 跳过校验（自签证书）" >&2
@@ -2578,7 +2461,9 @@ collect_landing_config() {
         ;;
       2)
         user="$(ask_text_default "落地 SOCKS5 用户名" "$(printf '%s' "$previous" | jq -r '.username // empty')")"
+        [ -n "$user" ] || return 1
         password="$(ask_landing_secret "落地 SOCKS5 密码" "$(printf '%s' "$previous" | jq -r '.password // empty')")"
+        [ -n "$password" ] || return 1
         ;;
       *) err "SOCKS5 认证选项无效。"; return 1 ;;
     esac
@@ -2607,6 +2492,7 @@ collect_landing_config() {
       password=""
     else
       password="$(ask_landing_secret "落地 Shadowsocks 密码/密钥" "$(printf '%s' "$previous" | jq -r '.password // empty')")"
+      [ -n "$password" ] || return 1
     fi
     json="$(jq -nc --arg type "$type" --arg server "$server" --argjson port "$port" --arg method "$method" --arg password "$password" '{type:$type,server:$server,port:$port,method:$method,password:$password}')"
   fi
@@ -2623,7 +2509,7 @@ add_landing_wizard() {
   need_state
   step "添加落地节点"
   local server port type flag loc display id
-  collect_landing_config || return $?
+  collect_landing_config
   server="$(printf '%s' "$LANDING_CONFIG_JSON" | jq -r '.server')"
   port="$(printf '%s' "$LANDING_CONFIG_JSON" | jq -r '.port')"
   type="$(printf '%s' "$LANDING_CONFIG_JSON" | jq -r '.type')"
@@ -2667,7 +2553,7 @@ edit_landing() {
   if [ "$old_type" = "vless" ]; then
     previous="$(jq -c --argjson i "$idx" '. as $s | .landings[$i] | .type="vless" | .uuid=(.uuid // $s.uuid) | .public_key=(.public_key // $s.public_key) | .short_id=(.short_id // $s.short_id) | .sni=(.sni // $s.reality_sni)' "$STATE_FILE")"
   fi
-  collect_landing_config "$previous" || return $?
+  collect_landing_config "$previous"
   previous_config="$(printf '%s' "$previous" | parse_landing_uri --json 2>/dev/null || true)"
   if [ -n "$previous_config" ] && [ "$LANDING_CONFIG_JSON" = "$previous_config" ]; then
     info "落地信息没有变化。"
@@ -2966,9 +2852,11 @@ delete_node_wizard() {
   read_line "请输入要删除的节点序号 (多个用空格隔开，如 1 2)，输入 0 返回: " indices
   indices="$(split_input "$indices")"
 
+  local -a idx_items=()
   if [ -z "$indices" ] || [ "$indices" = "0" ]; then return "$CANCEL_RC"; fi
 
-  for idx in $indices; do
+  read -r -a idx_items <<< "$indices"
+  for idx in "${idx_items[@]}"; do
     if valid_index "$idx" "$count"; then
       real_idx=$((10#$idx - 1))
       # 去重
@@ -3005,7 +2893,7 @@ modify_node_wizard() {
   need_state
 
   local count index real_idx old_port new_port old_tag new_tag type protocol name
-  local outbound_type landing_id landing_display mod_choice
+  local outbound_type landing_id backup_landing_id landing_display mod_choice
   local current_sni new_sni out_target new_type new_name
 
   count="$(jq '.nodes | length' "$STATE_FILE")"
@@ -3029,13 +2917,14 @@ modify_node_wizard() {
 
   real_idx=$((10#$index - 1))
   # 一次 jq 取出该节点全部字段（\x1f 分隔，空字段不会被吞掉）
-  IFS=$'\x1f' read -r type protocol name old_port old_tag outbound_type landing_id landing_display < <(
+  IFS=$'\x1f' read -r type protocol name old_port old_tag outbound_type landing_id backup_landing_id landing_display < <(
     jq -r --argjson i "$real_idx" '
       . as $s | $s.nodes[$i] as $n
       | ($n.outbound_type // "direct") as $out
       | [ $n.type,
           ($n.protocol // (if $n.type | startswith("tuic") then "udp" else "tcp" end)),
           $n.name, ($n.port | tostring), $n.tag, $out, ($n.landing_id // ""),
+          ($n.backup_landing_id // ""),
           (if $out == "landing"
            then ((first($s.landings[]? | select(.id == ($n.landing_id // ""))) | .display) // "(落地已丢失)")
            else "-" end) ]
@@ -3050,12 +2939,13 @@ modify_node_wizard() {
   echo "端口: ${old_port}"
   echo "出口: $([ "$outbound_type" = "landing" ] && echo "落地中转 (${landing_display})" || echo "直出")"
   echo "备用: $(jq -r --argjson i "$real_idx" '. as $s | .nodes[$i].backup_landing_id as $id | if $id==null then "未启用" else ([.landings[]|select(.id==$id)|.display][0]//"落地已丢失") end' "$STATE_FILE")"
-  if [ -f "$FAILOVER_STATUS_FILE" ]; then
+  if [ "$outbound_type" = "landing" ] && [ -n "$backup_landing_id" ] && [ -f "$FAILOVER_STATUS_FILE" ]; then
     jq -r --arg t "failover-${old_tag}" '
       if (now - (.checked_at//0)) > 90 then "主备检测状态已超过 90 秒未更新，请检查 ysq-failover 服务。"
       elif (.error//"")!="" then "主备检测异常: \(.error)"
       else .groups[]? | select(.tag==$t) |
-        "当前出口: \(.selected) (主: \(.primary_ok), 备: \(.backup_ok))" end' "$FAILOVER_STATUS_FILE"
+        "当前出口: \(.selected) (主: \(.primary_ok), 备: \(.backup_ok))" end' "$FAILOVER_STATUS_FILE" 2>/dev/null \
+      || warn "主备检测状态文件不可读或格式异常，请检查 ysq-failover 服务。"
   fi
   echo "--------------------"
   echo
@@ -3221,7 +3111,10 @@ ask_user_uuid() {
     read_line "输入 VLESS / TUIC 共用 UUID（留空自动生成）: " n
     n="$(trim "$n")"
     if [ -z "$n" ]; then
-      n="$(sing-box generate uuid)" || return 1
+      local sb_bin
+      sb_bin="$(resolve_singbox_bin)"
+      [ -n "$sb_bin" ] || return 1
+      n="$("$sb_bin" generate uuid)" || return 1
     fi
     if valid_user_uuid "$n"; then
       echo "${n,,}"
@@ -3306,7 +3199,10 @@ modify_user_wizard() {
       state_build --argjson i "$idx" --arg p "$new" '.users[$i].tuic_pass=$p'
       ;;
     4)
-      new="$(sing-box generate uuid)"
+      local sb_bin
+      sb_bin="$(resolve_singbox_bin)"
+      [ -n "$sb_bin" ] || die "未找到 sing-box 可执行文件。"
+      new="$("$sb_bin" generate uuid)"
       pass="$(openssl rand -hex 16)"
       state_build --argjson i "$idx" --arg u "$new" --arg p "$pass" \
         '.users[$i] |= (.uuid=$u | .tuic_pass=$p)'
@@ -3372,67 +3268,9 @@ user_management_menu() {
 }
 
 # -------------------------
-# 流量统计：使用本机 41453 gRPC 的 V2Ray StatsService。
+# 流量统计：使用 singbox-plus stats 读取本机 41453 gRPC 的 V2Ray StatsService。
 # 查询只读 (reset=false)，统计在 sing-box 重启后归零。
 # -------------------------
-GRPCURL_COMMAND=""
-ensure_grpcurl() {
-  local arch asset base wd file sums expected actual
-  if command -v grpcurl >/dev/null 2>&1; then
-    GRPCURL_COMMAND="$(command -v grpcurl)"
-    return 0
-  fi
-  if [ -x "$GRPCURL_YSQ_BIN" ]; then
-    GRPCURL_COMMAND="$GRPCURL_YSQ_BIN"
-    return 0
-  fi
-  arch="$(normalize_arch)"
-  case "$arch" in
-    amd64) arch="x86_64" ;;
-    arm64) arch="arm64" ;;
-  esac
-  asset="grpcurl_${GRPCURL_VERSION}_linux_${arch}.tar.gz"
-  base="https://github.com/fullstorydev/grpcurl/releases/download/v${GRPCURL_VERSION}"
-  wd="$(new_work_dir)"
-  file="${wd}/${asset}"
-  sums="${wd}/checksums.txt"
-  info "首次查看流量：下载 grpcurl ${GRPCURL_VERSION}（仅用于读取本机 gRPC 统计）..."
-  if ! curl -fL --connect-timeout 10 --retry 2 -o "$file" "${base}/${asset}"; then
-    err "grpcurl 下载失败。可自行安装 grpcurl 后重新打开流量统计。"
-    return 1
-  fi
-  if ! curl -fL --connect-timeout 10 --retry 2 -o "$sums" "${base}/grpcurl_${GRPCURL_VERSION}_checksums.txt"; then
-    err "无法下载 grpcurl 官方 SHA256 校验文件，已拒绝安装。"
-    return 1
-  fi
-  expected="$(awk -v f="$asset" '{n=$2; sub(/^\*/,"",n); sub(/^\.\//,"",n); if(n==f) {print $1; exit}}' "$sums")"
-  actual="$(sha256sum "$file" | awk '{print $1}')"
-  if ! [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] || [ "${expected,,}" != "${actual,,}" ]; then
-    err "grpcurl SHA256 校验失败，已拒绝安装。"
-    return 1
-  fi
-  if ! tar -xzf "$file" -C "$wd" grpcurl || [ ! -f "$wd/grpcurl" ]; then
-    err "grpcurl 解压失败。"
-    return 1
-  fi
-  mkdir -p "$(dirname "$GRPCURL_YSQ_BIN")"
-  install -m 755 "$wd/grpcurl" "$GRPCURL_YSQ_BIN" || return 1
-  GRPCURL_COMMAND="$GRPCURL_YSQ_BIN"
-  ok "grpcurl 安装完成，SHA256 已校验。"
-}
-
-# sing-box 的注册服务名与原 proto package 名不同；此处使用兼容的线格式和真正的服务名。
-write_v2ray_stats_proto() {
-  cat > "$1" <<'PROTO'
-syntax = "proto3";
-package v2ray.core.app.stats.command;
-message Stat { string name = 1; int64 value = 2; }
-message QueryStatsRequest { string pattern = 1; bool reset = 2; repeated string patterns = 3; bool regexp = 4; }
-message QueryStatsResponse { repeated Stat stat = 1; }
-service StatsService { rpc QueryStats(QueryStatsRequest) returns (QueryStatsResponse); }
-PROTO
-}
-
 show_traffic_stats() {
   need_state
   step "流量统计（V2Ray API ${V2RAY_API_PORT}）"
@@ -3440,47 +3278,26 @@ show_traffic_stats() {
     warn "sing-box 没有运行，无法获取流量。"
     return 1
   fi
-  ensure_grpcurl || return 1
-  local wd proto result errors
+  ensure_singbox_plus || return 1
+  local wd result errors
   wd="$(new_work_dir)"
-  proto="${wd}/stats.proto"
   result="${wd}/response.json"
   errors="${wd}/error.txt"
-  write_v2ray_stats_proto "$proto"
 
-  # 先用实际安装的 grpcurl 在本地解析 proto；此动作不连接 API，也不触碰计数器。
-  # 之前的 -proto 绝对路径错误在此阶段即可直接发现，而不是被误报为编译问题。
-  if ! "$GRPCURL_COMMAND" -import-path "$wd" -proto stats.proto list > "$wd/services.txt" 2> "$errors"; then
-    err "grpcurl 无法解析流量统计 proto；尚未向 sing-box 发起请求。"
-    sed -n '1,8p' "$errors" >&2
-    return 1
-  fi
-  if ! grep -Fxq 'v2ray.core.app.stats.command.StatsService' "$wd/services.txt"; then
-    err "本地 proto 中没有预期的 V2Ray StatsService。"
-    sed -n '1,8p' "$wd/services.txt" >&2
-    return 1
-  fi
-
-  # grpcurl 的 -proto 必须相对于 -import-path，不能直接使用无导入根目录的绝对路径。
-  # 此处使用每次执行生成的临时目录作为导入根目录，保证从任何 cwd 启动 ysq 都能解析。
-  if ! "$GRPCURL_COMMAND" -plaintext -max-time 5 -import-path "$wd" -proto stats.proto -d '{"reset":false}' \
-    "127.0.0.1:${V2RAY_API_PORT}" \
-    'v2ray.core.app.stats.command.StatsService/QueryStats' > "$result" 2> "$errors"; then
+  if ! "$SINGBOX_PLUS_BIN" stats --addr "127.0.0.1:${V2RAY_API_PORT}" --timeout 5s > "$result" 2> "$errors"; then
     err "无法读取 127.0.0.1:${V2RAY_API_PORT} 的 V2Ray API 统计。"
     sed -n '1,8p' "$errors" >&2
-    if grep -Eqi 'connection refused|connect: connection|deadline exceeded|no route to host' "$errors"; then
-      warn "API 41453 无法连接。请检查 ysq 面板常驻端口指示，以及 sing-box 是否已启动。"
+    if grep -Eqi 'connection refused|connect: connection|deadline exceeded|no route to host|timeout' "$errors"; then
+      warn "API ${V2RAY_API_PORT} 无法连接。请检查 ysq 面板常驻端口指示，以及 sing-box 是否已启动。"
     elif grep -Eqi 'unknown service|unimplemented' "$errors"; then
       warn "服务名不匹配或服务器未启用统计服务。请检查 sing-box 的 with_v2ray_api 编译标签和配置。"
-    elif grep -Eqi 'proto source|import.path|proto:' "$errors"; then
-      warn "grpcurl 解析本地 proto 文件失败；请确认正在运行 v${YSQ_VERSION} 或更新的修复版脚本。"
     else
       warn "请检查 API 端口、sing-box 编译标签（with_v2ray_api）及 sing-box 日志。"
     fi
     return 1
   fi
   if ! jq -e '.stat == null or (.stat|type) == "array"' "$result" >/dev/null 2>&1; then
-    err "gRPC 返回了非预期数据。"
+    err "V2Ray API 返回了非预期数据。"
     return 1
   fi
 
@@ -3535,9 +3352,11 @@ direct_add() {
 
   read_line "请输入要直连的域名 (多个用空格或逗号隔开，输入 0 返回): " raw_input
   raw_input="$(split_input "$raw_input")"
+  local -a raw_items=()
   if [ -z "$raw_input" ] || [ "$raw_input" = "0" ]; then return "$CANCEL_RC"; fi
 
-  for item in $raw_input; do
+  read -r -a raw_items <<< "$raw_input"
+  for item in "${raw_items[@]}"; do
     domain="$(normalize_domain "$item")"
     if [ -z "$domain" ]; then continue; fi
     if ! [[ "$domain" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]]; then
@@ -3592,7 +3411,9 @@ direct_remove() {
     return 0
   fi
 
-  for idx in $raw_indices; do
+  local -a idx_items=()
+  read -r -a idx_items <<< "$raw_indices"
+  for idx in "${idx_items[@]}"; do
     if valid_index "$idx" "$count"; then
       real_idx=$((10#$idx - 1))
       if [[ " ${seen[*]:-} " == *" ${real_idx} "* ]]; then continue; fi
@@ -3623,9 +3444,11 @@ block_add() {
 
   read_line "请输入要屏蔽的域名 (多个用空格或逗号隔开，输入 0 返回): " raw_input
   raw_input="$(split_input "$raw_input")"
+  local -a raw_items=()
   if [ -z "$raw_input" ] || [ "$raw_input" = "0" ]; then return "$CANCEL_RC"; fi
 
-  for item in $raw_input; do
+  read -r -a raw_items <<< "$raw_input"
+  for item in "${raw_items[@]}"; do
     domain="$(normalize_domain "$item")"
     if [ -z "$domain" ]; then continue; fi
     if ! [[ "$domain" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]]; then
@@ -3680,7 +3503,9 @@ block_remove() {
     return 0
   fi
 
-  for idx in $raw_indices; do
+  local -a idx_items=()
+  read -r -a idx_items <<< "$raw_indices"
+  for idx in "${idx_items[@]}"; do
     if valid_index "$idx" "$count"; then
       real_idx=$((10#$idx - 1))
       if [[ " ${seen[*]:-} " == *" ${real_idx} "* ]]; then continue; fi
@@ -3788,11 +3613,24 @@ block_website_menu() { routing_menu; }
 # -------------------------
 # 更新内核 / 刷新 IP
 # -------------------------
+restore_bin_atomic() {
+  local bak="$1" target="$2" stage
+  mkdir -p "$(dirname "$target")" 2>/dev/null || return 1
+  stage="${target}.restore.${WORK_TAG}"
+  if install -m 755 "$bak" "$stage" && mv -f "$stage" "$target"; then
+    return 0
+  fi
+  rm -f "$stage" 2>/dev/null || true
+  return 1
+}
+
 update_core_wizard() {
   local current_ver latest_ver bin wd rc new_ver
+  local agent_was_active=0 sb_changed=0 sp_changed=0
 
-  if command -v sing-box >/dev/null 2>&1; then
-    current_ver="$(sing-box version 2>/dev/null | head -n 1 | awk '{print $3}' || true)"
+  bin="$(resolve_singbox_bin)"
+  if [ -n "$bin" ]; then
+    current_ver="$("$bin" version 2>/dev/null | head -n 1 | awk '{print $3}' || true)"
   else
     current_ver="未知"
   fi
@@ -3818,41 +3656,85 @@ update_core_wizard() {
   fi
 
   state_write_guard || return $?
-  # 先备份旧二进制，安装失败时恢复，避免把服务搞成“没有可执行文件”
-  bin="$(command -v sing-box 2>/dev/null || true)"
+  # 先备份旧二进制，安装或重启失败时恢复，避免把服务搞成“没有可执行文件”或停服
+  local orig_bin="$bin"
   wd="$(new_work_dir)"
-  if [ -n "$bin" ] && [ -x "$bin" ]; then
-    cp -p "$bin" "$wd/sing-box.bak"
+  if [ -n "$orig_bin" ] && [ -x "$orig_bin" ]; then
+    cp -p "$orig_bin" "$wd/sing-box.bak"
+  fi
+  if [ -x "$SINGBOX_PLUS_BIN" ]; then
+    cp -p "$SINGBOX_PLUS_BIN" "$wd/singbox-plus.bak"
+  fi
+  if agent_service_is_active; then
+    agent_was_active=1
   fi
 
-  service_stop
-
+  # 下载并原子替换新二进制，不提前停服，避免下载超时或中断导致停服
   # 子 shell 里运行，保证里面的 die 不会直接结束整个操作
   set +e
   ( set -e; SINGBOX_VERSION="$latest_ver" install_singbox force )
   rc=$?
   set -e
 
-  if [ "$rc" -ne 0 ]; then
-    err "更新失败，正在恢复旧版本..."
-    if [ -f "$wd/sing-box.bak" ] && [ -n "$bin" ]; then
-      install -m 755 "$wd/sing-box.bak" "$bin"
-      hash -r 2>/dev/null || true
-      service_restart || true
+  if [ "$rc" -eq 0 ]; then
+    bin="$(resolve_singbox_bin)"
+    new_ver="$( [ -n "$bin" ] && "$bin" version 2>/dev/null | head -n 1 | awk '{print $3}' || true)"
+    if [ "$new_ver" != "$latest_ver" ]; then
+      warn "当前版本 ${new_ver:-未知} 与 Release 最新版 ${latest_ver} 不一致。"
     fi
+    if service_restart && is_singbox_running; then
+      if [ "$agent_was_active" -eq 1 ]; then
+        agent_service_start || warn "singbox-plus 已更新，但重启 ysq-agent 失败，请在「中控连接管理」中检查状态。"
+      fi
+      rm -rf "$wd"
+      ok "更新并重启完成。"
+      return 0
+    fi
+    err "新版本重启或运行检查失败，正在恢复旧版本..."
+  fi
+
+  if [ -f "$wd/sing-box.bak" ] && [ -n "$orig_bin" ]; then
+    if [ ! -x "$orig_bin" ] || ! cmp -s "$wd/sing-box.bak" "$orig_bin" \
+        || { [ "$orig_bin" != "$CORE_BIN_FILE" ] && [ -e "$CORE_BIN_FILE" ]; }; then
+      sb_changed=1
+    fi
+  fi
+  if [ -f "$wd/singbox-plus.bak" ]; then
+    if [ ! -x "$SINGBOX_PLUS_BIN" ] || ! cmp -s "$wd/singbox-plus.bak" "$SINGBOX_PLUS_BIN"; then
+      sp_changed=1
+    fi
+  fi
+
+  if [ "$rc" -ne 0 ] && [ "$sb_changed" -eq 0 ] && [ "$sp_changed" -eq 0 ] && is_singbox_running; then
+    err "更新失败，旧版本二进制未改动，sing-box 保持当前版本运行。"
     rm -rf "$wd"
     return 1
   fi
-
-  rm -rf "$wd"
-
-  new_ver="$(sing-box version 2>/dev/null | head -n 1 | awk '{print $3}' || true)"
-  if [ "$new_ver" != "$latest_ver" ]; then
-    warn "当前版本 ${new_ver:-未知} 与 Release 最新版 ${latest_ver} 不一致。"
+  if [ "$rc" -ne 0 ]; then
+    err "更新失败，正在恢复旧版本..."
   fi
 
-  service_restart || return 1
-  ok "更新并重启完成。"
+  if [ -f "$wd/sing-box.bak" ] && [ -n "$orig_bin" ] && [ "$sb_changed" -eq 1 ]; then
+    if [ "$orig_bin" != "$CORE_BIN_FILE" ]; then
+      rm -f "$CORE_BIN_FILE" 2>/dev/null || true
+    fi
+    restore_bin_atomic "$wd/sing-box.bak" "$orig_bin" \
+      || warn "恢复旧版 sing-box 二进制失败：${orig_bin}"
+    hash -r 2>/dev/null || true
+  fi
+  if [ -f "$wd/singbox-plus.bak" ] && [ "$sp_changed" -eq 1 ]; then
+    restore_bin_atomic "$wd/singbox-plus.bak" "$SINGBOX_PLUS_BIN" \
+      || warn "恢复旧版 singbox-plus 二进制失败：${SINGBOX_PLUS_BIN}"
+  fi
+  if [ -f "$wd/sing-box.bak" ] && [ -n "$orig_bin" ]; then
+    ( set -e; ensure_singbox_service ) || true
+    service_restart || true
+  fi
+  if [ "$agent_was_active" -eq 1 ] && [ "$sp_changed" -eq 1 ]; then
+    agent_service_start || true
+  fi
+  rm -rf "$wd"
+  return 1
 }
 
 refresh_ip_wizard() {
@@ -3987,15 +3869,18 @@ choose_initial_nodes() {
 #   - check 被系统杀掉（退出码 137，多半是内存不足）：先重试一次；
 #     仍被杀就用 jq 确认 JSON 合法后跳过 check，交给「启动服务」来验证（启动失败会自动回滚）
 check_config_file() {
-  local f="$1" rc=0
+  local f="$1" rc=0 sb=""
 
-  sing-box check -c "$f" && return 0 || rc=$?
+  sb="$(resolve_singbox_bin)"
+  [ -n "$sb" ] || { err "未找到 sing-box 可执行文件。"; return 1; }
+
+  "$sb" check -c "$f" && return 0 || rc=$?
   [ "$rc" -eq 137 ] || return 1
 
   warn "sing-box check 被系统杀掉（137，疑似内存不足），1 秒后重试一次..."
   sleep 1
   rc=0
-  sing-box check -c "$f" && return 0 || rc=$?
+  "$sb" check -c "$f" && return 0 || rc=$?
   [ "$rc" -eq 137 ] || return 1
 
   warn "重试仍被杀：内存不足。改为用 jq 确认 JSON 合法后跳过 check，直接启动服务验证（启动失败会自动回滚）。"
@@ -4025,17 +3910,14 @@ render_config() {
   fi
   info "生成 sing-box 配置..."
   mkdir -p "$CORE_LOG_DIR"
-  touch "$LOG_FILE"
-  chmod 640 "$LOG_FILE"
-  # Legacy OpenRC stdout logs may have been created by root. The new core file
-  # output must be writable by the service account, including on first adoption.
+  chmod 755 "$CORE_LOG_DIR"
   if id sing-box >/dev/null 2>&1; then
-    chown sing-box:sing-box "$CORE_LOG_DIR" "$LOG_FILE"
+    chown sing-box:sing-box "$CORE_LOG_DIR"
   fi
 
   tmp="$(mktemp "${CONFIG_FILE}.tmp.${WORK_TAG}.XXXXXX")" || { err "无法创建临时配置文件。"; return 1; }
 
-  if ! jq --arg api_listen "127.0.0.1:${V2RAY_API_PORT}" --arg cert_file "$CERT_FILE" --arg key_file "$KEY_FILE" --arg log_file "$LOG_FILE" --arg cache_file "${CORE_DATA_DIR}/route-rule-cache.db" --arg failover_listen "127.0.0.1:${FAILOVER_API_PORT}" '
+  if ! jq --arg api_listen "127.0.0.1:${V2RAY_API_PORT}" --arg cert_file "$CERT_FILE" --arg key_file "$KEY_FILE" --arg cache_file "${CORE_DATA_DIR}/route-rule-cache.db" --arg failover_listen "127.0.0.1:${FAILOVER_API_PORT}" '
     (.users |= map(select(.enabled != false))) as $s |
 
     def landing_id($id):
@@ -4141,7 +4023,6 @@ render_config() {
     {
       "log": {
         "level": "info",
-        "output": $log_file,
         "timestamp": true
       },
       "experimental": ({
@@ -4209,8 +4090,8 @@ render_config() {
     return 1
   fi
 
-  chown sing-box:sing-box "$tmp" 2>/dev/null || true
-  chmod 600 "$tmp"
+  chown root:sing-box "$tmp" 2>/dev/null || true
+  chmod 640 "$tmp"
 
   # 先检查临时文件，通过后再原子替换正在使用的配置
   if ! check_config_file "$tmp"; then
@@ -4242,7 +4123,7 @@ render_info() {
 
   local server_ip reality_sni tuic_sni public_key private_key short_id ip_version server_ip_display
   local type tag name port protocol outbound_type landing_disp landing_port user uuid tuic_pass encoded_name link
-  local default_name default_uuid default_tuic_pass
+  local default_name default_uuid default_tuic_pass out_dir tmp
 
   state_read '.server_ip, .reality_sni, .tuic_sni, .public_key, .private_key, .short_id, (.ip_version // "ipv4"), ([.users[] | select(.enabled != false)][0].name), ([.users[] | select(.enabled != false)][0].uuid), ([.users[] | select(.enabled != false)][0].tuic_pass)' \
     server_ip reality_sni tuic_sni public_key private_key short_id ip_version default_name default_uuid default_tuic_pass
@@ -4253,20 +4134,29 @@ render_info() {
     )"
     user_label="用户"
   fi
-  if [ "$ip_version" = "ipv6" ]; then
+  if is_ipv6 "$server_ip"; then
     server_ip_display="[${server_ip}]"
   else
     server_ip_display="$server_ip"
   fi
 
-  cat > "$out_file" <<INFO
+  out_dir="$(dirname "$out_file")"
+  mkdir -p "$out_dir" || return 1
+  tmp="$(mktemp "${out_dir}/.ysq-info.tmp.${WORK_TAG}.XXXXXX")" || return 1
+
+  {
+    cat <<INFO
 ==============================
 ysq sing-box 节点信息（按用户）
 ==============================
 服务器地址: ${server_ip} (${ip_version})
 ${user_label}: ${default_name}
 UUID: ${default_uuid}
-REALITY PrivateKey: ${private_key}
+INFO
+    if [ -z "$selected_user" ]; then
+      printf 'REALITY PrivateKey: %s\n' "$private_key"
+    fi
+    cat <<INFO
 REALITY PublicKey: ${public_key}
 ShortID: ${short_id}
 TUIC Password: ${default_tuic_pass}
@@ -4277,14 +4167,16 @@ V2Ray API: 127.0.0.1:${V2RAY_API_PORT} (仅本机)
 YAML配置: ${YAML_FILE}
 
 INFO
+  } > "$tmp" || { rm -f "$tmp"; return 1; }
 
   if [ "$(jq '.nodes | length' "$STATE_FILE")" -eq 0 ]; then
-    printf '当前还没有节点。输入 ysq 后在面板中添加节点。\n' >> "$out_file"
-    chmod 600 "$out_file"
+    printf '当前还没有节点。输入 ysq 后在面板中添加节点。\n' >> "$tmp"
+    chmod 600 "$tmp" && mv -f "$tmp" "$out_file" || { rm -f "$tmp"; return 1; }
     return 0
   fi
 
-  while IFS=$'\t' read -r type tag name port protocol outbound_type landing_disp landing_port user uuid tuic_pass encoded_name; do
+  while IFS=$'\x1f' read -r type tag name port protocol outbound_type landing_disp landing_port user uuid tuic_pass encoded_name; do
+    [ -n "$type" ] || continue
     if [[ "$type" == vless* ]]; then
       link="vless://${uuid}@${server_ip_display}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reality_sni}&fp=chrome&pbk=${public_key}&sid=${short_id}&type=tcp&headerType=none#${encoded_name}"
     elif [[ "$type" == tuic* ]]; then
@@ -4305,18 +4197,18 @@ INFO
       if [[ "$type" == tuic* ]]; then echo "TUIC Password: ${tuic_pass}"; fi
       echo "$link"
       echo
-    } >> "$out_file"
-  done <<< "$(jq -r --arg selected "$selected_user" '
+    } >> "$tmp"
+  done < <(jq -r --arg selected "$selected_user" '
     . as $s |
     $s.nodes[]? as $n |
     (first($s.landings[]? | select(.id == ($n.landing_id // ""))) // {}) as $l |
     ($s.users[] | select(.enabled != false) | select($selected == "" or .name == $selected)) as $u |
     [ $n.type, $n.tag, $n.name, ($n.port | tostring), ($n.protocol // "tcp"),
       ($n.outbound_type // "direct"), ($l.display // "-"), (($l.port // "-") | tostring),
-      $u.name, $u.uuid, $u.tuic_pass, (($n.name + "-" + $u.name) | @uri) ] | @tsv
-  ' "$STATE_FILE")"
+      $u.name, $u.uuid, $u.tuic_pass, (($n.name + "-" + $u.name) | @uri) ] | join("\u001f")
+  ' "$STATE_FILE")
 
-  chmod 600 "$out_file"
+  chmod 600 "$tmp" && mv -f "$tmp" "$out_file" || { rm -f "$tmp"; return 1; }
   return 0
 }
 
@@ -4332,7 +4224,7 @@ render_yaml() {
   fi
 
   local public_key short_id reality_sni tuic_sni server_ip
-  local type name port user uuid tuic_pass proxy_name
+  local type name port user uuid tuic_pass proxy_name out_dir tmp
   local -a names=()
   local q_server q_uuid q_pass q_rsni q_tsni q_pbk q_sid
 
@@ -4345,7 +4237,11 @@ render_yaml() {
   q_pbk="$(yaml_quote "$public_key")"
   q_sid="$(yaml_quote "$short_id")"
 
-  cat > "$out_file" <<YAML
+  out_dir="$(dirname "$out_file")"
+  mkdir -p "$out_dir" || return 1
+  tmp="$(mktemp "${out_dir}/.ysq-yaml.tmp.${WORK_TAG}.XXXXXX")" || return 1
+
+  cat > "$tmp" <<YAML
 mixed-port: 7890
 allow-lan: false
 mode: rule
@@ -4369,7 +4265,7 @@ YAML
 
   # 每个用户都有自己的 UUID / TUIC Password。同一个入口可以给多个用户生成独立订阅条目。
   # 第一个用户的节点名保持原样，兼容已有的 Clash 代理组引用。
-  while IFS=$'\t' read -r type name port user uuid tuic_pass proxy_name; do
+  while IFS=$'\x1f' read -r type name port user uuid tuic_pass proxy_name; do
     [ -n "$type" ] || continue
     names+=("$proxy_name")
     q_uuid="$(yaml_quote "$uuid")"
@@ -4392,7 +4288,7 @@ YAML
       public-key: ${q_pbk}
       short-id: ${q_sid}
 YAML
-      } >> "$out_file"
+      } >> "$tmp"
     elif [[ "$type" == tuic* ]]; then
       {
         printf '  - name: %s\n' "$(yaml_quote "$proxy_name")"
@@ -4409,20 +4305,20 @@ YAML
     congestion-controller: bbr
     udp-relay-mode: native
 YAML
-      } >> "$out_file"
+      } >> "$tmp"
     fi
-  done <<< "$(jq -r --arg selected "$selected_user" '
+  done < <(jq -r --arg selected "$selected_user" '
     . as $s |
     $s.nodes[]? as $n |
     ($s.users | map(select(.enabled != false)) | to_entries[] | select($selected == "" or .value.name == $selected)) as $u |
     [$n.type, $n.name, ($n.port | tostring), $u.value.name, $u.value.uuid, $u.value.tuic_pass,
-     (if $selected != "" or $u.key == 0 then $n.name else $n.name + "-" + $u.value.name end)] | @tsv
-  ' "$STATE_FILE")"
+     (if $selected != "" or $u.key == 0 then $n.name else $n.name + "-" + $u.value.name end)] | join("\u001f")
+  ' "$STATE_FILE")
 
   if [ "${#names[@]}" -eq 0 ]; then
-    sed -i 's/^proxies:$/proxies: []/' "$out_file"
+    sed -i 's/^proxies:$/proxies: []/' "$tmp"
   fi
-  cat >> "$out_file" <<YAML
+  cat >> "$tmp" <<YAML
 
 proxy-groups:
   - name: PROXY
@@ -4431,10 +4327,10 @@ proxy-groups:
 YAML
 
   for name in "${names[@]}"; do
-    printf '      - %s\n' "$(yaml_quote "$name")" >> "$out_file"
+    printf '      - %s\n' "$(yaml_quote "$name")" >> "$tmp"
   done
 
-  cat >> "$out_file" <<YAML
+  cat >> "$tmp" <<YAML
       - DIRECT
 
 rules:
@@ -4442,7 +4338,7 @@ rules:
   - MATCH,PROXY
 YAML
 
-  chmod 600 "$out_file"
+  chmod 600 "$tmp" && mv -f "$tmp" "$out_file" || { rm -f "$tmp"; return 1; }
   return 0
 }
 
@@ -4451,7 +4347,6 @@ render_all() {
   ensure_state_defaults || return 1
   ensure_tuic_cert || return 1
   if failover_configured; then
-    ensure_agent_python || return 1
     # Install all fallible helper assets before replacing the active core config.
     install_failover_bundle || return 1
   fi
@@ -4630,30 +4525,44 @@ show_yaml() {
 show_logs() {
   step "sing-box 运行日志"
 
-  local lines=100 out=""
+  local lines=100 out="" f latest_rot=""
+  local -a rotated=() log_files=()
 
+  while IFS= read -r f; do
+    [ -s "$f" ] && rotated+=("$f")
+  done < <(find "$CORE_LOG_DIR" -maxdepth 1 -type f -name 'sing-box.*.log' 2>/dev/null | LC_ALL=C sort)
+
+  if [ "${#rotated[@]}" -gt 0 ]; then
+    latest_rot="${rotated[$(( ${#rotated[@]} - 1 ))]}"
+    log_files+=("$latest_rot")
+  fi
   if [ -s "$LOG_FILE" ]; then
-    tail -n "$lines" "$LOG_FILE"
+    log_files+=("$LOG_FILE")
+  fi
+
+  if [ "${#log_files[@]}" -gt 0 ]; then
+    {
+      for f in "${log_files[@]}"; do
+        [ -r "$f" ] && cat "$f" 2>/dev/null || true
+      done
+    } | tail -n "$lines"
   else
-  case "$SERVICE_MANAGER" in
-    systemd)
-      out="$(journalctl -u sing-box -n "$lines" --no-pager 2>&1 || true)"
-      if [ -z "$out" ] || [[ "$out" == *"No entries"* ]]; then
-        warn "journal 里暂无 sing-box 日志。"
-      else
-        printf '%s\n' "$out"
-      fi
-      ;;
-    openrc|none)
-      if [ -s "$LOG_FILE" ]; then
-        echo "--- ${LOG_FILE} ---"
-        tail -n "$lines" "$LOG_FILE"
-      fi
-      ;;
-  esac
+    case "$SERVICE_MANAGER" in
+      systemd)
+        out="$(journalctl -u sing-box -n "$lines" --no-pager 2>&1 || true)"
+        if [ -z "$out" ] || [[ "$out" == *"No entries"* ]]; then
+          warn "暂无 sing-box 日志。"
+        else
+          printf '%s\n' "$out"
+        fi
+        ;;
+      *)
+        warn "暂无 sing-box 日志。"
+        ;;
+    esac
+  fi
 
   echo
-  fi
   local log_level
   log_level="$(jq -r '.log.level // "未知"' "$CONFIG_FILE" 2>/dev/null || true)"
   info "提示：当前日志级别为 ${log_level:-未知}"
@@ -4754,23 +4663,23 @@ do_uninstall() {
   service_stop
   service_disable
 
-  rm -f ${CORE_BIN_FILE}
-  rm -f "$GRPCURL_YSQ_BIN"
-  rm -f ${CORE_SYSTEMD_FILE}
-  rm -f ${CORE_OPENRC_FILE}
-  rm -f ${CORE_PID_FILE}
-  remove_log_trim
-  rm -f "$FAILOVER_FILE" "$FAILOVER_SYSTEMD_FILE" "$FAILOVER_OPENRC_FILE" "$FAILOVER_PID_FILE"
+  rm -f "$CORE_BIN_FILE"
+  rm -f "$SINGBOX_PLUS_BIN"
+  rm -f "$CORE_SYSTEMD_FILE"
+  rm -f "$CORE_OPENRC_FILE"
+  rm -f "$CORE_PID_FILE"
+  cleanup_legacy_log_trim
+  rm -f "$FAILOVER_SYSTEMD_FILE" "$FAILOVER_OPENRC_FILE" "$FAILOVER_PID_FILE"
   rm -rf "$(dirname "$FAILOVER_STATUS_FILE")"
-  rm -rf ${CORE_DATA_DIR} ${CORE_LOG_DIR}
+  rm -rf "$CORE_DATA_DIR" "$CORE_LOG_DIR"
   rm -f "$INFO_FILE" "$YAML_FILE" "$PANEL_FILE"
-  rm -f "$AGENT_FILE" "$AGENT_SYSTEMD_FILE" "$AGENT_OPENRC_FILE" "$AGENT_PID_FILE"
+  rm -f "${YSQ_TEST_ROOT}/usr/local/libexec/ysq-agent.py" "$AGENT_SYSTEMD_FILE" "$AGENT_OPENRC_FILE" "$AGENT_PID_FILE"
 
   if [ "$keep" = "1" ]; then
     # 配置目录里除状态文件外全部删除（config.json / 证书 / 临时文件）
     for p in "$CONFIG_DIR"/* "$CONFIG_DIR"/.[!.]*; do
-      [ -e "$p" ] || continue
-      [ "$p" = "$STATE_FILE" ] && continue
+      [ -e "$p" ] || [ -L "$p" ] || continue
+      [ "$p" != "$STATE_FILE" ] || continue
       rm -rf "$p"
     done
     chmod 600 "$STATE_FILE" 2>/dev/null || true
@@ -4795,7 +4704,7 @@ uninstall_all() {
   case "$mode" in
     1)
       confirm_or_cancel "确认彻底删除 sing-box 及全部节点数据？输入 y 确认: " || return $?
-      do_uninstall 0 || return $?
+      do_uninstall 0
       ok "已彻底删除。"
       ;;
     2)
@@ -4804,7 +4713,7 @@ uninstall_all() {
         return 1
       fi
       confirm_or_cancel "确认删除 sing-box 并保留节点数据？输入 y 确认: " || return $?
-      do_uninstall 1 || return $?
+      do_uninstall 1
       ok "已删除 sing-box，节点数据已保留：${STATE_FILE}"
       info "该文件含 UUID / Reality 私钥，请妥善保管（权限 600）。"
       info "重新安装：bash ${INSTALLER_FILE} [vless=端口 tuic=端口 -y]，会自动沿用该文件，不会覆盖。"
@@ -4832,6 +4741,7 @@ upgrade_action() {
   ensure_state_defaults || die "状态文件规范化失败，请检查 ${STATE_FILE}。"
   install_deps
   install_singbox
+  upgrade_singbox_plus_if_outdated
   ensure_dirs
   rerender_and_restart || die "升级后重启失败，已恢复旧配置。"
   # 从解压目录直接执行 upgrade 时，也将已验证成功的完整新脚本安装到快捷命令位置。
@@ -4843,6 +4753,7 @@ upgrade_action() {
     mv -f "$install_new" "$INSTALLER_FILE" || return 1
   fi
   install_panel_wrapper
+  release_config_lock
   restore_agent_if_configured
   ok "升级完成。"
 }
@@ -4901,6 +4812,7 @@ update_panel_wizard() {
     return "$CANCEL_RC"
   fi
 
+  flush_legacy_agent_if_needed
   state_write_guard || return $?
   # 先写同目录临时文件再 mv：原子替换；当前正在运行的旧脚本仍持有旧 inode，不会被改乱
   new_file="${INSTALLER_FILE}.new.$$"
@@ -5051,6 +4963,9 @@ validate_cli_ports() {
     if [ "$name" = "vless" ] && [ "$((10#$val))" -eq "$V2RAY_API_PORT" ]; then
       die "TCP ${V2RAY_API_PORT} 已留给 V2Ray API，请使用其他 VLESS 端口。"
     fi
+    if [ "$name" = "vless" ] && [ "$((10#$val))" -eq "$FAILOVER_API_PORT" ]; then
+      die "TCP ${FAILOVER_API_PORT} 已留给主备切换本机 API，请使用其他 VLESS 端口。"
+    fi
   done
 }
 
@@ -5113,6 +5028,7 @@ install_wizard() {
     install_panel_wrapper
     PANEL_READY=1
   fi
+  release_config_lock
   restore_agent_if_configured
   print_summary
 }
@@ -5122,250 +5038,13 @@ failover_configured() {
   jq -e '.nodes[]? | select(.outbound_type=="landing" and ((.backup_landing_id//"")!=""))' "$STATE_FILE" >/dev/null
 }
 
-write_failover_worker() {
-  cat <<'YSQ_FAILOVER_PY'
-#!/usr/bin/env python3
-# BEGIN_EMBEDDED_FAILOVER
-"""Keep the preferred landing selected, switching only after confirmed failures."""
-import concurrent.futures
-import contextlib
-import json
-import os
-from pathlib import Path
-import signal
-import socket
-import sys
-import tempfile
-import threading
-import time
-import urllib.error
-import urllib.parse
-import urllib.request
-
-INTERVAL = 10
-THRESHOLD = 2
-PROBE_TIMEOUT_MS = 4000
-PROBE_URLS = ("https://www.gstatic.com/generate_204", "https://cp.cloudflare.com/generate_204")
-
-
-class ControllerError(RuntimeError):
-    pass
-
-
-class ProbeFailed(RuntimeError):
-    pass
-
-
-class ProbeUnknown(RuntimeError):
-    pass
-
-
-class Monitor:
-    def __init__(self, config_path, status_path):
-        self.config_path, self.status_path = Path(config_path), Path(status_path)
-        self.counters = {}
-        self.fingerprint = None
-        self._config_stat = None
-        self._config = None
-        self._pool = None
-        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        self.base = ""
-        self.secret = ""
-        self.last_error = None
-
-    def close(self):
-        if self._pool is not None:
-            self._pool.shutdown(wait=True)
-            self._pool = None
-
-    def _load_config(self):
-        st = os.stat(self.config_path)
-        key = (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)
-        if key == self._config_stat and self._config is not None:
-            return self._config, False
-        config = json.loads(self.config_path.read_text(encoding="utf-8"))
-        fingerprint = json.dumps(config, sort_keys=True, separators=(",", ":"))
-        changed = fingerprint != self.fingerprint
-        self._config_stat = key
-        self._config = config
-        if changed:
-            self.fingerprint = fingerprint
-        return config, changed
-
-    def api(self, path, method="GET", payload=None, probe=False):
-        raw = None if payload is None else json.dumps(payload).encode()
-        request = urllib.request.Request(self.base + path, data=raw, method=method,
-                headers={"Authorization": "Bearer " + self.secret, "Content-Type": "application/json"})
-        try:
-            with self.opener.open(request, timeout=PROBE_TIMEOUT_MS / 1000 + 2) as response:
-                body = response.read(1024 * 1024 + 1)
-                if len(body) > 1024 * 1024:
-                    raise ControllerError("local controller response too large")
-                return json.loads(body) if body else {}
-        except urllib.error.HTTPError as exc:
-            if probe:
-                if exc.code in (503, 504):
-                    raise ProbeFailed("probe HTTP " + str(exc.code)) from None
-                if exc.code in (401, 403):
-                    raise ControllerError("local controller HTTP " + str(exc.code)) from None
-                raise ProbeUnknown("probe HTTP " + str(exc.code)) from None
-            raise ControllerError("local controller HTTP " + str(exc.code)) from None
-        except (TimeoutError, socket.timeout) as exc:
-            if probe:
-                raise ProbeFailed("probe timeout") from None
-            raise ControllerError("local controller unavailable: " + type(exc).__name__) from None
-        except urllib.error.URLError as exc:
-            if probe:
-                if isinstance(exc.reason, (TimeoutError, socket.timeout)):
-                    raise ProbeFailed("probe timeout") from None
-                raise ProbeUnknown("probe error: " + type(exc.reason).__name__) from None
-            raise ControllerError("local controller unavailable: " + type(exc).__name__) from None
-        except (OSError, ValueError) as exc:
-            if probe:
-                raise ProbeUnknown("probe error: " + type(exc).__name__) from None
-            raise ControllerError("local controller unavailable: " + type(exc).__name__) from None
-
-    def healthy(self, tag):
-        saw_failure = False
-        saw_unknown = False
-        for url in PROBE_URLS:
-            query = urllib.parse.urlencode({"url": url, "timeout": PROBE_TIMEOUT_MS})
-            try:
-                result = self.api("/proxies/" + urllib.parse.quote(tag, safe="") + "/delay?" + query, probe=True)
-            except ProbeFailed:
-                saw_failure = True
-                continue
-            except ProbeUnknown:
-                saw_unknown = True
-                continue
-            delay = result.get("delay") if isinstance(result, dict) else None
-            if isinstance(delay, (int, float)) and not isinstance(delay, bool) and delay > 0:
-                return True
-            saw_failure = True
-        if saw_unknown:
-            return None
-        if saw_failure:
-            return False
-        return False
-
-    def write_status(self, status):
-        path = self.status_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, name = tempfile.mkstemp(prefix=".status-", dir=str(path.parent))
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                json.dump(status, stream, ensure_ascii=False, separators=(",", ":"))
-            os.replace(name, path)
-        finally:
-            with contextlib.suppress(FileNotFoundError):
-                os.unlink(name)
-
-    def cycle(self):
-        config, config_changed = self._load_config()
-        selectors = [item for item in config.get("outbounds", [])
-                     if item.get("type") == "selector" and item.get("tag", "").startswith("failover-")]
-        if not selectors:
-            self.counters.clear()
-            self.write_status({"checked_at": int(time.time()), "groups": [], "error": ""})
-            return []
-        api = config.get("experimental", {}).get("clash_api", {})
-        controller = api.get("external_controller", "")
-        host, separator, port = controller.rpartition(":")
-        if not separator or host != "127.0.0.1" or not port.isdigit() or not api.get("secret"):
-            raise ControllerError("missing authenticated loopback controller")
-        self.base, self.secret = "http://" + controller, api["secret"]
-        if config_changed:
-            self.counters.clear()
-        # Read the core's current selection every time: restart/cache may change it.
-        current = self.api("/proxies/").get("proxies", {})
-        tags = set()
-        for selector in selectors:
-            members = selector.get("outbounds", [])
-            if len(members) != 2 or selector.get("default") not in members:
-                raise ControllerError("invalid failover selector")
-            tags.update(members)
-            if current.get(selector["tag"], {}).get("now") not in members:
-                raise ControllerError("selector unavailable in running core")
-        if self._pool is None:
-            self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
-        sorted_tags = sorted(tags)
-        health = dict(zip(sorted_tags, self._pool.map(self.healthy, sorted_tags)))
-        for tag, status in health.items():
-            old = self.counters.get(tag, {"good": 0, "bad": 0})
-            if status is True:
-                self.counters[tag] = {"good": min(THRESHOLD, old["good"] + 1), "bad": 0}
-            elif status is False:
-                self.counters[tag] = {"good": 0, "bad": min(THRESHOLD, old["bad"] + 1)}
-            else:
-                self.counters[tag] = old
-        groups = []
-        for selector in selectors:
-            tag, primary = selector["tag"], selector["default"]
-            backup = next(member for member in selector["outbounds"] if member != primary)
-            selected = current[tag]["now"]
-            desired = selected
-            if selected == primary and self.counters[primary]["bad"] >= THRESHOLD and health[backup] is True:
-                desired = backup
-            elif selected != primary and self.counters[primary]["good"] >= THRESHOLD:
-                desired = primary
-            if desired != selected:
-                self.api("/proxies/" + urllib.parse.quote(tag, safe=""), "PUT", {"name": desired})
-                print(time.strftime("%Y-%m-%d %H:%M:%S"), tag, selected, "->", desired, flush=True)
-                selected = desired
-            groups.append({"tag": tag, "primary": primary, "backup": backup, "selected": selected,
-                           "primary_ok": health[primary], "backup_ok": health[backup],
-                           "primary_failures": self.counters[primary]["bad"],
-                           "primary_successes": self.counters[primary]["good"],
-                           "all_down": health[primary] is False and health[backup] is False})
-        self.write_status({"checked_at": int(time.time()), "groups": groups, "error": ""})
-        return groups
-
-    def run(self, stop):
-        try:
-            while not stop.is_set():
-                started = time.monotonic()
-                try:
-                    self.cycle()
-                    self.last_error = None
-                except (OSError, ValueError, KeyError, ControllerError) as exc:
-                    error = str(exc)[:240]
-                    if self.last_error != error:
-                        print("failover:", error, file=sys.stderr, flush=True)
-                    self.last_error = error
-                    with contextlib.suppress(OSError):
-                        self.write_status({"checked_at": int(time.time()), "groups": [], "error": error})
-                stop.wait(max(1, INTERVAL - (time.monotonic() - started)))
-        finally:
-            self.close()
-
-
-def main():
-    if len(sys.argv) != 3:
-        return 2
-    stop = threading.Event()
-    signal.signal(signal.SIGTERM, lambda *_: stop.set())
-    signal.signal(signal.SIGINT, lambda *_: stop.set())
-    Monitor(sys.argv[1], sys.argv[2]).run(stop)
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
-# END_EMBEDDED_FAILOVER
-YSQ_FAILOVER_PY
-}
-
 install_failover_bundle() {
-  local wd py
-  wd="$(new_work_dir)"
-  py="$(command -v python3)"
-  mkdir -p "$(dirname "$FAILOVER_FILE")" "$(dirname "$FAILOVER_STATUS_FILE")" || return 1
+  local wd
+  ensure_singbox_plus || return 1
+  wd="$(new_work_dir)" || return 1
+  mkdir -p "$(dirname "$FAILOVER_STATUS_FILE")" || return 1
   chmod 700 "$(dirname "$FAILOVER_STATUS_FILE")" || return 1
-  write_failover_worker > "$wd/worker" || return 1
-  python3 -c 'import sys; compile(open(sys.argv[1],encoding="utf-8").read(),sys.argv[1],"exec")' "$wd/worker" || return 1
-  if ! install_if_changed "$wd/worker" "$FAILOVER_FILE" 700; then
-    [ -s "$FAILOVER_FILE" ] && cmp -s "$wd/worker" "$FAILOVER_FILE" || return 1
-  fi
+  rm -f "${YSQ_TEST_ROOT}/usr/local/libexec/ysq-failover.py"
   case "$SERVICE_MANAGER" in
     systemd)
       cat > "$wd/unit" <<EOF
@@ -5377,7 +5056,7 @@ Wants=network-online.target
 Type=simple
 User=root
 UMask=0077
-ExecStart=${py} ${FAILOVER_FILE} ${CONFIG_FILE} ${FAILOVER_STATUS_FILE}
+ExecStart=${SINGBOX_PLUS_BIN} failover --config ${CONFIG_FILE} --status ${FAILOVER_STATUS_FILE}
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=15s
@@ -5395,8 +5074,8 @@ EOF
       cat > "$wd/unit" <<EOF
 #!/sbin/openrc-run
 description="YSQ preferred landing failover monitor"
-command="${py}"
-command_args="${FAILOVER_FILE} ${CONFIG_FILE} ${FAILOVER_STATUS_FILE}"
+command="${SINGBOX_PLUS_BIN}"
+command_args="failover --config ${CONFIG_FILE} --status ${FAILOVER_STATUS_FILE}"
 command_background="yes"
 pidfile="${FAILOVER_PID_FILE}"
 output_log="/dev/null"
@@ -5423,20 +5102,28 @@ stop_failover_service() {
     openrc) rc-service ysq-failover stop >/dev/null 2>&1 || true; rc-update del ysq-failover default >/dev/null 2>&1 || true ;;
     none)
       if [ -f "$FAILOVER_PID_FILE" ]; then
-        local pid
-        pid="$(cat "$FAILOVER_PID_FILE")"
+        local pid cmdline=""
+        pid="$(cat "$FAILOVER_PID_FILE" 2>/dev/null || true)"
         case "$pid" in
           ''|*[!0-9]*) ;;
           *)
             # A stale pid file must not stop an unrelated process after PID reuse.
-            if [ -r "/proc/${pid}/cmdline" ] && tr '\0' ' ' < "/proc/${pid}/cmdline" | grep -Fq "$FAILOVER_FILE"; then
+            if [ -r "/proc/${pid}/cmdline" ]; then
+              cmdline="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null || true)"
+            fi
+            if { [[ "$cmdline" == *"$SINGBOX_PLUS_BIN"* ]] && [[ "$cmdline" == *failover* ]]; } \
+                || [[ "$cmdline" == *ysq-failover.py* ]]; then
               kill "$pid" 2>/dev/null || true
               for _ in $(seq 1 15); do
                 kill -0 "$pid" 2>/dev/null || break
                 sleep 1
               done
-              if [ -r "/proc/${pid}/cmdline" ] && tr '\0' ' ' < "/proc/${pid}/cmdline" | grep -Fq "$FAILOVER_FILE"; then
-                kill -9 "$pid" 2>/dev/null || true
+              if [ -r "/proc/${pid}/cmdline" ]; then
+                cmdline="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null || true)"
+                if { [[ "$cmdline" == *"$SINGBOX_PLUS_BIN"* ]] && [[ "$cmdline" == *failover* ]]; } \
+                    || [[ "$cmdline" == *ysq-failover.py* ]]; then
+                  kill -9 "$pid" 2>/dev/null || true
+                fi
               fi
             fi
             ;;
@@ -5458,7 +5145,11 @@ sync_failover_service() {
     openrc) rc-update add ysq-failover default >/dev/null 2>&1; rc-service ysq-failover restart 9>&- ;;
     none)
       stop_failover_service
-      nohup python3 "$FAILOVER_FILE" "$CONFIG_FILE" "$FAILOVER_STATUS_FILE" 9>&- >/dev/null 2>&1 &
+      ensure_singbox_plus || return 1
+      mkdir -p "$(dirname "$FAILOVER_STATUS_FILE")" || return 1
+      chmod 700 "$(dirname "$FAILOVER_STATUS_FILE")" || return 1
+      mkdir -p "$(dirname "$FAILOVER_PID_FILE")" || return 1
+      nohup "$SINGBOX_PLUS_BIN" failover --config "$CONFIG_FILE" --status "$FAILOVER_STATUS_FILE" </dev/null 9>&- >/dev/null 2>&1 &
       echo $! > "$FAILOVER_PID_FILE"
       ;;
     test) ;;
@@ -5466,7 +5157,7 @@ sync_failover_service() {
 }
 
 # -------------------------
-# 可选中控：基础单机模式不依赖 Python；主备切换或中控功能按需安装 Python。
+# 可选中控：全节点零 Python 依赖（单机与中控托管模式均由 singbox-plus 提供）。
 # -------------------------
 config_lock_package() {
   if [ "$PKG_MANAGER" = "apk" ]; then printf '%s\n' flock; else printf '%s\n' util-linux; fi
@@ -5479,7 +5170,10 @@ ensure_config_lock_tool() {
     local package
     package="$(config_lock_package)"
     info "安装跨进程配置锁依赖 ${package}..." >&2
-    pkg_install "$package" >&2 || { err "配置锁依赖安装失败：${package}。"; return 1; }
+    if ! pkg_install "$package" >&2; then
+      pkg_update >&2 || true
+      pkg_install "$package" >&2 || { err "配置锁依赖安装失败：${package}。"; return 1; }
+    fi
   fi
   command -v flock >/dev/null 2>&1 || { err "未找到 flock，请安装配置锁依赖后重试。"; return 1; }
 }
@@ -5530,6 +5224,12 @@ acquire_config_lock() {
   done
 }
 
+release_config_lock() {
+  exec 9>&- 2>/dev/null || true
+  unset YSQ_CONFIG_LOCK_FD YSQ_CONFIG_LOCK_PATH
+  YSQ_ACTION_WRITE_LOCKED=0
+}
+
 agent_binding_present() {
   if [ -s "$AGENT_CONFIG_FILE" ] && jq -e '
       (.detached != true) and
@@ -5550,1888 +5250,16 @@ require_local_user_management() {
 
 flush_agent_traffic() {
   [ "${YSQ_SKIP_AGENT_FLUSH:-0}" != "1" ] || return 0
-  [ -s "$AGENT_CONFIG_FILE" ] && [ -f "$AGENT_FILE" ] || return 0
-  command -v python3 >/dev/null 2>&1 || return 0
-  if ! python3 -c '
-import subprocess, sys
-try:
-    result = subprocess.run([sys.executable, sys.argv[1], "--config", sys.argv[2], "sample-once"],
-                            timeout=8, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                            close_fds=True)
-    raise SystemExit(result.returncode)
-except (OSError, subprocess.TimeoutExpired):
-    raise SystemExit(1)
-' "$AGENT_FILE" "$AGENT_CONFIG_FILE"; then
+  [ -s "$AGENT_CONFIG_FILE" ] && [ -x "$SINGBOX_PLUS_BIN" ] || return 0
+  if ! "$SINGBOX_PLUS_BIN" agent --config "$AGENT_CONFIG_FILE" --timeout 8s sample-once 9>&- >/dev/null 2>&1; then
     warn "停止前流量采样未成功，继续服务操作；最后一个采样间隔可能存在统计缺口。"
   fi
   return 0
 }
 
-write_embedded_agent() {
-  cat <<'YSQ_AGENT_PY'
-# BEGIN_EMBEDDED_AGENT
-#!/usr/bin/env python3
-"""YSQ node agent. Python 3.9+, standard library only.
-
-Configuration and the SQLite ledger are private local files.  The collector never
-resets sing-box counters.  HTTPS delivery is at-least-once; the center commits a
-batch before acknowledging its persistent (node, ledger epoch, sequence) key.
-"""
-from __future__ import annotations
-
-import argparse
-import contextlib
-import fcntl
-import datetime
-import hashlib
-import http.client
-import ipaddress
-import json
-import os
-import pathlib
-import re
-import secrets
-import signal
-import shutil
-import socket
-import sqlite3
-import ssl
-import subprocess
-import sys
-import tempfile
-import threading
-import time
-import urllib.error
-import urllib.parse
-import urllib.request
-import uuid
-
-VERSION = "2026.11.26"
-PROTOCOL = 1
-SAMPLE_SECONDS = 10
-SYNC_SECONDS = 15
-WAIT_SECONDS = 20
-BATCH_SECONDS = SYNC_SECONDS
-MAX_BODY = 2 * 1024 * 1024
-MAX_SQLITE_INT = (1 << 63) - 1
-USER_ID_RE = re.compile(r"u_[0-9a-f]{32}\Z")
-NODE_ID_RE = re.compile(r"n_[0-9a-f]{32}\Z")
-NAME_RE = re.compile(r"[A-Za-z0-9]{1,32}\Z")
-PASSWORD_RE = re.compile(r"[A-Za-z0-9_-]{6,128}\Z")
-STAT_RE = re.compile(r"user>>>([^>]+)>>>traffic>>>(uplink|downlink)\Z")
-PROTO = '''syntax = "proto3";
-package v2ray.core.app.stats.command;
-message Stat { string name = 1; int64 value = 2; }
-message QueryStatsRequest { string pattern = 1; bool reset = 2; repeated string patterns = 3; bool regexp = 4; }
-message QueryStatsResponse { repeated Stat stat = 1; }
-service StatsService { rpc QueryStats(QueryStatsRequest) returns (QueryStatsResponse); }
-'''
-
-
-def system_path(path):
-    root = os.environ.get("YSQ_TEST_ROOT", "")
-    return str(pathlib.Path(root) / path.lstrip("/")) if root else path
-
-
-DEFAULT_CONFIG = system_path("/etc/ysq-agent/config.json")
-DEFAULT_DB = system_path("/var/lib/ysq-agent/agent.db")
-DEFAULT_SCRIPT = system_path("/root/install-singbox-ysq.sh")
-DEFAULT_STATE = system_path("/etc/sing-box/ysq-state.db")
-DEFAULT_GRPCURL = system_path("/usr/local/libexec/ysq-grpcurl")
-DEFAULT_LOG_TRIM_LOCK = system_path("/run/ysq-log-trim.lock")
-
-
-class AgentError(Exception):
-    pass
-
-
-class CollectorError(AgentError):
-    pass
-
-
-class LockBusy(AgentError):
-    pass
-
-
-class TransportError(AgentError):
-    def __init__(self, message, status=None):
-        super().__init__(message)
-        self.status = status
-
-
-def canonical(value):
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-
-
-def integer(value, label, minimum=0, maximum=MAX_SQLITE_INT):
-    if type(value) is not int or value < minimum or value > maximum:
-        raise AgentError("Invalid integer: " + label)
-    return value
-
-
-def private_parent(path):
-    parent = pathlib.Path(path).parent
-    parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if parent.is_symlink():
-        raise AgentError("Private data directory must not be a symlink")
-    return parent
-
-
-def atomic_json(path, value):
-    parent = private_parent(path)
-    fd, temp = tempfile.mkstemp(prefix=".ysq-", suffix=".tmp", dir=str(parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            os.fchmod(stream.fileno(), 0o600)
-            stream.write(canonical(value) + "\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temp, path)
-        directory = os.open(str(parent), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    finally:
-        if os.path.exists(temp):
-            os.unlink(temp)
-
-
-def read_json(path, limit=MAX_BODY * 4):
-    with open(path, "rb") as stream:
-        data = stream.read(limit + 1)
-    if len(data) > limit:
-        raise AgentError("Local JSON file is too large")
-    result = json.loads(data)
-    if not isinstance(result, dict):
-        raise AgentError("Expected a JSON object")
-    return result
-
-
-@contextlib.contextmanager
-def file_lock(path, timeout=1.0):
-    private_parent(path)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
-    os.fchmod(fd, 0o600)
-    deadline = time.monotonic() + timeout
-    try:
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    raise LockBusy("Another agent operation holds the local lock")
-                time.sleep(0.05)
-        yield
-    finally:
-        os.close(fd)
-
-
-def redact(message, config=None):
-    text = str(message)
-    cfg = config or {}
-    secret_values = [cfg.get("node_token", "")]
-    pending = cfg.get("registration_payload", {})
-    secret_values.append(pending.get("join_code", ""))
-    users = pending.get("users", []) + cfg.get("_redact_users", [])
-    if cfg.get("state_path"):
-        try:
-            state = read_json(cfg["state_path"])
-            users = users + state.get("users", [])
-            secret_values.extend(state.get(key, "") for key in ("uuid", "private_key", "short_id", "tuic_pass"))
-            for landing in state.get("landings", []):
-                if isinstance(landing, dict):
-                    secret_values.extend(landing.get(key, "") for key in
-                                         ("uuid", "password", "private_key", "short_id"))
-        except (OSError, ValueError, AgentError):
-            pass
-    for user in users:
-        if isinstance(user, dict):
-            secret_values.extend([user.get("uuid", ""), user.get("tuic_pass", "")])
-    for value in sorted(set(str(v) for v in secret_values if v), key=len, reverse=True):
-        text = text.replace(value, "[redacted]")
-    text = re.sub(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", "[uuid]", text)
-    text = re.sub(r"(?i)bearer\s+\S+", "Bearer [redacted]", text)
-    text = " ".join(text.split())
-    return text[-900:]
-
-
-def log(message, config=None):
-    print(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + " " + redact(message, config),
-          file=sys.stderr, flush=True)
-
-
-def validate_origin(value, allow_loopback_http=False):
-    if not isinstance(value, str) or any(c.isspace() for c in value):
-        raise AgentError("Center URL must be an HTTPS origin")
-    parsed = urllib.parse.urlsplit(value)
-    try:
-        parsed.port
-    except ValueError as exc:
-        raise AgentError("Invalid center port") from exc
-    if (not parsed.hostname or parsed.username is not None or parsed.password is not None
-            or parsed.query or parsed.fragment or parsed.path not in ("", "/")):
-        raise AgentError("Use only the center origin, for example https://panel.eulmo.com")
-    if parsed.scheme != "https":
-        loopback = parsed.hostname.lower() == "localhost"
-        try:
-            loopback = loopback or ipaddress.ip_address(parsed.hostname).is_loopback
-        except ValueError:
-            pass
-        if not (allow_loopback_http and parsed.scheme == "http" and loopback):
-            raise AgentError("Production connections require HTTPS with certificate verification")
-    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
-
-
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise urllib.error.HTTPError(req.full_url, code, "Agent refuses HTTP redirects", headers, fp)
-
-
-class Transport:
-    def __init__(self, origin, token=None, allow_loopback_http=False, timeout=12):
-        self.origin = validate_origin(origin, allow_loopback_http)
-        self.token = token
-        self.timeout = timeout
-        self.opener = urllib.request.build_opener(
-            urllib.request.ProxyHandler({}),
-            urllib.request.HTTPSHandler(context=ssl.create_default_context()), NoRedirect())
-
-    def post(self, path, body, authenticated=True):
-        if path not in ("/api/agent/register", "/api/agent/sync", "/api/agent/detach", "/api/agent/wait", "/api/agent/activity"):
-            raise AgentError("Unsupported agent endpoint")
-        data = canonical(body).encode("utf-8")
-        if len(data) > MAX_BODY:
-            raise AgentError("Agent request exceeds 2 MiB")
-        headers = {"Content-Type": "application/json", "Accept": "application/json",
-                   "User-Agent": "ysq-agent/" + VERSION}
-        if authenticated:
-            if not self.token:
-                raise AgentError("No node credential is configured")
-            headers["Authorization"] = "Bearer " + self.token
-        request = urllib.request.Request(self.origin + path, data=data, headers=headers, method="POST")
-        try:
-            with self.opener.open(request, timeout=self.timeout) as response:
-                data = response.read(MAX_BODY + 1)
-        except urllib.error.HTTPError as exc:
-            if 300 <= exc.code < 400:
-                raise TransportError("Center redirected the request; redirects are refused", exc.code) from exc
-            try:
-                detail = json.loads(exc.read(4096)).get("error", "Request rejected")
-            except (ValueError, AttributeError):
-                detail = "Request rejected"
-            raise TransportError("Center HTTP %d: %s" % (exc.code, detail), exc.code) from exc
-        except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError) as exc:
-            raise TransportError("HTTPS request failed: " + str(exc)) from exc
-        if len(data) > MAX_BODY:
-            raise TransportError("Center response exceeds 2 MiB")
-        try:
-            result = json.loads(data)
-        except ValueError as exc:
-            raise TransportError("Center did not return valid JSON") from exc
-        if not isinstance(result, dict) or result.get("protocol") != PROTOCOL:
-            raise TransportError("Unsupported center response protocol")
-        return result
-
-
-def run_process(args, timeout, config=None, termination_grace=5):
-    """Run a fixed local command; timeout also terminates all of its children."""
-    with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
-        process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=out, stderr=err,
-                                   start_new_session=True, close_fds=True)
-        try:
-            process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired as exc:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGTERM)
-            try:
-                process.wait(timeout=termination_grace)
-            except subprocess.TimeoutExpired:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(process.pid, signal.SIGKILL)
-                process.wait(timeout=1)
-            # A shell can exit before a descendant; finish cleaning its group.
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGKILL)
-            raise AgentError("Local helper timed out; its process group was terminated; "
-                             "configuration must be checked on the next sync") from exc
-        out.seek(0)
-        output = out.read(MAX_BODY + 1)
-        err.seek(0, os.SEEK_END)
-        size = err.tell()
-        err.seek(max(0, size - 8192))
-        errors = err.read().decode("utf-8", "replace")
-    if process.returncode != 0:
-        raise AgentError("Local command failed (%d): %s" % (process.returncode, redact(errors, config)))
-    if len(output) > MAX_BODY:
-        raise AgentError("Local helper output exceeds 2 MiB")
-    return output
-
-
-def helper(config, action, extra=(), timeout=120):
-    if action not in ("agent-inventory", "agent-apply", "agent-detach"):
-        raise AgentError("Unsupported local helper action")
-    script = config.get("script_path", DEFAULT_SCRIPT)
-    if not os.path.isabs(script) or not os.path.isfile(script):
-        raise AgentError("Installer helper path is missing or is not absolute")
-    return run_process(["bash", script, action] + list(extra), timeout, config)
-
-
-def validated_users(users, snapshots=False):
-    if not isinstance(users, list) or len(users) > 20000:
-        raise AgentError("Invalid user list")
-    names, ids, credentials, result = set(), set(), set(), []
-    for user in users:
-        if not isinstance(user, dict):
-            raise AgentError("Invalid user record")
-        name, credential, password = user.get("name"), user.get("uuid"), user.get("tuic_pass")
-        if not isinstance(name, str) or not NAME_RE.fullmatch(name):
-            raise AgentError("Invalid user name")
-        if not isinstance(credential, str):
-            raise AgentError("Invalid user UUID")
-        try:
-            normalized = str(uuid.UUID(credential))
-        except (ValueError, AttributeError) as exc:
-            raise AgentError("Invalid user UUID") from exc
-        if credential.lower() != normalized:
-            raise AgentError("User UUID must use the canonical UUID format")
-        if not isinstance(password, str) or not PASSWORD_RE.fullmatch(password):
-            raise AgentError("Invalid TUIC credential")
-        if name in names or normalized in credentials:
-            raise AgentError("Duplicate name or UUID in node users")
-        names.add(name)
-        credentials.add(normalized)
-        item = {"name": name, "uuid": normalized, "tuic_pass": password}
-        if snapshots:
-            identity = user.get("id")
-            if not isinstance(identity, str) or not USER_ID_RE.fullmatch(identity) or identity in ids:
-                raise AgentError("Invalid or duplicate global user ID")
-            if type(user.get("enabled")) is not bool:
-                raise AgentError("User enabled flag must be a boolean")
-            ids.add(identity)
-            item.update(id=identity, enabled=user["enabled"])
-        result.append(item)
-    return result
-
-
-def fingerprint(users):
-    normalized = validated_users(users)
-    normalized.sort(key=lambda item: (item["name"], item["uuid"]))
-    return hashlib.sha256(canonical(normalized).encode("utf-8")).hexdigest()
-
-
-class Ledger:
-    def __init__(self, path):
-        self.path = str(path)
-        private_parent(self.path)
-        if os.path.islink(self.path):
-            raise AgentError("Ledger must not be a symlink")
-        fd = os.open(self.path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
-        try:
-            os.fchmod(fd, 0o600)
-        finally:
-            os.close(fd)
-        with self.connect() as db:
-            db.executescript('''
-              CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-              CREATE TABLE IF NOT EXISTS aliases (
-                stats_key TEXT PRIMARY KEY, user_id TEXT NOT NULL, baseline_required INTEGER NOT NULL);
-              CREATE TABLE IF NOT EXISTS baselines (
-                stats_key TEXT PRIMARY KEY, core_epoch TEXT NOT NULL,
-                up INTEGER NOT NULL, down INTEGER NOT NULL, ts INTEGER NOT NULL);
-              CREATE TABLE IF NOT EXISTS usage (
-                user_id TEXT PRIMARY KEY, up INTEGER NOT NULL CHECK(typeof(up)='integer' AND up>=0),
-                down INTEGER NOT NULL CHECK(typeof(down)='integer' AND down>=0), last_at INTEGER NOT NULL);
-              CREATE TABLE IF NOT EXISTS pending_usage (
-                user_id TEXT NOT NULL, ts INTEGER NOT NULL,
-                up INTEGER NOT NULL CHECK(typeof(up)='integer' AND up>=0),
-                down INTEGER NOT NULL CHECK(typeof(down)='integer' AND down>=0),
-                PRIMARY KEY(user_id, ts));
-              CREATE TABLE IF NOT EXISTS outbox (
-                epoch TEXT NOT NULL, seq INTEGER NOT NULL, payload TEXT NOT NULL, created_at INTEGER NOT NULL,
-                PRIMARY KEY(epoch, seq));
-            ''')
-            db.execute("INSERT OR IGNORE INTO meta VALUES ('epoch', ?)", (canonical(str(uuid.uuid4())),))
-            db.execute("INSERT OR IGNORE INTO meta VALUES ('next_seq', '1')")
-            db.execute("INSERT OR IGNORE INTO meta VALUES ('applied_revision', '0')")
-            db.execute("INSERT OR IGNORE INTO meta VALUES ('last_packaged_at', '0')")
-        os.chmod(self.path, 0o600)
-
-    def connect(self):
-        return database_connection(self.path)
-
-    @staticmethod
-    def get(db, key, default=None):
-        row = db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
-        return json.loads(row[0]) if row else default
-
-    @staticmethod
-    def put(db, key, value):
-        db.execute("INSERT INTO meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                   (key, canonical(value)))
-
-    def meta(self, key, default=None):
-        with self.connect() as db:
-            return self.get(db, key, default)
-
-    def set_meta(self, **values):
-        with self.connect() as db:
-            for key, value in values.items():
-                self.put(db, key, value)
-
-    def remember(self, entries):
-        with self.connect() as db:
-            for stats_key, user_id, baseline_required in entries:
-                old = db.execute("SELECT user_id FROM aliases WHERE stats_key=?", (stats_key,)).fetchone()
-                if old and old[0] != user_id:
-                    raise AgentError("A statistics alias belongs to another user; manual reconciliation is required")
-                db.execute("INSERT OR IGNORE INTO aliases VALUES (?,?,?)",
-                           (stats_key, user_id, int(baseline_required)))
-
-    def aliases(self):
-        with self.connect() as db:
-            return [dict(row) for row in db.execute("SELECT * FROM aliases")]
-
-    def record(self, core_epoch, counters, sampled_at):
-        with self.connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            rows = db.execute("SELECT * FROM aliases").fetchall()
-            added_up = added_down = 0
-            for alias in rows:
-                key = alias["stats_key"]
-                counter = counters.get(key, {})
-                old = db.execute("SELECT * FROM baselines WHERE stats_key=?", (key,)).fetchone()
-                up, down = counter.get("uplink", 0), counter.get("downlink", 0)
-                integer(up, "upload counter")
-                integer(down, "download counter")
-                if old and old["core_epoch"] == core_epoch:
-                    if up < old["up"] or down < old["down"]:
-                        raise CollectorError("Counter disappeared or moved backwards without a core restart; "
-                                             "baseline preserved; check other reset=true collectors")
-                    delta_up, delta_down = up - old["up"], down - old["down"]
-                elif old:
-                    delta_up, delta_down = up, down
-                elif alias["baseline_required"]:
-                    delta_up, delta_down = 0, 0
-                else:
-                    delta_up, delta_down = up, down
-                db.execute("INSERT INTO baselines VALUES (?,?,?,?,?) ON CONFLICT(stats_key) DO UPDATE SET "
-                           "core_epoch=excluded.core_epoch,up=excluded.up,down=excluded.down,ts=excluded.ts",
-                           (key, core_epoch, up, down, sampled_at))
-                if delta_up or delta_down:
-                    db.execute("INSERT INTO usage VALUES (?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET "
-                               "up=usage.up+excluded.up,down=usage.down+excluded.down,last_at=excluded.last_at",
-                               (alias["user_id"], delta_up, delta_down, sampled_at))
-                    bucket = sampled_at // BATCH_SECONDS * BATCH_SECONDS
-                    db.execute("INSERT INTO pending_usage VALUES (?,?,?,?) ON CONFLICT(user_id,ts) DO UPDATE SET "
-                               "up=pending_usage.up+excluded.up,down=pending_usage.down+excluded.down",
-                               (alias["user_id"], bucket, delta_up, delta_down))
-                    added_up += delta_up
-                    added_down += delta_down
-            self.put(db, "last_sample_at", sampled_at)
-            self.put(db, "collector_error", "")
-            self.put(db, "core_epoch", core_epoch)
-            self.put(db, "service_running", True)
-        return {"sampled_at": sampled_at, "up": added_up, "down": added_down}
-
-    def package(self, now=None, force=False):
-        now = int(time.time()) if now is None else int(now)
-        with self.connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            if not force and now - self.get(db, "last_packaged_at", 0) < BATCH_SECONDS:
-                return 0
-            count = 0
-            # Bound each batch and each packaging transaction; older rows remain durable.
-            for unused in range(16):
-                rows = [dict(row) for row in db.execute(
-                    "SELECT user_id,ts,up,down FROM pending_usage ORDER BY ts,user_id LIMIT 1000")]
-                if not rows:
-                    break
-                epoch = self.get(db, "epoch")
-                seq = integer(self.get(db, "next_seq"), "batch sequence", 1)
-                batch = {"epoch": epoch, "seq": seq, "rows": rows}
-                db.execute("INSERT INTO outbox VALUES (?,?,?,?)", (epoch, seq, canonical(batch), now))
-                db.executemany("DELETE FROM pending_usage WHERE user_id=? AND ts=?",
-                               [(row["user_id"], row["ts"]) for row in rows])
-                self.put(db, "next_seq", seq + 1)
-                count += 1
-            self.put(db, "last_packaged_at", now)
-            return count
-
-    def batches(self):
-        with self.connect() as db:
-            result, size = [], 0
-            for row in db.execute("SELECT payload FROM outbox ORDER BY created_at,seq LIMIT 16"):
-                payload = row[0]
-                size += len(payload.encode("utf-8")) + 1
-                if size > MAX_BODY - 16384:
-                    break
-                result.append(json.loads(payload))
-            return result
-
-    def acknowledge(self, acknowledgements, sent):
-        if not isinstance(acknowledgements, list):
-            raise TransportError("Center acknowledgement is not a list")
-        allowed = {(batch["epoch"], batch["seq"]) for batch in sent}
-        accepted = set()
-        for ack in acknowledgements:
-            if not isinstance(ack, dict) or not isinstance(ack.get("epoch"), str):
-                raise TransportError("Invalid center acknowledgement")
-            key = (ack["epoch"], integer(ack.get("seq"), "ack sequence", 1))
-            if key not in allowed:
-                raise TransportError("Center acknowledged a batch that was not sent")
-            accepted.add(key)
-        with self.connect() as db:
-            db.executemany("DELETE FROM outbox WHERE epoch=? AND seq=?", list(accepted))
-        return len(accepted)
-
-    def summary(self):
-        with self.connect() as db:
-            usage = [dict(row) for row in db.execute("SELECT user_id,up,down,last_at FROM usage ORDER BY user_id")]
-            return {"ledger_epoch": self.get(db, "epoch"), "applied_revision": self.get(db, "applied_revision", 0),
-                    "last_sample_at": self.get(db, "last_sample_at"),
-                    "last_sync_at": self.get(db, "last_sync_at"),
-                    "collector_error": self.get(db, "collector_error", ""),
-                    "apply_error": self.get(db, "apply_error", ""),
-                    "sync_error": self.get(db, "sync_error", ""),
-                    "pending_batches": db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0],
-                    "unpackaged_rows": db.execute("SELECT COUNT(*) FROM pending_usage").fetchone()[0],
-                    "usage": usage}
-
-
-@contextlib.contextmanager
-def database_connection(path):
-    db = sqlite3.connect(path, timeout=4.0)
-    db.row_factory = sqlite3.Row
-    try:
-        db.execute("PRAGMA journal_mode=WAL")
-        db.execute("PRAGMA synchronous=FULL")
-        db.execute("PRAGMA busy_timeout=4000")
-        yield db
-        db.commit()
-    except BaseException:
-        db.rollback()
-        raise
-    finally:
-        db.close()
-
-
-_CORE_CACHE_LOCK = threading.Lock()
-_CORE_CACHE = {"config": None, "pid": None, "epoch": None, "hits": 0}
-
-
-def _probe_pid(proc, boot, pid_str, core_config):
-    entry = proc / pid_str
-    try:
-        command = (entry / "cmdline").read_bytes().split(b"\0")
-        args = [part.decode("utf-8", "replace") for part in command if part]
-        if not args or pathlib.Path(args[0]).name != "sing-box" or "run" not in args:
-            return None
-        configured = any(args[index] in ("-c", "--config") and index + 1 < len(args)
-                         and args[index + 1] == core_config for index in range(len(args)))
-        if not configured:
-            return None
-        raw = (entry / "stat").read_text()
-        fields = raw[raw.rfind(")") + 2:].split()
-        if fields[0] == "Z":
-            return None
-        starttime = fields[19]  # field 22; fields starts at Linux stat field 3.
-        return boot + ":" + pid_str + ":" + starttime
-    except (OSError, IndexError):
-        return None
-
-
-def probe_core(config, verify_only=False):
-    """Identify the configured Linux sing-box process without shell helper locks."""
-    proc = pathlib.Path("/proc")
-    try:
-        boot = (proc / "sys/kernel/random/boot_id").read_text().strip()
-    except OSError as exc:
-        raise CollectorError("Cannot read Linux boot identity") from exc
-    core_config = str(pathlib.Path(config.get("state_path", DEFAULT_STATE)).parent / "config.json")
-    with _CORE_CACHE_LOCK:
-        cached = dict(_CORE_CACHE)
-    if (cached["config"] == core_config and cached["pid"] and cached["epoch"]
-            and (verify_only or cached["hits"] < 10)):
-        epoch = _probe_pid(proc, boot, cached["pid"], core_config)
-        if epoch == cached["epoch"]:
-            if not verify_only:
-                with _CORE_CACHE_LOCK:
-                    if (_CORE_CACHE["config"] == core_config and _CORE_CACHE["pid"] == cached["pid"]
-                            and _CORE_CACHE["epoch"] == cached["epoch"]):
-                        _CORE_CACHE["hits"] += 1
-            return epoch
-    candidates = []
-    for entry in proc.iterdir():
-        if not entry.name.isdigit():
-            continue
-        epoch = _probe_pid(proc, boot, entry.name, core_config)
-        if epoch:
-            candidates.append((entry.name, epoch))
-    if not candidates:
-        with _CORE_CACHE_LOCK:
-            if _CORE_CACHE["config"] == core_config:
-                _CORE_CACHE.update(config=None, pid=None, epoch=None, hits=0)
-        raise CollectorError("sing-box is not running with the expected configuration")
-    if len(candidates) != 1:
-        with _CORE_CACHE_LOCK:
-            if _CORE_CACHE["config"] == core_config:
-                _CORE_CACHE.update(config=None, pid=None, epoch=None, hits=0)
-        raise CollectorError("Multiple sing-box processes use the expected configuration")
-    pid_str, epoch = candidates[0]
-    with _CORE_CACHE_LOCK:
-        _CORE_CACHE.update(config=core_config, pid=pid_str, epoch=epoch, hits=0)
-    return epoch
-
-
-def _ensure_stats_proto(directory):
-    proto_path = pathlib.Path(directory) / "stats.proto"
-    expected = PROTO.encode("utf-8")
-    if proto_path.is_symlink():
-        raise CollectorError("stats.proto must not be a symlink")
-    try:
-        if proto_path.read_bytes() == expected:
-            return proto_path
-    except OSError:
-        pass
-    fd, temp = tempfile.mkstemp(prefix=".stats-", suffix=".proto.tmp", dir=str(directory))
-    try:
-        with os.fdopen(fd, "wb") as stream:
-            os.fchmod(stream.fileno(), 0o600)
-            stream.write(expected)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temp, proto_path)
-    finally:
-        with contextlib.suppress(FileNotFoundError):
-            os.unlink(temp)
-    return proto_path
-
-
-def collect_counters(config):
-    command = config.get("grpcurl_path", DEFAULT_GRPCURL)
-    if not os.path.isabs(command) or not os.access(command, os.X_OK):
-        raise CollectorError("grpcurl is not installed; repair the node agent installation")
-    directory = private_parent(config["db_path"])
-    _ensure_stats_proto(directory)
-    output = run_process([command, "-plaintext", "-max-time", "3", "-import-path", str(directory),
-                          "-proto", "stats.proto", "-d", '{"reset":false}',
-                          "127.0.0.1:41453",
-                          "v2ray.core.app.stats.command.StatsService/QueryStats"], 4, config,
-                         termination_grace=0.5)
-    try:
-        response = json.loads(output)
-    except ValueError as exc:
-        raise CollectorError("Stats API returned invalid JSON") from exc
-    if not isinstance(response, dict) or not isinstance(response.get("stat", []), list):
-        raise CollectorError("Stats API returned an invalid counter list")
-    result, seen = {}, set()
-    for stat in response.get("stat", []):
-        if not isinstance(stat, dict) or not isinstance(stat.get("name"), str):
-            raise CollectorError("Stats API returned an invalid counter")
-        match = STAT_RE.fullmatch(stat["name"])
-        if not match:
-            continue
-        key, direction = match.groups()
-        if stat["name"] in seen:
-            raise CollectorError("Stats API returned a duplicate counter")
-        seen.add(stat["name"])
-        value = stat.get("value", 0)
-        if isinstance(value, str) and re.fullmatch(r"[0-9]+", value):
-            value = int(value)
-        integer(value, "statistics byte counter")
-        result.setdefault(key, {})[direction] = value
-    return result
-
-
-class ActivityCollector:
-    """Bounded durable log queue, independent of the byte-accounting ledger.
-
-    Cursor, connection context and parsed events commit in one transaction. File
-    truncation is detected by inode AND a cursor anchor (copytruncate keeps inode).
-    Raw copytruncate can still race a core write; every trim is reported as a gap.
-    """
-    MAX_PENDING = 20000
-    MAX_QUEUE_BYTES = 16 * 1024 * 1024
-    MAX_RAW_BYTES = 9 * 1024 * 1024
-    KEEP_RAW_BYTES = 2 * 1024 * 1024
-    READ_BYTES = 256 * 1024
-    LINE = re.compile(r"\b(INFO|WARN|ERROR|FATAL)\s+(?:\[(\d+)\s+[^\]]*\]\s+)?(.*)")
-    INBOUND = re.compile(r"inbound/([^\s:]+)\[([^\]]+)\]:\s*(.*)")
-    SOURCE = re.compile(r"inbound (?:packet )?connection from (\S+)")
-    TARGET = re.compile(r"\[([^\]]+)\]\s+inbound (packet )?connection to (\S+)")
-    ANSI = re.compile(r"\x1b\[[0-9;]*m")
-
-    def __init__(self, config_path):
-        self.config_path = str(config_path)
-        self._lock = threading.Lock()
-        self._collected_at = 0
-        self._cursor = None
-        self._last_idle_stat = None
-        self._last_expiry_at = None
-        self._has_error = False
-        self._tx_enqueued = False
-        self._config_cache = None
-        self._core_log_cache = None
-        self._aliases_cache = None
-        config = self._read_config()
-        # A new enrollment/center receives a fresh activity queue. The byte
-        # ledger intentionally survives detach, whereas activity must not cross it.
-        scope = str(config.get("node_id") or "pending") + "@" + config["center_url"]
-        suffix = hashlib.sha256(scope.encode()).hexdigest()[:12]
-        self.path = config["db_path"] + ".activity-" + suffix + ".db"
-        private_parent(self.path)
-        with self.connect() as db:
-            db.execute("PRAGMA auto_vacuum=INCREMENTAL")
-            db.execute("PRAGMA journal_mode=WAL")
-            db.executescript('''
-                CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS pending(id TEXT PRIMARY KEY,ts INTEGER NOT NULL,payload TEXT NOT NULL,bytes INTEGER NOT NULL);
-                CREATE INDEX IF NOT EXISTS pending_time ON pending(ts);
-                CREATE INDEX IF NOT EXISTS pending_size ON pending(bytes);
-                CREATE TABLE IF NOT EXISTS seen(id TEXT PRIMARY KEY,ts INTEGER NOT NULL);
-                CREATE TABLE IF NOT EXISTS contexts(id TEXT PRIMARY KEY,ts INTEGER NOT NULL,value TEXT NOT NULL);
-            ''')
-        os.chmod(self.path, 0o600)
-
-    @staticmethod
-    def _file_stat(path):
-        try:
-            st = os.stat(path)
-            return (st.st_ino, st.st_mtime_ns, st.st_size)
-        except OSError:
-            return None
-
-    def _log_lock_path(self, log_path):
-        if log_path == system_path("/var/log/sing-box/sing-box.log"):
-            return DEFAULT_LOG_TRIM_LOCK
-        return self.path + ".read.lock"
-
-    def _read_config(self):
-        key = self._file_stat(self.config_path)
-        with self._lock:
-            cache = self._config_cache
-        if key is not None and cache is not None and cache[0] == key:
-            return cache[1]
-        with open(self.config_path, "rb") as stream:
-            st = os.fstat(stream.fileno())
-            data = stream.read(MAX_BODY * 4 + 1)
-        if len(data) > MAX_BODY * 4:
-            raise AgentError("Local JSON file is too large")
-        result = json.loads(data)
-        if not isinstance(result, dict):
-            raise AgentError("Expected a JSON object")
-        actual_key = (st.st_ino, st.st_mtime_ns, st.st_size)
-        with self._lock:
-            self._config_cache = (actual_key, result)
-        return result
-
-    def _check_core_log_config(self, core_path, log_path):
-        if not os.path.isfile(core_path):
-            with self._lock:
-                self._core_log_cache = None
-            return
-        key = self._file_stat(core_path)
-        if key is None:
-            with self._lock:
-                self._core_log_cache = None
-            return
-        with self._lock:
-            cache = self._core_log_cache
-        if cache is not None and cache[0] == (core_path, key):
-            log_config = cache[1]
-        else:
-            with open(core_path, "rb") as stream:
-                st = os.fstat(stream.fileno())
-                data = stream.read(MAX_BODY * 4 + 1)
-            if len(data) > MAX_BODY * 4:
-                raise AgentError("Local JSON file is too large")
-            parsed = json.loads(data)
-            if not isinstance(parsed, dict):
-                raise AgentError("Expected a JSON object")
-            log_config = parsed.get("log", {})
-            actual_key = (st.st_ino, st.st_mtime_ns, st.st_size)
-            with self._lock:
-                self._core_log_cache = ((core_path, actual_key), log_config)
-        if (log_config.get("disabled") or log_config.get("level", "info") not in ("info", "debug", "trace")
-                or log_config.get("output") != log_path or log_config.get("timestamp") is not True):
-            raise AgentError("行为日志未启用：请升级 VPS 脚本，使用 info 文件日志并开启 timestamp")
-
-    @contextlib.contextmanager
-    def connect(self):
-        db = sqlite3.connect(self.path, timeout=3, isolation_level=None)
-        db.row_factory = sqlite3.Row
-        db.execute("PRAGMA synchronous=FULL")
-        db.execute("PRAGMA busy_timeout=3000")
-        # The queue has a 16 MiB payload budget; this also bounds ancillary pages.
-        db.execute("PRAGMA max_page_count=12288")
-        try:
-            yield db
-        finally:
-            db.close()
-
-    @contextlib.contextmanager
-    def transaction(self):
-        with self.connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            try:
-                yield db
-                db.execute("COMMIT")
-            except BaseException:
-                db.execute("ROLLBACK")
-                raise
-
-    @staticmethod
-    def endpoint(value):
-        host, port = value, 0
-        try:
-            host, raw_port = value.rsplit(":", 1)
-            port = int(raw_port)
-            if not 0 <= port <= 65535:
-                raise ValueError()
-        except ValueError:
-            return value[:512], 0
-        return host.strip("[]")[:512], port
-
-    @staticmethod
-    def timestamp(line, fallback):
-        match = re.search(r"([+-]\d{4})\s+(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)", line)
-        if match:
-            try:
-                return int(datetime.datetime.strptime(match[2] + match[1], "%Y-%m-%d %H:%M:%S%z").timestamp())
-            except ValueError:
-                pass
-        return fallback
-
-    def aliases(self, config):
-        state_path = config.get("state_path", DEFAULT_STATE)
-        db_path = config["db_path"]
-        key = (
-            self.config_path, self._file_stat(self.config_path),
-            state_path, self._file_stat(state_path),
-            db_path, self._file_stat(db_path),
-            self._file_stat(db_path + "-wal"),
-        )
-        with self._lock:
-            cache = self._aliases_cache
-        if cache is not None and cache[0] == key:
-            return cache[1]
-        aliases = {}
-        # Legacy names remain resolvable across a managed credential adoption.
-        with database_connection(db_path) as db:
-            aliases.update((row["stats_key"], row["user_id"]) for row in db.execute("SELECT stats_key,user_id FROM aliases"))
-        state = read_json(state_path)
-        imported = config.get("registration_aliases", {})
-        for name, uid in imported.items():
-            if isinstance(uid, str) and USER_ID_RE.fullmatch(uid):
-                aliases[name] = uid
-        managed_here = state.get("management", {}).get("node_id") == config.get("node_id")
-        for user in state.get("users", []):
-            uid = str(user.get("id", "") if managed_here else imported.get(user.get("name"), ""))
-            if USER_ID_RE.fullmatch(uid):
-                aliases[uid] = uid
-                aliases[user.get("stats_key") or user.get("name")] = uid
-        with self._lock:
-            self._aliases_cache = (key, aliases)
-        return aliases
-
-    def enqueue(self, db, event):
-        # One malformed log field must not poison an otherwise valid upload batch.
-        for key, limit in (("source_ip", 64), ("target", 512), ("inbound", 100), ("message", 500)):
-            if key in event:
-                event[key] = re.sub(r"[\x00-\x1f\x7f]", " ", str(event[key])).strip()[:limit]
-        payload = canonical(event)
-        if db.execute("INSERT OR IGNORE INTO seen VALUES(?,?)", (event["id"], event["ts"])).rowcount:
-            if db.execute("INSERT OR IGNORE INTO pending VALUES(?,?,?,?)", (event["id"], event["ts"], payload, len(payload.encode("utf-8")))).rowcount:
-                self._tx_enqueued = True
-
-    def gap(self, db, reason, ts):
-        Ledger.put(db, "gaps", Ledger.get(db, "gaps", 0) + 1)
-        event = {"id": uuid.uuid4().hex + uuid.uuid4().hex, "ts": ts, "user_id": None,
-                 "kind": "gap", "message": reason}
-        self.enqueue(db, event)
-
-    def parse(self, db, raw, session, aliases, fallback, logical_offset=None):
-        line = self.ANSI.sub("", raw.decode("utf-8", "replace")).strip()
-        match = self.LINE.search(line)
-        if not match:
-            return
-        level, cid, message = match.groups()
-        ts = self.timestamp(line, fallback)
-        if ts < 1577836800 or ts > int(time.time()) + 300:
-            return
-        context_id = session + ":" + str(cid) if cid else None
-        row = db.execute("SELECT value FROM contexts WHERE id=?", (context_id,)).fetchone() if context_id else None
-        context = json.loads(row[0]) if row else {}
-        inbound = self.INBOUND.search(message)
-        if inbound:
-            context["inbound"] = inbound[2][:100]
-        source = self.SOURCE.search(message)
-        if source:
-            # A reused connection ID starts a NEW authentication context. Never
-            # attach an early handshake failure to that ID's previous user.
-            context = {"source_ip": self.endpoint(source[1])[0][:64]}
-            if inbound:
-                context["inbound"] = inbound[2][:100]
-        target = self.TARGET.search(message)
-        event = None
-        if target and inbound:
-            context.update(user_id=aliases.get(target[1]), target=self.endpoint(target[3])[0],
-                           port=self.endpoint(target[3])[1], network="udp" if target[2] else "tcp")
-            event = dict(context, kind="connection")
-        elif level in ("ERROR", "FATAL"):
-            # Only a previously authenticated context can attribute an error.
-            # Never guess a user from source IP or an unauthenticated scan.
-            event = dict(context, kind="error", message=" ".join(message.split())[:500])
-        if context_id and context:
-            db.execute("INSERT INTO contexts VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET ts=excluded.ts,value=excluded.value",
-                       (context_id, ts, canonical(context)))
-        if event:
-            event_key = f"{session}:{logical_offset}:{line}" if logical_offset is not None else (session + line)
-            event.update(id=hashlib.sha256(event_key.encode()).hexdigest(), ts=ts)
-            self.enqueue(db, event)
-
-    def enforce_capacity(self, db, ts):
-        dropped = 0
-        count, size = db.execute("SELECT COUNT(*),COALESCE(SUM(bytes),0) FROM pending").fetchone()
-        if count > self.MAX_PENDING or size > self.MAX_QUEUE_BYTES:
-            for row in db.execute("SELECT id,bytes FROM pending ORDER BY ts,rowid").fetchall():
-                if count <= self.MAX_PENDING - 1 and size <= self.MAX_QUEUE_BYTES - 2048:
-                    break
-                db.execute("DELETE FROM pending WHERE id=?", (row["id"],))
-                dropped += 1
-                count -= 1
-                size -= row["bytes"]
-        if dropped:
-            Ledger.put(db, "dropped", Ledger.get(db, "dropped", 0) + dropped)
-            self.gap(db, "本地行为缓存达到容量或 7 天期限，丢弃 %d 条记录" % dropped, ts)
-
-    def cleanup_expired(self, db, ts):
-        # Expired/offline data cannot fill the disk indefinitely. Make the loss
-        # explicit in status as well as a gap event; byte accounting is separate.
-        dropped = db.execute("DELETE FROM pending WHERE ts<?", (ts - 7 * 86400,)).rowcount
-        if dropped:
-            Ledger.put(db, "dropped", Ledger.get(db, "dropped", 0) + dropped)
-            self.gap(db, "本地行为缓存达到容量或 7 天期限，丢弃 %d 条记录" % dropped, ts)
-        db.execute("DELETE FROM seen WHERE rowid IN (SELECT rowid FROM seen ORDER BY rowid DESC LIMIT -1 OFFSET 40000)")
-        db.execute("DELETE FROM contexts WHERE ts<?", (ts - 900,))
-        db.execute("DELETE FROM contexts WHERE rowid IN (SELECT rowid FROM contexts ORDER BY ts DESC LIMIT -1 OFFSET 4000)")
-
-    def bound_queue(self, db, ts):
-        self.cleanup_expired(db, ts)
-        self.enforce_capacity(db, ts)
-
-    def collect_once(self):
-        config = self._read_config()
-        if config.get("detached") or config.get("detaching") or config.get("status") != "active":
-            return False
-        path = config.get("activity_log_path", system_path("/var/log/sing-box/sing-box.log"))
-        ts = int(time.time())
-        core_path = config.get("activity_core_config_path", system_path("/etc/sing-box/config.json"))
-        self._check_core_log_config(core_path, path)
-        try:
-            pre_stat = os.stat(path)
-        except OSError:
-            with self._lock:
-                self._last_idle_stat = None
-            raise
-        pre_identity = [pre_stat.st_dev, pre_stat.st_ino, path]
-        pre_idle_stat = (pre_stat.st_dev, pre_stat.st_ino, pre_stat.st_size, pre_stat.st_mtime_ns)
-        with self._lock:
-            cached_cursor = dict(self._cursor) if self._cursor is not None else None
-            last_idle = self._last_idle_stat
-            has_error = self._has_error
-        if (cached_cursor
-                and cached_cursor.get("identity") == pre_identity
-                and pre_stat.st_size == cached_cursor.get("offset")
-                and pre_idle_stat == last_idle
-                and not has_error
-                and pre_stat.st_size < self.MAX_RAW_BYTES):
-            with self._lock:
-                self._collected_at = max(self._collected_at, ts)
-            return False
-        with file_lock(self._log_lock_path(path), timeout=0.2):
-            with open(path, "rb") as stream:
-                stat = os.fstat(stream.fileno())
-                identity = [stat.st_dev, stat.st_ino, path]
-                with self._lock:
-                    cursor = dict(self._cursor) if self._cursor is not None else None
-                    has_error = self._has_error
-                if cursor is None:
-                    with self.connect() as db:
-                        cursor = Ledger.get(db, "cursor", {})
-                        db_error = Ledger.get(db, "error", "")
-                        db_collected = Ledger.get(db, "collected_at", 0)
-                    has_error = bool(db_error)
-                    with self._lock:
-                        self._cursor = dict(cursor) if cursor else {}
-                        self._has_error = has_error
-                        self._collected_at = max(self._collected_at, db_collected)
-                offset = cursor.get("offset", 0)
-                logical_base = cursor.get("logical_base", 0)
-                same_file = cursor.get("identity") == identity
-                session = cursor.get("session") if same_file and cursor.get("session") else uuid.uuid4().hex
-                changed = bool(cursor) and (not same_file or stat.st_size < offset)
-                if same_file and not changed and offset:
-                    stream.seek(max(0, offset - 128))
-                    changed = hashlib.sha256(stream.read(min(offset, 128))).hexdigest() != cursor.get("anchor")
-                read_offset = 0 if (not cursor or not same_file or changed) else offset
-                stream.seek(read_offset)
-                block = stream.read(self.READ_BYTES)
-                # Offset only crosses complete lines, except a malformed >64 KiB
-                # line which is explicitly skipped and cannot stall the reader.
-                complete = block.rfind(b"\n") + 1
-                oversized_partial = False
-                if not complete and len(block) >= 65536:
-                    complete = len(block)
-                    oversized_partial = True
-                caught_up = (read_offset + complete) >= stat.st_size
-                if bool(cursor) and same_file and not changed and complete == 0 and not has_error:
-                    with self._lock:
-                        self._collected_at = max(self._collected_at, ts)
-                        if offset == stat.st_size:
-                            self._last_idle_stat = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
-                        else:
-                            self._last_idle_stat = None
-                else:
-                    aliases = self.aliases(config)
-                    self._tx_enqueued = False
-                    with self.transaction() as db:
-                        if not cursor or not same_file or changed:
-                            offset = 0
-                            logical_base = 0
-                            if not same_file:
-                                session = uuid.uuid4().hex
-                            if cursor:
-                                self.gap(db, "原始日志被裁剪、替换或轮转，已重新续读", ts)
-                        if oversized_partial:
-                            self.gap(db, "跳过超长或损坏的日志行", ts)
-                        else:
-                            pos = offset
-                            for raw_with_nl in block[:complete].splitlines(keepends=True):
-                                raw = raw_with_nl.rstrip(b"\r\n")
-                                logical_offset = logical_base + pos
-                                pos += len(raw_with_nl)
-                                if len(raw) <= 65536:
-                                    self.parse(db, raw, session, aliases, ts, logical_offset=logical_offset)
-                                else:
-                                    self.gap(db, "跳过超长或损坏的日志行", ts)
-                        offset += complete
-                        stream.seek(max(0, offset - 128))
-                        anchor = hashlib.sha256(stream.read(min(offset, 128))).hexdigest()
-                        new_cursor = {
-                            "identity": identity,
-                            "session": session,
-                            "offset": offset,
-                            "logical_base": logical_base,
-                            "anchor": anchor,
-                        }
-                        Ledger.put(db, "cursor", new_cursor)
-                        Ledger.put(db, "collected_at", ts)
-                        Ledger.put(db, "error", "")
-                        now_mono = time.monotonic()
-                        if self._last_expiry_at is None or now_mono - self._last_expiry_at >= 60:
-                            self.cleanup_expired(db, ts)
-                            self._last_expiry_at = now_mono
-                        if self._tx_enqueued:
-                            self.enforce_capacity(db, ts)
-                        caught_up = offset >= stat.st_size
-                    with self._lock:
-                        self._cursor = new_cursor
-                        self._collected_at = max(self._collected_at, ts)
-                        self._has_error = False
-                        if caught_up:
-                            self._last_idle_stat = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
-                        else:
-                            self._last_idle_stat = None
-            # Parsed records are durable before raw bytes are discarded. The
-            # writer can race copytruncate; disclose this conservative gap.
-            unread_after_trim = False
-            if caught_up and stat.st_size >= self.MAX_RAW_BYTES:
-                unread_after_trim = self.trim(path, identity, offset, logical_base, session)
-        return (not caught_up and complete > 0) or bool(unread_after_trim)
-
-    def trim(self, path, identity, committed_offset=None, logical_base=0, session=None):
-        with open(path, "r+b") as stream:
-            stat = os.fstat(stream.fileno())
-            if [stat.st_dev, stat.st_ino, path] != identity or stat.st_size < self.MAX_RAW_BYTES:
-                return False
-            if committed_offset is None:
-                committed_offset = stat.st_size
-            if committed_offset > stat.st_size:
-                return False
-            desired_cut = max(0, committed_offset - self.KEEP_RAW_BYTES)
-            if desired_cut == 0:
-                cut_start = 0
-            else:
-                stream.seek(desired_cut)
-                head_slice = stream.read(committed_offset - desired_cut)
-                nl = head_slice.find(b"\n")
-                cut_start = desired_cut + nl + 1 if nl != -1 else committed_offset
-            if cut_start <= 0:
-                return False
-            stream.seek(cut_start)
-            tail = stream.read()
-            new_offset = committed_offset - cut_start
-            if len(tail) < new_offset:
-                return False
-            # Persist a gap BEFORE copytruncate, including across a process crash.
-            now_ts = int(time.time())
-            with self.transaction() as db:
-                self.gap(db, "原始日志达到 9 MiB，已保留最近 2 MiB；裁剪瞬间可能存在缺口", now_ts)
-                self.enforce_capacity(db, now_ts)
-            stream.seek(0)
-            stream.write(tail)
-            stream.truncate(len(tail))
-            stream.flush()
-            os.fsync(stream.fileno())
-            post_stat = os.fstat(stream.fileno())
-            new_logical_base = logical_base + cut_start
-            anchor_slice = tail[max(0, new_offset - 128):new_offset]
-            new_anchor = hashlib.sha256(anchor_slice).hexdigest()
-            if session is None:
-                with self.connect() as db:
-                    old_cursor = Ledger.get(db, "cursor", {})
-                    session = old_cursor.get("session") or uuid.uuid4().hex
-            new_cursor = {
-                "identity": identity,
-                "session": session,
-                "offset": new_offset,
-                "logical_base": new_logical_base,
-                "anchor": new_anchor,
-            }
-            with self.transaction() as db:
-                Ledger.put(db, "cursor", new_cursor)
-            with self._lock:
-                self._cursor = new_cursor
-                if len(tail) == new_offset and post_stat.st_size == new_offset:
-                    self._last_idle_stat = (post_stat.st_dev, post_stat.st_ino, post_stat.st_size, post_stat.st_mtime_ns)
-                    return False
-                self._last_idle_stat = None
-                return True
-
-    def set_error(self, error):
-        with self.transaction() as db:
-            Ledger.put(db, "error", " ".join(str(error).split())[:1000])
-        with self._lock:
-            self._has_error = True
-            self._last_idle_stat = None
-
-    def status(self):
-        with self._lock:
-            mem_collected_at = self._collected_at
-        with self.connect() as db:
-            result = {"pending": db.execute("SELECT COUNT(*) FROM pending").fetchone()[0],
-                      **{key: Ledger.get(db, key, "" if key == "error" else 0)
-                         for key in ("collected_at", "dropped", "gaps", "error")}}
-        result["collected_at"] = max(result["collected_at"] or 0, mem_collected_at)
-        return result
-
-    def upload_once(self, transport=None, allow_loopback_http=False):
-        config = self._read_config()
-        if config.get("detached") or config.get("detaching") or config.get("status") != "active":
-            return 0
-        with self.connect() as db:
-            events = [json.loads(row[0]) for row in db.execute("SELECT payload FROM pending ORDER BY ts,rowid LIMIT 400")]
-        transport = transport or Transport(config["center_url"], config.get("node_token"), allow_loopback_http)
-        response = transport.post("/api/agent/activity", {"protocol": PROTOCOL, "node_id": config["node_id"],
-                                                        "events": events, "status": self.status()})
-        ack = response.get("ack")
-        sent = {event["id"] for event in events}
-        if not isinstance(ack, list) or any(not isinstance(eid, str) or eid not in sent for eid in ack):
-            raise TransportError("Invalid activity acknowledgement")
-        if ack:
-            with self.transaction() as db:
-                db.executemany("DELETE FROM pending WHERE id=?", ((eid,) for eid in ack))
-            with self.connect() as db:
-                db.execute("PRAGMA incremental_vacuum(128)")
-        return len(ack)
-
-
-class Agent:
-    def __init__(self, config_path, allow_loopback_http=False, transport=None,
-                 collector=None, core_probe=None, helper_runner=None):
-        self.config_path = str(config_path)
-        self.config = read_json(self.config_path)
-        if self.config.get("protocol", PROTOCOL) != PROTOCOL:
-            raise AgentError("Unsupported local agent protocol")
-        self.allow_loopback_http = allow_loopback_http
-        validate_origin(self.config["center_url"], allow_loopback_http)
-        self.ledger = Ledger(self.config["db_path"])
-        self.transport_override = transport
-        self.collector = collector or collect_counters
-        self.core_probe = core_probe or probe_core
-        self.helper_runner = helper_runner or helper
-        self._synced_inbounds_hash = None
-
-    def reload(self):
-        fresh = read_json(self.config_path)
-        if fresh.get("db_path") != self.config.get("db_path"):
-            raise AgentError("Agent configuration changed to another ledger; restart the service")
-        self.config = fresh
-        return fresh
-
-    def save(self):
-        atomic_json(self.config_path, self.config)
-
-    def transport(self, timeout=12):
-        return self.transport_override or Transport(self.config["center_url"], self.config.get("node_token"),
-                                                     self.allow_loopback_http, timeout=timeout)
-
-    def state(self):
-        return read_json(self.config.get("state_path", DEFAULT_STATE))
-
-    def subscription_inbounds(self):
-        state = self.state()
-        result = []
-        for node in state.get("nodes", []):
-            kind = str(node.get("type", ""))
-            item = {key: node.get(key, "") for key in ("name", "tag", "type", "port")}
-            item.update(server=state.get("server_ip", ""),
-                        sni=state.get("tuic_sni" if kind.startswith("tuic") else "reality_sni", ""),
-                        public_key=state.get("public_key", ""), short_id=state.get("short_id", ""),
-                        skip_cert_verify=kind.startswith("tuic"))
-            result.append(item)
-        return result
-
-    def is_running(self):
-        try:
-            self.core_probe(self.config)
-            return True
-        except (AgentError, OSError):
-            return False
-
-    def remember_state(self, state):
-        aliases = []
-        known = {item["stats_key"] for item in self.ledger.aliases()}
-        for user in state.get("users", []):
-            if not isinstance(user, dict) or not USER_ID_RE.fullmatch(str(user.get("id", ""))):
-                continue
-            key = user.get("stats_key") or user.get("name")
-            if isinstance(key, str) and key and ">" not in key and key not in known:
-                aliases.append((key, user["id"], True))
-        self.ledger.remember(aliases)
-
-    def sample_once(self, allow_detaching=False):
-        with file_lock(self.ledger.path + ".sample.lock", timeout=0.5):
-            self.reload()
-            if self.config.get("detached") or (self.config.get("detaching") and not allow_detaching):
-                return {"skipped": "detached_or_detaching"}
-            if not self.config.get("node_id") or self.config.get("status") in ("registering", "pending"):
-                return {"skipped": "waiting_for_first_sync"}
-            if (not self.ledger.meta("applied_revision", 0)
-                    and not self.ledger.meta("adoption_prepared", False)):
-                return {"skipped": "waiting_for_first_sync"}
-            try:
-                self.remember_state(self.state())
-                if not self.ledger.aliases():
-                    return {"skipped": "waiting_for_first_sync"}
-                before = self.core_probe(self.config)
-                counters = self.collector(self.config)
-                after = (probe_core(self.config, verify_only=True)
-                         if self.core_probe is probe_core else self.core_probe(self.config))
-                if before != after:
-                    raise CollectorError("sing-box restarted during collection; sample was not committed")
-                return self.ledger.record(before, counters, int(time.time()))
-            except (AgentError, OSError, ValueError, sqlite3.Error) as exc:
-                message = redact(exc, self.config)
-                try:
-                    self.ledger.set_meta(collector_error=message, service_running=self.is_running())
-                except sqlite3.Error as disk_error:
-                    raise AgentError("Ledger write failed; counters were not acknowledged or discarded: "
-                                     + str(disk_error)) from exc
-                raise CollectorError(message) from exc
-
-    def register(self):
-        self.reload()
-        if self.config.get("node_id"):
-            return {"node_id": self.config["node_id"], "status": self.config.get("status", "pending")}
-        payload = self.config.get("registration_payload")
-        if not payload:
-            raise AgentError("No pending registration exists")
-        response = self.transport().post("/api/agent/register", payload, authenticated=False)
-        if (not NODE_ID_RE.fullmatch(str(response.get("node_id", "")))
-                or response.get("status") not in ("pending", "active")):
-            raise TransportError("Invalid registration response")
-        imported = response.get("imported", [])
-        if not isinstance(imported, list):
-            raise TransportError("Invalid imported user mappings")
-        registration_users = {user["name"] for user in payload.get("users", [])}
-        aliases = {}
-        for item in imported:
-            if (not isinstance(item, dict) or item.get("old_name") not in registration_users
-                    or not USER_ID_RE.fullmatch(str(item.get("id", "")))):
-                raise TransportError("Invalid imported user mapping")
-            if item["old_name"] in aliases and aliases[item["old_name"]] != item["id"]:
-                raise TransportError("Ambiguous imported user mapping")
-            aliases[item["old_name"]] = item["id"]
-        self.config.update(node_id=response["node_id"], status=response["status"], registered_at=int(time.time()))
-        self.config["registration_aliases"] = aliases
-        self.config.pop("registration_payload", None)
-        self.save()
-        return {"node_id": self.config["node_id"], "status": self.config["status"]}
-
-    def prepare_desired(self, desired):
-        if not isinstance(desired, dict) or desired.get("node_id") != self.config.get("node_id"):
-            raise AgentError("Desired configuration belongs to another node")
-        revision = integer(desired.get("revision"), "desired revision", 1)
-        users = validated_users(desired.get("users"), snapshots=True)
-        current_revision = self.ledger.meta("applied_revision", 0)
-        if revision < current_revision:
-            raise AgentError("Center offered an older configuration revision")
-        state = self.state()
-        management = state.get("management", {})
-        applied_on_disk = management.get("revision")
-        applying_on_disk = management.get("applying_revision")
-        known_revisions = [value for value in (applied_on_disk, applying_on_disk)
-                           if type(value) is int and value >= 1]
-        managed_on_this_node = (management.get("mode") == "managed"
-                                and management.get("node_id") == self.config.get("node_id")
-                                and bool(known_revisions))
-        if managed_on_this_node:
-            # A crash can happen after the helper replaced the local state but
-            # before the ledger recorded its acknowledgement. The center may
-            # already offer a newer revision; the first-registration fingerprint
-            # no longer describes this local state. Trust its stable IDs after
-            # checking the locally managed snapshot and monotonic revision.
-            validated_users(state.get("users", []), snapshots=True)
-            if revision < max(known_revisions):
-                raise AgentError("Center offered a revision older than the locally managed state")
-        if (current_revision == 0 and not managed_on_this_node
-                and self.config.get("registration_fingerprint")):
-            if fingerprint(state.get("users", [])) != self.config["registration_fingerprint"]:
-                raise AgentError("Local users changed after registration, before initial center sync. "
-                                 "Review local users and reconnect")
-        by_uuid = {user["uuid"]: user["id"] for user in users}
-        desired_ids = {user["id"] for user in users}
-        imported_aliases = self.config.get("registration_aliases", {})
-        aliases = []
-        for local in state.get("users", []):
-            old_key = local.get("stats_key") or local.get("name")
-            identity = local.get("id") if (current_revision or managed_on_this_node) else None
-            if not USER_ID_RE.fullmatch(str(identity or "")):
-                # An existing central account may have different credentials.
-                # The registration response links the original local name to
-                # its central identity before the first desired snapshot.
-                identity = imported_aliases.get(local.get("name"))
-                if identity not in desired_ids:
-                    identity = by_uuid.get(str(local.get("uuid", "")).lower())
-            if identity and isinstance(old_key, str) and old_key:
-                aliases.append((old_key, identity, True))
-        current_keys = {user.get("stats_key") or user.get("name") for user in state.get("users", [])}
-        aliases.extend((user["id"], user["id"], user["id"] in current_keys) for user in users)
-        with file_lock(self.ledger.path + ".sample.lock", timeout=8):
-            self.ledger.remember(aliases)
-            self.ledger.set_meta(adoption_prepared=True)
-        return {"node_id": desired["node_id"], "revision": revision, "users": users}
-
-    def apply_desired(self, desired):
-        payload = self.prepare_desired(desired)
-        if payload["revision"] == self.ledger.meta("applied_revision", 0):
-            return False
-        directory = private_parent(self.ledger.path)
-        fd, path = tempfile.mkstemp(prefix=".desired-", suffix=".json", dir=str(directory))
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                os.fchmod(stream.fileno(), 0o600)
-                stream.write(canonical(payload))
-                stream.flush()
-                os.fsync(stream.fileno())
-            helper_config = dict(self.config, _redact_users=payload["users"])
-            self.helper_runner(helper_config, "agent-apply", (path,), 120)
-            management = self.state().get("management", {})
-            if (management.get("mode") != "managed" or management.get("node_id") != payload["node_id"]
-                    or management.get("revision") != payload["revision"] or not self.is_running()):
-                raise AgentError("Helper did not confirm the requested revision and a healthy core")
-            self.ledger.set_meta(applied_revision=payload["revision"], apply_error="", last_apply_at=int(time.time()))
-            return True
-        finally:
-            with contextlib.suppress(FileNotFoundError):
-                os.unlink(path)
-
-    def sync_once(self, force_package=False, apply=True):
-        with file_lock(self.config_path + ".sync.lock", timeout=1):
-            self.reload()
-            if self.config.get("detached") or self.config.get("detaching"):
-                raise AgentError("Node is detached or detaching")
-            if self.config.get("remote_detached"):
-                return self._detach_local()
-            return self._sync(force_package=force_package, apply=apply)
-
-    def wait_changes(self, detach=True):
-        """Wait without holding the sync lock, so metrics and application continue."""
-        self.reload()
-        if self.config.get("detached"):
-            return {"status": "detached", "changed": False}
-        if self.config.get("remote_detached"):
-            return self.detach_from_center() if detach else {"changed": False, "detach_requested": True}
-        if self.config.get("detaching") or not self.config.get("node_id"):
-            return {"changed": False, "skipped": True}
-        try:
-            # /wait compares a notification cursor; only /sync acknowledges a
-            # genuinely applied revision. Remember an offered revision here so
-            # the listener can hear later edits/deletion during a slow apply.
-            cursor = max(self.ledger.meta("applied_revision", 0), getattr(self, "_notified_revision", 0))
-            result = self.transport(timeout=WAIT_SECONDS + 5).post("/api/agent/wait", {
-                "protocol": PROTOCOL, "node_id": self.config["node_id"],
-                "applied_revision": cursor, "timeout": WAIT_SECONDS})
-            if type(result.get("changed")) is not bool:
-                raise TransportError("Invalid center change notification")
-            integer(result.get("revision"), "notified revision")
-            if result["changed"]:
-                self._notified_revision = result["revision"]
-            return result
-        except TransportError as exc:
-            if exc.status == 410:
-                return self.detach_from_center() if detach else {"changed": False, "detach_requested": True}
-            raise
-
-    def detach_from_center(self):
-        """The center already removed this binding; no remote request is needed."""
-        with file_lock(self.config_path + ".sync.lock", timeout=20):
-            self.reload()
-            return self._detach_local()
-
-    def _detach_local(self):
-        if self.config.get("detached"):
-            return {"status": "detached", "changed": False, "ledger_preserved": self.ledger.path}
-        self.config.update(remote_detached=True, detaching=True)
-        self.save()
-        try:
-            self.helper_runner(self.config, "agent-detach", (), 120)
-            self.config.update(detached=True, detaching=False, status="detached", detached_at=int(time.time()))
-            for key in ("node_token", "registration_payload", "registration_fingerprint", "registration_aliases"):
-                self.config.pop(key, None)
-            self.save()
-            self.ledger.set_meta(sync_error="", apply_error="")
-            return {"node_id": self.config.get("node_id"), "status": "detached", "changed": False,
-                    "acknowledged_batches": 0, "applied": False, "ledger_preserved": self.ledger.path,
-                    "pending_batches": self.ledger.summary()["pending_batches"]}
-        except BaseException:
-            # Keep the remote decision, but allow the next sync to retry the
-            # local helper rather than leaving local management locked forever.
-            self.config["detaching"] = False
-            self.save()
-            raise
-
-    def _sync(self, force_package=False, apply=True):
-        if not self.config.get("node_id"):
-            try:
-                self.register()
-            except TransportError as exc:
-                if exc.status in (403, 410):
-                    # A rejected/expired registration cannot recover by
-                    # retrying the same join code. This also covers a lost
-                    # registration reply followed by deletion at the center.
-                    return self._detach_local()
-                raise
-        self.ledger.package(force=force_package)
-        status = self.ledger.summary()
-        batches = self.ledger.batches()
-        inbounds = self.subscription_inbounds()
-        inbounds_hash = hashlib.sha256(canonical(inbounds).encode("utf-8")).hexdigest()
-        payload = {"protocol": PROTOCOL, "node_id": self.config["node_id"], "agent_version": VERSION,
-                   "applied_revision": status["applied_revision"], "apply_error": status["apply_error"],
-                   "service_running": self.is_running(), "collector_error": status["collector_error"],
-                   "last_sample_at": status["last_sample_at"] or 0, "pending_batches": status["pending_batches"],
-                   "batches": batches}
-        if inbounds_hash != self._synced_inbounds_hash:
-            payload["inbounds"] = inbounds
-        try:
-            response = self.transport().post("/api/agent/sync", payload)
-            if response.get("node_id") != self.config["node_id"] or response.get("status") not in ("active", "pending"):
-                raise TransportError("Center returned an invalid node status")
-            acknowledged = self.ledger.acknowledge(response.get("ack", []), batches)
-            self._synced_inbounds_hash = inbounds_hash
-            self.ledger.set_meta(last_sync_at=int(time.time()), sync_error="")
-            if self.config.get("status") != response["status"]:
-                self.config["status"] = response["status"]
-                self.save()
-            applied = False
-            if apply and response.get("desired") is not None:
-                try:
-                    if response["status"] != "active":
-                        raise AgentError("Node is not yet active")
-                    applied = self.apply_desired(response["desired"])
-                except (AgentError, OSError, ValueError, sqlite3.Error) as exc:
-                    self.ledger.set_meta(apply_error=redact(exc, self.config))
-                    raise AgentError("Configuration was not acknowledged: " + redact(exc, self.config)) from exc
-            return {"node_id": self.config["node_id"], "status": response["status"],
-                    "acknowledged_batches": acknowledged, "applied": applied,
-                    "applied_revision": self.ledger.meta("applied_revision", 0)}
-        except TransportError as exc:
-            if exc.status == 410:
-                return self._detach_local()
-            self.ledger.set_meta(sync_error=redact(exc, self.config))
-            raise
-        except (AgentError, OSError, ValueError, sqlite3.Error) as exc:
-            self.ledger.set_meta(sync_error=redact(exc, self.config))
-            raise
-
-    def detach(self, force=False):
-        with file_lock(self.config_path + ".sync.lock", timeout=20):
-            self.reload()
-            if self.config.get("detached"):
-                return {"status": "detached", "ledger_preserved": self.ledger.path}
-            self.config["detaching"] = True
-            self.save()
-            try:
-                try:
-                    self.sample_once(allow_detaching=True)
-                except (AgentError, OSError, sqlite3.Error) as exc:
-                    log("Final sample failed: " + str(exc), self.config)
-                if not self.config.get("remote_detached"):
-                    try:
-                        if self.config.get("node_id"):
-                            # Drain bounded batches without applying a new desired configuration.
-                            for unused in range(64):
-                                result = self._sync(force_package=True, apply=False)
-                                if result.get("status") == "detached":
-                                    return result
-                                summary = self.ledger.summary()
-                                if not summary["pending_batches"] and not summary["unpackaged_rows"]:
-                                    break
-                                if not result["acknowledged_batches"]:
-                                    raise AgentError("Center did not acknowledge pending traffic")
-                            else:
-                                raise AgentError("Traffic backlog is too large; finish syncing before detaching")
-                            response = self.transport().post("/api/agent/detach", {
-                                "protocol": PROTOCOL, "node_id": self.config["node_id"]})
-                            if response.get("node_id", self.config["node_id"]) != self.config["node_id"]:
-                                raise TransportError("Invalid detach acknowledgement")
-                        elif not force:
-                            raise AgentError("Registration is incomplete; use --force for local detachment")
-                        self.config["remote_detached"] = True
-                        self.save()
-                    except (AgentError, OSError, ValueError) as exc:
-                        if isinstance(exc, TransportError) and exc.status == 410:
-                            return self._detach_local()
-                        if not force:
-                            raise AgentError("Center detachment could not be confirmed. Local configuration "
-                                             "was retained; use detach --force for an explicit local detachment. "
-                                             + redact(exc, self.config)) from exc
-                        log("Forced local detachment; unacknowledged traffic stays in the ledger: " + str(exc), self.config)
-                return self._detach_local()
-            except BaseException:
-                if not self.config.get("remote_detached"):
-                    self.config["detaching"] = False
-                    self.save()
-                raise
-
-    def status(self):
-        result = {"version": VERSION, "node_id": self.config.get("node_id"),
-                  "status": self.config.get("status", "registering"),
-                  "center_url": self.config["center_url"], "detached": bool(self.config.get("detached")),
-                  "service_running": self.is_running()}
-        result.update(self.ledger.summary())
-        return result
-
-    def run(self):
-        with file_lock(self.ledger.path + ".run.lock", timeout=0.1):
-            stop = threading.Event()
-            change = threading.Event()
-            center_detached = threading.Event()
-            old_handlers = {}
-            for sig in (signal.SIGTERM, signal.SIGINT):
-                old_handlers[sig] = signal.signal(sig, lambda signum, frame: (stop.set(), change.set()))
-
-            # Each worker owns its config snapshot. Atomic config replacement is
-            # shared; mutable Python dictionaries are not shared across threads.
-            sampling_agent = Agent(self.config_path, self.allow_loopback_http,
-                                   collector=self.collector, core_probe=self.core_probe,
-                                   helper_runner=self.helper_runner)
-            waiting_agent = Agent(self.config_path, self.allow_loopback_http, transport=self.transport_override,
-                                  collector=self.collector, core_probe=self.core_probe,
-                                  helper_runner=self.helper_runner)
-
-            def sampler():
-                while not stop.is_set():
-                    start = time.monotonic()
-                    try:
-                        current = read_json(self.config_path)
-                        if current.get("detached"):
-                            stop.set()
-                            change.set()
-                            break
-                        if current.get("detaching"):
-                            stop.wait(0.25)
-                            continue
-                        sampling_agent.sample_once()
-                    except LockBusy:
-                        pass
-                    except (AgentError, OSError, ValueError, sqlite3.Error) as exc:
-                        log("Collector: " + str(exc), self.config)
-                    stop.wait(max(0.1, SAMPLE_SECONDS - (time.monotonic() - start)))
-
-            def watch_changes():
-                while not stop.is_set():
-                    try:
-                        # Only the main worker changes local bindings/config.
-                        # This listener can block on HTTPS independently of the
-                        # sampler and the regular metrics/reporting cycle.
-                        result = waiting_agent.wait_changes(detach=False)
-                        if result.get("detach_requested"):
-                            center_detached.set()
-                            change.set()
-                            break
-                        if result.get("status") == "detached":
-                            stop.set()
-                            change.set()
-                            break
-                        if result.get("changed"):
-                            change.set()
-                        elif result.get("skipped"):
-                            stop.wait(0.5)
-                    except TransportError as exc:
-                        if exc.status in (404, 405):
-                            log("Center has no change listener; keeping 15-second sync", self.config)
-                            break
-                        log("Change listener: " + str(exc), self.config)
-                        stop.wait(3)
-                    except (AgentError, OSError, ValueError, sqlite3.Error) as exc:
-                        log("Change listener: " + str(exc), self.config)
-                        stop.wait(3)
-
-            activity_lock = threading.Lock()
-            shared_activity = [None]
-
-            def get_activity():
-                with activity_lock:
-                    if shared_activity[0] is None:
-                        shared_activity[0] = ActivityCollector(self.config_path)
-                    return shared_activity[0]
-
-            def activity_worker(upload=False):
-                idle_streak = 0
-                last_upload = 0.0
-                last_status_key = None
-                while not stop.is_set():
-                    delay = SYNC_SECONDS if upload else 1
-                    activity = None
-                    try:
-                        current = read_json(self.config_path)
-                        if current.get("detached") or current.get("detaching"):
-                            break
-                        if current.get("status") != "active" or not current.get("node_id"):
-                            stop.wait(1)
-                            continue
-                        activity = get_activity()
-                        if upload:
-                            st = activity.status()
-                            status_key = (st["dropped"], st["gaps"], st["error"])
-                            now_mono = time.monotonic()
-                            if (st["pending"] > 0 or last_status_key is None
-                                    or status_key != last_status_key or (now_mono - last_upload) >= 45):
-                                sent = activity.upload_once(self.transport_override, self.allow_loopback_http)
-                                last_upload = time.monotonic()
-                                last_status_key = status_key
-                                if sent == 400:
-                                    delay = 0.25
-                        else:
-                            with activity._lock:
-                                before_cursor = activity._cursor
-                            has_more = activity.collect_once()
-                            with activity._lock:
-                                after_cursor = activity._cursor
-                            if has_more:
-                                idle_streak = 0
-                                delay = 0.05
-                            elif before_cursor != after_cursor:
-                                idle_streak = 0
-                                delay = 1
-                            else:
-                                idle_streak = min(idle_streak + 1, 2)
-                                delay = min(3, 1 + idle_streak)
-                    except TransportError as exc:
-                        if exc.status == 410:
-                            center_detached.set()
-                            change.set()
-                            break
-                        if exc.status in (404, 405):
-                            delay = 60
-                        # A network failure cannot stop the continuous reader.
-                    except (AgentError, OSError, ValueError, sqlite3.Error) as exc:
-                        if activity is not None and not upload:
-                            with contextlib.suppress(sqlite3.Error):
-                                activity.set_error(redact(exc, current))
-                        delay = 3
-                    stop.wait(delay)
-
-            activity_reader = threading.Thread(target=activity_worker, name="ysq-activity-reader", daemon=True)
-            activity_uploader = threading.Thread(target=lambda: activity_worker(True), name="ysq-activity-uploader", daemon=True)
-            activity_reader.start()
-            activity_uploader.start()
-            thread = threading.Thread(target=sampler, name="ysq-sampler", daemon=True)
-            listener = threading.Thread(target=watch_changes, name="ysq-change-listener", daemon=True)
-            thread.start()
-            listener.start()
-            failures = 0
-            try:
-                while not stop.is_set():
-                    start = time.monotonic()
-                    change.clear()
-                    try:
-                        self.reload()
-                        if self.config.get("detached") or self.config.get("detaching"):
-                            break
-                        result = self.detach_from_center() if center_detached.is_set() else self.sync_once()
-                        if result.get("status") == "detached":
-                            stop.set()
-                            break
-                        if result.get("applied"):
-                            # Confirm the applied revision immediately so the
-                            # panel does not keep showing pending for 15 seconds.
-                            change.set()
-                        failures = 0
-                    except LockBusy:
-                        pass
-                    except (AgentError, OSError, ValueError, sqlite3.Error) as exc:
-                        failures = min(failures + 1, 5)
-                        log("Sync: " + str(exc), self.config)
-                    delay = min(120, SYNC_SECONDS * (2 ** max(0, failures - 1)))
-                    change.wait(max(0.1, delay - (time.monotonic() - start)))
-            finally:
-                stop.set()
-                change.set()
-                thread.join(timeout=8)
-                listener.join(timeout=1)
-                activity_reader.join(timeout=4)
-                activity_uploader.join(timeout=1)
-                for sig, handler in old_handlers.items():
-                    signal.signal(sig, handler)
-
-
-def join(config_path, url, code, name=None, script=None, allow_loopback_http=False):
-    origin = validate_origin(url, allow_loopback_http)
-    with file_lock(str(config_path) + ".sync.lock", timeout=5):
-        previous = read_json(config_path) if os.path.isfile(config_path) else None
-        if previous and not previous.get("detached"):
-            if previous.get("center_url") != origin:
-                raise AgentError("Already enrolled with another center; detach before joining another")
-            agent = Agent(config_path, allow_loopback_http)
-            if agent.config.get("node_id"):
-                return {"node_id": agent.config["node_id"], "status": agent.config.get("status", "pending")}
-            pending = agent.config.get("registration_payload")
-            if not isinstance(pending, dict):
-                raise AgentError("An unfinished registration has no saved request; inspect agent state")
-            if pending.get("join_code") != code:
-                # The user may have regenerated an expired one-time code. Reuse
-                # the durable registration id and node token: if the earlier
-                # request was committed but its response lost, the center can
-                # still reply idempotently without creating duplicate nodes.
-                pending["join_code"] = code
-                agent.save()
-            return agent.register()
-        registration_id = uuid.uuid4().hex
-        db_path = DEFAULT_DB
-        history = []
-        if previous:
-            history = list(previous.get("previous_ledgers", []))
-            history.append({"db_path": previous["db_path"], "node_id": previous.get("node_id"),
-                            "center_url": previous.get("center_url")})
-            db_path = str(pathlib.Path(previous["db_path"]).parent / ("agent-" + registration_id + ".db"))
-        config = {"protocol": PROTOCOL, "agent_version": VERSION, "node_id": None,
-                  "node_token": secrets.token_urlsafe(32), "center_url": origin,
-                  "script_path": os.path.abspath(script or DEFAULT_SCRIPT), "db_path": db_path,
-                  "state_path": DEFAULT_STATE, "grpcurl_path": shutil.which("grpcurl") or DEFAULT_GRPCURL,
-                  "registration_id": registration_id, "status": "registering", "detached": False,
-                  "created_at": int(time.time()), "previous_ledgers": history}
-        raw = helper(config, "agent-inventory", (), 20)
-        try:
-            inventory = json.loads(raw)
-        except ValueError as exc:
-            raise AgentError("Inventory helper did not return JSON") from exc
-        if not isinstance(inventory, dict):
-            raise AgentError("Invalid inventory helper response")
-        users = validated_users(inventory.get("users"))
-        inbounds = []
-        for inbound in inventory.get("inbounds", []):
-            if not isinstance(inbound, dict):
-                raise AgentError("Invalid inbound inventory")
-            port = integer(inbound.get("port"), "inbound port", 1, 65535)
-            clean = {key: str(inbound.get(key, ""))[:253] for key in ("name", "tag", "type", "server", "sni", "public_key", "short_id")}
-            clean["skip_cert_verify"] = bool(inbound.get("skip_cert_verify", False))
-            clean["port"] = port
-            inbounds.append(clean)
-        config["registration_fingerprint"] = fingerprint(users)
-        config["registration_payload"] = {"protocol": PROTOCOL, "join_code": code,
-            "registration_id": registration_id, "node_token": config["node_token"],
-            "agent_version": VERSION, "hostname": str(name or socket.gethostname())[:253],
-            "users": users, "inbounds": inbounds}
-        # Persist identity before the first byte is sent. Never regenerate it on a network retry.
-        Ledger(db_path)
-        atomic_json(config_path, config)
-        return Agent(config_path, allow_loopback_http).register()
-
-
-def main(argv=None):
-    os.umask(0o077)
-    parser = argparse.ArgumentParser(description="YSQ optional HTTPS center agent")
-    parser.add_argument("--config", default=DEFAULT_CONFIG)
-    parser.add_argument("--allow-loopback-http", action="store_true", help="Test-only: allow HTTP on loopback")
-    parser.add_argument("--version", action="version", version=VERSION)
-    commands = parser.add_subparsers(dest="command", required=True)
-    for command in ("run", "status", "sync-once", "sample-once"):
-        commands.add_parser(command)
-    joining = commands.add_parser("join")
-    joining.add_argument("--url", required=True)
-    joining.add_argument("--code", required=True)
-    joining.add_argument("--name")
-    joining.add_argument("--script")
-    detaching = commands.add_parser("detach")
-    detaching.add_argument("--force", action="store_true")
-    args = parser.parse_args(argv)
-    try:
-        if args.command == "join":
-            result = join(args.config, args.url, args.code, args.name, args.script, args.allow_loopback_http)
-        elif args.command == "status" and not os.path.isfile(args.config):
-            result = {"version": VERSION, "status": "standalone", "configured": False}
-        else:
-            agent = Agent(args.config, args.allow_loopback_http)
-            if args.command == "run":
-                agent.run()
-                return 0
-            if args.command == "sample-once":
-                result = agent.sample_once()
-            elif args.command == "sync-once":
-                result = agent.sync_once(force_package=True)
-            elif args.command == "detach":
-                result = agent.detach(force=args.force)
-            else:
-                result = agent.status()
-        print(canonical(result))
-        return 0
-    except (AgentError, OSError, ValueError, sqlite3.Error) as exc:
-        config = {}
-        with contextlib.suppress(Exception):
-            config = read_json(args.config)
-        log(exc, config)
-        return 1
-
-
-if __name__ == "__main__":
-    sys.exit(main())
-# END_EMBEDDED_AGENT
-YSQ_AGENT_PY
-}
-
-ensure_agent_python() {
-  if ! command -v python3 >/dev/null 2>&1; then
-    [ -z "$YSQ_TEST_ROOT" ] || { err "隔离测试需要 Python 3.9+。"; return 1; }
-    pkg_update
-    pkg_install python3 || return 1
-  fi
-  if ! python3 -c 'import sys, sqlite3, ssl; raise SystemExit(0 if sys.version_info >= (3,9) else 1)' >/dev/null 2>&1; then
-    err "中控 Agent / 主备切换需要 Python 3.9 或更新版本，以及 sqlite3/ssl 标准库；其他单机功能不受影响。"
-    return 1
-  fi
-}
-
 install_agent_service() {
-  local wd py
+  local wd
   wd="$(new_work_dir)"
-  py="$(command -v python3)"
   case "$SERVICE_MANAGER" in
     systemd)
       cat > "$wd/agent-unit" <<EOF
@@ -7445,7 +5273,7 @@ Type=simple
 User=root
 Group=root
 UMask=0077
-ExecStart=${py} ${AGENT_FILE} --config ${AGENT_CONFIG_FILE} run
+ExecStart=${SINGBOX_PLUS_BIN} agent --config ${AGENT_CONFIG_FILE} run
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=135s
@@ -7463,8 +5291,8 @@ EOF
       cat > "$wd/agent-unit" <<EOF
 #!/sbin/openrc-run
 description="YSQ HTTPS center agent"
-command="${py}"
-command_args="${AGENT_FILE} --config ${AGENT_CONFIG_FILE} run"
+command="${SINGBOX_PLUS_BIN}"
+command_args="agent --config ${AGENT_CONFIG_FILE} run"
 command_background="yes"
 pidfile="${AGENT_PID_FILE}"
 output_log="${AGENT_DATA_DIR}/agent.log"
@@ -7480,23 +5308,87 @@ EOF
       install_if_changed "$wd/agent-unit" "$AGENT_OPENRC_FILE" 755 || true
       ;;
     test) ;;
-    *) err "中控 Agent 常驻运行需要 systemd 或 OpenRC；本机可继续单机使用。"; return 1 ;;
+    *) err "中控 Agent 常驻运行需要 systemd 或 OpenRC；本机可继续单机使用。"; rm -rf "$wd"; return 1 ;;
   esac
+  rm -rf "$wd"
+}
+
+YSQ_LEGACY_AGENT_FLUSHED="${YSQ_LEGACY_AGENT_FLUSHED:-0}"
+YSQ_LEGACY_AGENT_SYNC_OK="${YSQ_LEGACY_AGENT_SYNC_OK:-0}"
+
+config_lock_currently_held() {
+  [ -f "$CONFIG_LOCK_FILE" ] || return 1
+  command -v flock >/dev/null 2>&1 || return 1
+  if ( exec 8>>"$CONFIG_LOCK_FILE" && LC_ALL=C flock -n 8 ) 2>/dev/null; then
+    return 1
+  fi
+  return 0
+}
+
+flush_legacy_agent_if_needed() {
+  local legacy_agent="${YSQ_TEST_ROOT}/usr/local/libexec/ysq-agent.py"
+  local sync_rc=0
+  [ "$YSQ_LEGACY_AGENT_FLUSHED" != "1" ] || return 0
+  [ -f "$legacy_agent" ] && command -v python3 >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 \
+    && [ -s "$AGENT_CONFIG_FILE" ] && agent_binding_present || return 0
+  if [ "${YSQ_CONFIG_LOCK_FD:-}" = "9" ] || config_lock_currently_held; then
+    warn "当前已有进程持有配置锁，已跳过旧版 Python Agent 切换前同步以避免死锁。"
+    warn "旧版脚本 ${legacy_agent} 与 SQLite 数据库（${AGENT_DATA_DIR}）已保留；升级结束后可执行以下命令补报并清理："
+    warn "  python3 ${legacy_agent} --config ${AGENT_CONFIG_FILE} sync-once && rm -f ${legacy_agent}"
+    return 0
+  fi
+  info "检测到旧版 Python Agent，正在执行切换前最后一次流量同步..."
+  agent_service_stop
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 15 python3 "$legacy_agent" --config "$AGENT_CONFIG_FILE" sync-once 9>&- >/dev/null 2>&1 || sync_rc=$?
+  else
+    python3 "$legacy_agent" --config "$AGENT_CONFIG_FILE" sync-once 9>&- >/dev/null 2>&1 || sync_rc=$?
+  fi
+  YSQ_LEGACY_AGENT_FLUSHED=1
+  export YSQ_LEGACY_AGENT_FLUSHED
+  if [ "$sync_rc" -eq 0 ]; then
+    YSQ_LEGACY_AGENT_SYNC_OK=1
+    export YSQ_LEGACY_AGENT_SYNC_OK
+    ok "旧版 Python Agent 切换前流量同步完成。"
+  else
+    YSQ_LEGACY_AGENT_SYNC_OK=0
+    export YSQ_LEGACY_AGENT_SYNC_OK
+    warn "旧版 Python Agent 切换前流量同步失败（退出码 ${sync_rc}）；已保留 ${legacy_agent} 与 ${AGENT_DATA_DIR} 中的旧版 SQLite 数据库。"
+    warn "待中控恢复连通后，可手动执行以下命令补报并清理："
+    warn "  python3 ${legacy_agent} --config ${AGENT_CONFIG_FILE} sync-once && rm -f ${legacy_agent}"
+  fi
+  return 0
 }
 
 install_agent_bundle() {
-  ensure_agent_python || return 1
-  ensure_grpcurl || return 1
-  local wd
-  wd="$(new_work_dir)"
-  mkdir -p "$(dirname "$AGENT_FILE")" "$(dirname "$AGENT_CONFIG_FILE")" "$AGENT_DATA_DIR"
+  local legacy_agent="${YSQ_TEST_ROOT}/usr/local/libexec/ysq-agent.py"
+  local had_bound_legacy=0
+  ensure_singbox_plus || return 1
+  mkdir -p "$(dirname "$AGENT_CONFIG_FILE")" "$AGENT_DATA_DIR"
   chmod 700 "$(dirname "$AGENT_CONFIG_FILE")" "$AGENT_DATA_DIR"
-  write_embedded_agent > "$wd/ysq-agent.py"
-  python3 -c 'import sys; compile(open(sys.argv[1], encoding="utf-8").read(), sys.argv[1], "exec")' \
-    "$wd/ysq-agent.py" || return 1
-  install -m 700 "$wd/ysq-agent.py" "${AGENT_FILE}.new.${WORK_TAG}"
-  mv -f "${AGENT_FILE}.new.${WORK_TAG}" "$AGENT_FILE"
+  if [ -f "$legacy_agent" ] && [ -s "$AGENT_CONFIG_FILE" ] && agent_binding_present; then
+    had_bound_legacy=1
+  fi
+  if [ "$had_bound_legacy" -eq 1 ]; then
+    flush_legacy_agent_if_needed
+    if [ "$YSQ_LEGACY_AGENT_SYNC_OK" = "1" ]; then
+      rm -f "$legacy_agent"
+    else
+      warn "由于旧版 Python Agent 最后一次流量同步未确认成功，已保留 ${legacy_agent} 以便后续补报。"
+    fi
+  else
+    rm -f "$legacy_agent"
+  fi
   install_agent_service || return 1
+}
+
+agent_service_is_active() {
+  case "$SERVICE_MANAGER" in
+    systemd) systemctl is-active --quiet ysq-agent 2>/dev/null ;;
+    openrc) rc-service ysq-agent status >/dev/null 2>&1 ;;
+    test) [ -f "$AGENT_DATA_DIR/test-running" ] ;;
+    *) return 1 ;;
+  esac
 }
 
 agent_service_stop() {
@@ -7530,15 +5422,6 @@ agent_service_disable() {
   esac
 }
 
-agent_service_ensure_running() {
-  case "$SERVICE_MANAGER" in
-    systemd) systemctl is-active --quiet ysq-agent 2>/dev/null && return 0 ;;
-    openrc) rc-service ysq-agent status >/dev/null 2>&1 && return 0 ;;
-    test) [ -f "$AGENT_DATA_DIR/test-running" ] && return 0 ;;
-  esac
-  agent_service_start
-}
-
 restore_agent_if_configured() {
   agent_binding_present || return 0
   [ -s "$AGENT_CONFIG_FILE" ] || { warn "中控绑定配置缺失，请恢复 Agent 配置备份；保留当前已生效用户。"; return 0; }
@@ -7557,10 +5440,12 @@ valid_agent_join_code() {
 
 agent_join_wizard() {
   need_state
+  local retrying_register=0
   if agent_binding_present; then
     if [ -s "$AGENT_CONFIG_FILE" ] && jq -e '
         (.detached != true) and (.node_id == null) and (.status == "registering")
       ' "$AGENT_CONFIG_FILE" >/dev/null 2>&1; then
+      retrying_register=1
       info "上一次连接尚未成功，可重新粘贴连接信息；将保留注册身份继续尝试。"
     else
       warn "本机已经绑定中控。可查看详细状态，或先解除绑定后再连接。"
@@ -7585,9 +5470,14 @@ agent_join_wizard() {
     err "接入码格式不正确，请重新从中控网页复制完整连接信息。"
     return 1
   fi
+  flush_legacy_agent_if_needed
   ( acquire_config_lock && install_agent_bundle ) || return 1
+  if [ "$retrying_register" -eq 1 ]; then
+    # 先停掉后台重试中的 ysq-agent，避免其持有 .sync.lock 导致 join 锁竞争失败
+    agent_service_stop
+  fi
   # Agent joins without holding the config lock; it reads local inventory.
-  if ! python3 "$AGENT_FILE" --config "$AGENT_CONFIG_FILE" join \
+  if ! "$SINGBOX_PLUS_BIN" agent --config "$AGENT_CONFIG_FILE" join \
     --url="$url" --code="$code" --script="$INSTALLER_FILE" >/dev/null; then
     if agent_binding_present; then
       agent_service_start || true
@@ -7602,29 +5492,41 @@ agent_join_wizard() {
 
 agent_status_wizard() {
   step "中控详细状态"
-  if [ ! -s "$AGENT_CONFIG_FILE" ] || [ ! -f "$AGENT_FILE" ]; then
+  if [ ! -s "$AGENT_CONFIG_FILE" ] || [ ! -x "$SINGBOX_PLUS_BIN" ]; then
+    if agent_binding_present; then
+      warn "运行模式：中控托管（异常：缺少 Agent 配置文件或 singbox-plus 组件）"
+      warn "本机状态文件仍处于中控托管模式；如无法恢复 Agent 配置，请使用选项 3「解除中控绑定」强制恢复单机模式。"
+      return 0
+    fi
     info "运行模式：单机模式（未连接中控）"
     info "用户配置：在本机 ysq 菜单管理"
     return 0
   fi
   local status mode center node_id revision last_sync last_sample pending rows
   local sync_error apply_error sample_error running text last_sync_display last_sample_display
-  status="$(python3 "$AGENT_FILE" --config "$AGENT_CONFIG_FILE" status)" || {
+  status="$("$SINGBOX_PLUS_BIN" agent --config "$AGENT_CONFIG_FILE" status)" || {
     err "无法读取 Agent 状态，请检查 ysq-agent 服务日志。"
     return 1
   }
-  center="$(jq -r '.center_url // "-"' <<<"$status")"
-  node_id="$(jq -r '.node_id // "-"' <<<"$status")"
-  mode="$(jq -r '.status // "unknown"' <<<"$status")"
-  revision="$(jq -r '.applied_revision // 0' <<<"$status")"
-  last_sync="$(jq -r '.last_sync_at // 0' <<<"$status")"
-  last_sample="$(jq -r '.last_sample_at // 0' <<<"$status")"
-  pending="$(jq -r '.pending_batches // 0' <<<"$status")"
-  rows="$(jq -r '.unpackaged_rows // 0' <<<"$status")"
-  sync_error="$(jq -r '.sync_error // ""' <<<"$status")"
-  apply_error="$(jq -r '.apply_error // ""' <<<"$status")"
-  sample_error="$(jq -r '.collector_error // ""' <<<"$status")"
-  running="$(jq -r '.service_running // false' <<<"$status")"
+  IFS=$'\x1f' read -r center node_id mode revision last_sync last_sample pending rows sync_error apply_error sample_error running < <(
+    jq -r '
+      def clean: tostring | gsub("[\\r\\n\\u001f]+"; " ");
+      [
+        (.center_url // "-" | clean),
+        (.node_id // "-" | clean),
+        (.status // "unknown" | clean),
+        ((.applied_revision // 0) | tostring),
+        ((.last_sync_at // 0) | tostring),
+        ((.last_sample_at // 0) | tostring),
+        ((.pending_batches // 0) | tostring),
+        ((.unpackaged_rows // 0) | tostring),
+        (.sync_error // "" | clean),
+        (.apply_error // "" | clean),
+        (.collector_error // "" | clean),
+        ((.service_running // false) | tostring)
+      ] | join("\u001f")
+    ' <<<"$status"
+  )
   last_sync_display="尚未成功同步"
   last_sample_display="尚未成功采样"
   if [[ "$last_sync" =~ ^[0-9]+$ ]] && [ "$last_sync" -gt 0 ]; then
@@ -7680,18 +5582,42 @@ agent_status_wizard() {
 }
 
 agent_detach_wizard() {
-  [ -s "$AGENT_CONFIG_FILE" ] && [ -f "$AGENT_FILE" ] || { err "尚未配置中控。"; return 1; }
+  if [ ! -s "$AGENT_CONFIG_FILE" ] || [ ! -x "$SINGBOX_PLUS_BIN" ]; then
+    if ! agent_binding_present; then
+      err "尚未配置中控。"
+      return 1
+    fi
+    warn "未找到有效的 Agent 配置或运行组件，但状态文件仍处于中控托管状态。"
+    warn "强制本机解绑后将保留当前已启用用户并恢复本机用户编辑；已停用用户不会恢复。"
+    confirm_or_cancel "确认强制本机解绑？输入 y（默认取消）: " n "" || return $?
+    agent_service_disable
+    agent_detach_action
+    if [ -s "$AGENT_CONFIG_FILE" ]; then
+      local cfg_tmp="${AGENT_CONFIG_FILE}.tmp.${WORK_TAG}"
+      if jq '.detached = true | .status = "detached" | del(.node_token, .registration_payload, .registration_fingerprint, .registration_aliases)' "$AGENT_CONFIG_FILE" > "$cfg_tmp" 2>/dev/null; then
+        chmod 600 "$cfg_tmp" 2>/dev/null || true
+        mv -f "$cfg_tmp" "$AGENT_CONFIG_FILE" || rm -f "$cfg_tmp"
+      else
+        rm -f "$cfg_tmp"
+      fi
+    fi
+    ok "已在本机强制解绑，恢复为单机模式。如中控仍有记录，请在中控网页撤销旧服务器。"
+    return 0
+  fi
   warn "解绑后保留当前已启用用户及统计账本，恢复本机用户编辑；已停用用户不会恢复。"
   confirm_or_cancel "确认主动解绑？输入 y: " n "" || return $?
   agent_service_stop
-  if python3 "$AGENT_FILE" --config "$AGENT_CONFIG_FILE" detach >/dev/null; then
+  if "$SINGBOX_PLUS_BIN" agent --config "$AGENT_CONFIG_FILE" detach >/dev/null; then
     agent_service_disable
     ok "已解绑，当前为单机模式。"
     return 0
   fi
   warn "正常解绑未完成。中控离线时可选择强制本机解绑，未确认的流量仍保留在本机账本。"
   if confirm_or_cancel "强制本机解绑？输入 y（默认取消）: " n ""; then
-    python3 "$AGENT_FILE" --config "$AGENT_CONFIG_FILE" detach --force >/dev/null || return 1
+    if ! "$SINGBOX_PLUS_BIN" agent --config "$AGENT_CONFIG_FILE" detach --force >/dev/null; then
+      agent_service_start || true
+      return 1
+    fi
     agent_service_disable
     ok "已在本机解绑。请在中控网页核对并撤销旧服务器记录。"
   else
@@ -7734,7 +5660,9 @@ agent_inventory_action() {
     users:[.users[]? | select(.enabled != false) | {name,uuid,tuic_pass}],
     inbounds:[. as $s | .nodes[]? | {name,tag,type,port,
       server:$s.server_ip, sni:(if (.type | startswith("tuic")) then $s.tuic_sni else $s.reality_sni end),
-      public_key:$s.public_key, short_id:$s.short_id, skip_cert_verify:(.type | startswith("tuic"))}],
+      public_key:(if (.type | startswith("tuic")) then "" else $s.public_key end),
+      short_id:(if (.type | startswith("tuic")) then "" else $s.short_id end),
+      skip_cert_verify:(.type | startswith("tuic"))}],
     management:(.management // {}), service_running:$running
   }' "$STATE_FILE"
 }
@@ -7798,7 +5726,7 @@ agent_apply_action() {
     .management = {mode:"managed",node_id:$p[0].node_id,revision:$prev,applying_revision:$p[0].revision}
   '
   apply_state || return 1
-  is_singbox_running || { err "新配置运行健康检查失败，未确认中控版本。"; return 1; }
+  # apply_state 已校验 restart_singbox && is_singbox_running，并在失败时原子回滚 state/config。
   # 只有真实应用成功后才记新 revision，崩溃重试不能把磁盘配置误当成已生效。
   state_build --argjson rev "$revision" '.management.revision=$rev | del(.management.applying_revision)'
   commit_state_plain
@@ -7831,6 +5759,8 @@ main() {
   case "$ACTION" in
     install)
       need_root
+      validate_cli_ports
+      flush_legacy_agent_if_needed
       acquire_config_lock || return 1
       install_wizard
       ;;
@@ -7839,6 +5769,7 @@ main() {
       ;;
     upgrade)
       need_root
+      flush_legacy_agent_if_needed
       acquire_config_lock || return 1
       upgrade_action
       ;;

@@ -1,0 +1,233 @@
+name: Build singbox-plus
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. 0.1.0; required when publish=true)'
+        required: false
+        default: ''
+        type: string
+      publish:
+        description: 'Publish GitHub Release'
+        required: false
+        default: false
+        type: boolean
+  push:
+    branches:
+      - main
+    tags:
+      - 'singbox-plus-v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: singbox-plus-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      should_release: ${{ steps.meta.outputs.should_release }}
+    steps:
+      - name: Resolve version and release flags
+        id: meta
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
+          SHORT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          should_release="false"
+          tag=""
+          version=""
+
+          if [[ "$REF_TYPE" == "tag" && "$REF_NAME" == singbox-plus-v* ]]; then
+            tag="$REF_NAME"
+            version="${tag#singbox-plus-v}"
+            should_release="true"
+          elif [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            if [[ -n "$INPUT_VERSION" ]]; then
+              version="${INPUT_VERSION#singbox-plus-v}"
+              version="${version#v}"
+              tag="singbox-plus-v${version}"
+            else
+              version="dev-${SHORT_SHA:0:7}"
+            fi
+            if [[ "$INPUT_PUBLISH" == "true" ]]; then
+              if [[ -z "$tag" ]]; then
+                echo "version input is required when publish=true" >&2
+                exit 1
+              fi
+              should_release="true"
+            fi
+          else
+            version="dev-${SHORT_SHA:0:7}"
+          fi
+
+          if [[ "$should_release" == "true" && ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+            echo "Invalid release version: $version" >&2
+            exit 1
+          fi
+
+          printf 'version=%s\ntag=%s\nshould_release=%s\n' \
+            "$version" "$tag" "$should_release" >> "$GITHUB_OUTPUT"
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Go toolchain
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: singbox-plus/go.mod
+          cache-dependency-path: singbox-plus/go.sum
+
+      - name: Run unit tests with race detector
+        working-directory: singbox-plus
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -v -race ./...
+
+  build:
+    needs: [prepare, test]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: amd64
+            goarch: amd64
+          - name: arm64
+            goarch: arm64
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Go toolchain
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: singbox-plus/go.mod
+          cache-dependency-path: singbox-plus/go.sum
+
+      - name: Build static Linux binary
+        working-directory: singbox-plus
+        shell: bash
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p ../out
+          go build -trimpath -buildvcs=false \
+            -ldflags "-X main.Version=${VERSION} -s -w -buildid=" \
+            -o ../out/singbox-plus ./cmd/singbox-plus
+
+      - name: Verify static linking
+        shell: bash
+        run: |
+          set -euo pipefail
+          go version -m out/singbox-plus | tee out/build-info.txt
+          if readelf -l out/singbox-plus | grep -q 'INTERP'; then
+            echo 'Unexpected ELF dynamic interpreter; binary is not fully static.' >&2
+            exit 1
+          fi
+
+      - name: Smoke-test binary on amd64
+        if: matrix.name == 'amd64'
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          out/singbox-plus version | tee out/version.txt
+          grep -Fxq "singbox-plus ${VERSION}" out/version.txt
+
+          parsed="$(printf '%s\n' \
+            'vless://550e8400-e29b-41d4-a716-446655440000@203.0.113.10:443?type=tcp&security=reality&pbk=AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA&fp=chrome&sni=www.example.com&sid=aabb&spx=%2F&flow=xtls-rprx-vision&packetEncoding=xudp' \
+            | out/singbox-plus parse-landing)"
+          echo "$parsed"
+          printf '%s\n' "$parsed" | out/singbox-plus parse-landing --json >/dev/null
+
+          agent_status="$(out/singbox-plus agent status --config /tmp/nonexistent-ysq-agent.json)"
+          echo "$agent_status"
+          grep -F '"configured":false' <<< "$agent_status"
+          grep -F '"status":"standalone"' <<< "$agent_status"
+
+      - name: Package tar.gz
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          ARCH_NAME: ${{ matrix.name }}
+        run: |
+          set -euo pipefail
+          folder="singbox-plus-${VERSION}-linux-${ARCH_NAME}"
+          mkdir -p "pkg/$folder" dist
+          install -m 755 out/singbox-plus "pkg/$folder/singbox-plus"
+          tar -C pkg -czf "dist/${folder}.tar.gz" "$folder"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: singbox-plus-${{ matrix.name }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: [prepare, build]
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: singbox-plus-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA-256 checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          count="$(find . -maxdepth 1 -name '*.tar.gz' -type f | wc -l)"
+          test "$count" -eq 2
+          sha256sum ./*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: singbox-plus ${{ needs.prepare.outputs.version }}
+          draft: false
+          prerelease: false
+          make_latest: false
+          fail_on_unmatched_files: true
+          body: |
+            Standalone pure-Go static companion binary for sing-box (`CGO_ENABLED=0`).
+            Includes `version`, `wrap`, `stats`, `parse-landing`, `failover`, and `agent`.
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS

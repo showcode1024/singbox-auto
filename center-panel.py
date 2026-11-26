@@ -48,6 +48,7 @@ VERSION_RE = re.compile(r'^VERSION\s*=\s*"([^"\r\n]{1,64})"\s*$', re.MULTILINE)
 PROTOCOL = 1
 MAX_BODY = 2 * 1024 * 1024
 MAX_BYTES = (1 << 63) - 1
+MAX_PLAUSIBLE_TS = 4_102_444_800
 DETAIL_RETENTION_DAYS = 100
 MAX_CHART_DAYS = 90
 PASSWORD_ITERATIONS = 600_000
@@ -259,6 +260,7 @@ class Store:
         self.path = self.directory / "center.db"
         self.maintenance_lock = threading.Lock()
         self.changes = threading.Condition()
+        self._change_seq = 0
         self.last_maintenance = 0.0
         self._last_quota_period = None
         with self.connect() as db:
@@ -305,6 +307,21 @@ class Store:
         finally:
             db.close()
 
+    def _notify_changes(self):
+        with self.changes:
+            self._change_seq += 1
+            self.changes.notify_all()
+
+    @contextlib.contextmanager
+    def read_transaction(self):
+        with self.connect() as db:
+            db.execute("BEGIN DEFERRED")
+            try:
+                yield db
+            finally:
+                if db.in_transaction:
+                    db.execute("ROLLBACK")
+
     @contextlib.contextmanager
     def transaction(self, notify=True):
         with self.connect() as db:
@@ -313,8 +330,7 @@ class Store:
                 yield db
                 db.execute("COMMIT")
                 if notify:
-                    with self.changes:
-                        self.changes.notify_all()
+                    self._notify_changes()
             except BaseException:
                 if db.in_transaction:
                     db.execute("ROLLBACK")
@@ -525,6 +541,7 @@ class Store:
             name = existing["name"] if existing else original["name"]
             if not existing:
                 db.execute("INSERT INTO users VALUES(?,?,?,?,1,0,?,?,?)", (uid, name, original["uuid"], original["tuic_pass"], node["id"], now(), now()))
+                db.execute("INSERT OR IGNORE INTO user_policies(user_id,subscription_token) VALUES(?,?)", (uid, secrets.token_urlsafe(32)))
             collision = db.execute("SELECT u.name FROM users u JOIN assignments a ON a.user_id=u.id WHERE a.node_id=? AND a.active=1 AND u.uuid=? AND u.id!=?",
                                    (node["id"], existing["uuid"] if existing else original["uuid"], uid)).fetchone()
             if collision:
@@ -588,18 +605,22 @@ class Store:
         applied = integer(data.get("applied_revision", 0), "已应用版本", 0)
         timeout = integer(data.get("timeout", 20), "等待时间", 1, 25)
         deadline = time.monotonic() + timeout
-        # Read and enter wait under one condition to avoid missing a committed change.
-        with self.changes:
-            while True:
-                with self.connect() as db:
-                    node = self._authenticated_node(db, ident, token)
-                    revision = node["revision"]
-                if revision != applied:
-                    return {"protocol": PROTOCOL, "changed": True, "revision": revision}
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return {"protocol": PROTOCOL, "changed": False, "revision": revision}
-                self.changes.wait(remaining)
+        while True:
+            with self.changes:
+                seen_seq = self._change_seq
+            with self.connect() as db:
+                node = self._authenticated_node(db, ident, token)
+                revision = node["revision"]
+            if revision < applied:
+                raise APIError(409, "节点配置版本领先于中控，请检查数据库恢复或重新绑定")
+            if revision > applied:
+                return {"protocol": PROTOCOL, "changed": True, "revision": revision}
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return {"protocol": PROTOCOL, "changed": False, "revision": revision}
+            with self.changes:
+                if self._change_seq == seen_seq:
+                    self.changes.wait(remaining)
 
     @staticmethod
     def _snapshot(db, ident, revision):
@@ -617,7 +638,7 @@ class Store:
         version = text_value(data.get("agent_version", "unknown"), "Agent 版本", 1, 64)
         apply_error = error_text(data.get("apply_error", ""), "应用错误")
         collector_error = error_text(data.get("collector_error", ""), "采集错误")
-        last_sample = integer(data.get("last_sample_at", 0), "采集时间", 0, now() + 300)
+        last_sample = min(integer(data.get("last_sample_at", 0), "采集时间", 0, MAX_PLAUSIBLE_TS), now())
         pending = integer(data.get("pending_batches", 0), "待上传批次", 0, 10_000_000)
         running = boolean(data.get("service_running", False), "运行状态")
         ack = []
@@ -658,7 +679,7 @@ class Store:
                     if not isinstance(item, dict):
                         raise APIError(400, "流量行格式错误")
                     uid = user_id_valid(item.get("user_id"))
-                    timestamp = integer(item.get("ts"), "流量采集时间", 1_577_836_800, now() + 300)
+                    timestamp = min(integer(item.get("ts"), "流量采集时间", 1_577_836_800, MAX_PLAUSIBLE_TS), now())
                     up, down = integer(item.get("up"), "上传字节"), integer(item.get("down"), "下载字节")
                     # A queued batch can arrive after a permanent user deletion.
                     # ACK it without recreating data or blocking the remaining users.
@@ -695,8 +716,7 @@ class Store:
         if quota_period is not None:
             self._last_quota_period = quota_period
         if notify_needed:
-            with self.changes:
-                self.changes.notify_all()
+            self._notify_changes()
         # ACK leaves this method only after the surrounding transaction committed.
         return result
 
@@ -712,7 +732,7 @@ class Store:
         pending = integer(status.get("pending", 0), "待上传行为", 0, 1000000)
         dropped = integer(status.get("dropped", 0), "丢弃行为", 0)
         gaps = integer(status.get("gaps", 0), "日志缺口", 0)
-        collected = integer(status.get("collected_at", 0), "日志读取时间", 0, now() + 300)
+        collected = min(integer(status.get("collected_at", 0), "日志读取时间", 0, MAX_PLAUSIBLE_TS), now())
         error = error_text(status.get("error", ""), "日志采集错误")
         ack = []
         with self.transaction(notify=False) as db:
@@ -726,25 +746,27 @@ class Store:
                 eid = event.get("id")
                 if not isinstance(eid, str) or not re.fullmatch(r"[0-9a-f]{64}", eid):
                     raise APIError(400, "行为记录 ID 不合法")
-                ts = integer(event.get("ts"), "行为时间", 1577836800, now() + 300)
+                raw_ts = integer(event.get("ts"), "行为时间", 1577836800, MAX_PLAUSIBLE_TS)
+                ts = min(raw_ts, now())
                 kind = event.get("kind")
                 if kind not in ("connection", "error", "gap"):
                     raise APIError(400, "行为类型不合法")
                 uid = event.get("user_id") or None
                 if uid:
                     user_id_valid(uid)
-                    # Late reports must not recreate permanently deleted users.
+                    # Late reports must not recreate permanently deleted users or deadlock on unassigned users.
                     if not db.execute("SELECT 1 FROM users WHERE id=?", (uid,)).fetchone():
                         ack.append(eid)
                         continue
                     if not db.execute("SELECT 1 FROM assignments WHERE user_id=? AND node_id=?", (uid, ident)).fetchone():
-                        raise APIError(403, "行为用户未分配给本服务器")
+                        ack.append(eid)
+                        continue
                 fields = [text_value(event.get(key, ""), key, 0, limit) for key, limit in
                           (("source_ip", 64), ("target", 512), ("network", 8), ("inbound", 100), ("message", 500))]
                 port = integer(event.get("port", 0), "目标端口", 0, 65535)
                 if fields[2] not in ("", "tcp", "udp"):
                     raise APIError(400, "传输协议不合法")
-                payload_hash = digest(canonical([ts, uid, kind, port, fields]))
+                payload_hash = digest(canonical([raw_ts, uid, kind, port, fields]))
                 previous = db.execute("SELECT payload_hash FROM activity_receipts WHERE node_id=? AND event_id=?", (ident, eid)).fetchone()
                 if previous:
                     if previous[0] != payload_hash:
@@ -783,7 +805,7 @@ class Store:
             page = integer(int(query.get("page", ["1"])[0]), "页码", 1, 1000000)
         except (ValueError, TypeError):
             raise APIError(400, "时间范围或页码不合法")
-        with self.connect() as db:
+        with self.read_transaction() as db:
             detail_days, summary_days = self._activity_retention(db)
             hours = min(hours, summary_days * 24)
             since = now() // 3600 * 3600 - (hours - 1) * 3600
@@ -922,6 +944,22 @@ class Store:
                    (uid, secrets.token_urlsafe(32)))
         return db.execute("SELECT * FROM user_policies WHERE user_id=?", (uid,)).fetchone()
 
+    @staticmethod
+    def _policy_readonly(db, uid):
+        row = db.execute("SELECT * FROM user_policies WHERE user_id=?", (uid,)).fetchone()
+        if row:
+            return row
+        return {
+            "user_id": uid,
+            "quota_bytes": 0,
+            "quota_period": "monthly",
+            "quota_blocked": 0,
+            "subscription_token": "",
+            "subscription_name": "plzquick",
+            "subscription_enabled": 1,
+            "subscription_expires_at": 0,
+        }
+
     def _quota_values(self, db, bounds=None):
         offset, today, month = bounds if bounds is not None else self._time_bounds(db)
         tz = dt.timezone(dt.timedelta(minutes=offset))
@@ -1012,7 +1050,16 @@ class Store:
 
     def subscription_info(self, uid, actor=None, reset=False, data=None):
         user_id_valid(uid)
-        with self.transaction() as db:
+        if data is None and not reset:
+            with self.read_transaction() as db:
+                user = db.execute("SELECT * FROM users WHERE id=? AND deleted=0", (uid,)).fetchone()
+                if not user:
+                    raise APIError(404, "用户不存在或已删除")
+                policy = db.execute("SELECT * FROM user_policies WHERE user_id=?", (uid,)).fetchone()
+                if policy:
+                    quota = self._quota_values(db)[uid]
+                    return self._subscription_metadata(db, user, policy, quota)
+        with self.transaction(notify=False) as db:
             user = db.execute("SELECT * FROM users WHERE id=? AND deleted=0", (uid,)).fetchone()
             if not user:
                 raise APIError(404, "用户不存在或已删除")
@@ -1029,7 +1076,7 @@ class Store:
                 db.execute("UPDATE user_policies SET subscription_token=? WHERE user_id=?", (secrets.token_urlsafe(32), uid))
                 self.audit(db, actor, "user.subscription.reset", user["name"])
             policy = self._policy(db, uid)
-            quota = self._refresh_quotas(db)[uid]
+            quota = self._quota_values(db)[uid]
             return self._subscription_metadata(db, user, policy, quota)
 
     def _subscription_metadata(self, db, user, policy, quota):
@@ -1042,11 +1089,21 @@ class Store:
                 "url": path, "clash": path + "/clash", "v2ray": path + "/v2ray", "nodes_count": len(proxies), "missing": missing}
 
     def list_subscriptions(self):
-        with self.transaction() as db:
+        with self.read_transaction() as db:
+            missing = db.execute("SELECT u.id FROM users u LEFT JOIN user_policies p ON p.user_id=u.id WHERE u.deleted=0 AND p.user_id IS NULL").fetchall()
+            if not missing:
+                users = db.execute("SELECT * FROM users WHERE deleted=0 ORDER BY name COLLATE NOCASE").fetchall()
+                policies = {r["user_id"]: r for r in db.execute("SELECT p.* FROM user_policies p JOIN users u ON u.id=p.user_id WHERE u.deleted=0")}
+                quotas = self._quota_values(db)
+                return {"subscriptions": [self._subscription_metadata(db, user, policies[user["id"]], quotas[user["id"]]) for user in users]}
+        with self.transaction(notify=False) as db:
+            for row in db.execute("SELECT u.id FROM users u LEFT JOIN user_policies p ON p.user_id=u.id WHERE u.deleted=0 AND p.user_id IS NULL").fetchall():
+                self._policy(db, row["id"])
+        with self.read_transaction() as db:
             users = db.execute("SELECT * FROM users WHERE deleted=0 ORDER BY name COLLATE NOCASE").fetchall()
-            policies = {user["id"]: self._policy(db, user["id"]) for user in users}
-            quotas = self._refresh_quotas(db)
-            return {"subscriptions": [self._subscription_metadata(db, user, policies[user["id"]], quotas[user["id"]]) for user in users]}
+            policies = {r["user_id"]: r for r in db.execute("SELECT p.* FROM user_policies p JOIN users u ON u.id=p.user_id WHERE u.deleted=0")}
+            quotas = self._quota_values(db)
+            return {"subscriptions": [self._subscription_metadata(db, user, policies[user["id"]], quotas[user["id"]]) for user in users if user["id"] in policies]}
 
     @staticmethod
     def subscription_format(kind=None, user_agent="", accept=""):
@@ -1072,16 +1129,16 @@ class Store:
 
     def subscription(self, token, kind=None, user_agent="", accept=""):
         kind = self.subscription_format(kind, user_agent, accept)
-        with self.transaction() as db:
+        with self.read_transaction() as db:
             user = db.execute("SELECT u.* FROM users u JOIN user_policies p ON p.user_id=u.id WHERE p.subscription_token=? AND u.deleted=0", (token,)).fetchone()
             if not user:
                 raise APIError(404, "订阅不存在")
-            policy = self._policy(db, user["id"])
+            policy = self._policy_readonly(db, user["id"])
             if not policy["subscription_enabled"]:
                 raise APIError(403, "订阅已停用")
             if policy["subscription_expires_at"] and policy["subscription_expires_at"] <= now():
                 raise APIError(403, "订阅已过期")
-            quota = self._refresh_quotas(db)[user["id"]]
+            quota = self._quota_values(db)[user["id"]]
             if not user["enabled"] or quota["quota_blocked"]:
                 raise APIError(403, "用户已停用" if not user["enabled"] else "流量额度已用尽")
             proxies, links, missing = self._subscription_nodes(db, user)
@@ -1170,7 +1227,7 @@ class Store:
                 "retained_since": dt.datetime.fromtimestamp(cutoff, tz).strftime("%Y-%m-%d %H:%M")}
 
     def list_users(self, selected_month=None):
-        with self.connect() as db:
+        with self.read_transaction() as db:
             offset, today, month = self._time_bounds(db)
             period = self._month_period(db, offset, today, selected_month)
             rows = db.execute("SELECT u.id,u.name,u.enabled,u.deleted,u.origin_node,u.created_at,u.updated_at,COALESCE(p.quota_bytes,0) quota_bytes,COALESCE(p.quota_period,'monthly') quota_period FROM users u LEFT JOIN user_policies p ON p.user_id=u.id WHERE u.deleted=0 ORDER BY u.name COLLATE NOCASE").fetchall()
@@ -1221,19 +1278,19 @@ class Store:
 
     def user_detail(self, uid):
         user_id_valid(uid)
-        with self.connect() as db:
+        with self.read_transaction() as db:
             row = db.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
             if not row:
                 raise APIError(404, "用户不存在")
             result = dict(row)
-            policy = self._policy(db, uid)
+            policy = self._policy_readonly(db, uid)
             result.update(quota_bytes=policy["quota_bytes"], quota_period=policy["quota_period"])
             result["enabled"], result["deleted"] = bool(result["enabled"]), bool(result["deleted"])
             result["node_ids"] = [r[0] for r in db.execute("SELECT node_id FROM assignments WHERE user_id=? AND active=1", (uid,))]
             return result
 
     def list_nodes(self):
-        with self.connect() as db:
+        with self.read_transaction() as db:
             result, totals = [], {}
             counts = {r["node_id"]: r["count"] for r in db.execute(
                 "SELECT a.node_id,COUNT(*) count FROM assignments a JOIN users u ON u.id=a.user_id "
@@ -1256,7 +1313,7 @@ class Store:
             return {"nodes": result, "server_time": now()}
 
     def overview(self):
-        with self.connect() as db:
+        with self.read_transaction() as db:
             offset, today, month = self._time_bounds(db)
             all_totals = self._sum(db.execute("SELECT up,down FROM totals"))
             daily, monthly = {"up": 0, "down": 0, "total": 0}, {"up": 0, "down": 0, "total": 0}
@@ -1293,7 +1350,7 @@ class Store:
             clauses.append("u.node_id=?")
             params.append(node_id)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
-        with self.connect() as db:
+        with self.read_transaction() as db:
             offset, today, month = self._time_bounds(db)
             totals = self._sum(db.execute("SELECT u.up,u.down FROM totals u" + where, params))
             # Dates derive from sample timestamps, not upload arrival timestamps.
@@ -1327,7 +1384,7 @@ class Store:
             if period is not None:
                 period.update(self._sum((row["up"], row["down"]) for row in daily))
                 names = {r["id"]: r["name"] for r in db.execute("SELECT id,name FROM nodes")}
-                by_node = [{"id": ident, "name": names[ident], **values,
+                by_node = [{"id": ident, "name": names.get(ident, ident), **values,
                             "total": values["up"] + values["down"]}
                            for ident, values in period_nodes.items()]
                 by_node.sort(key=lambda node: node["total"], reverse=True)
@@ -1428,21 +1485,26 @@ class RateLimiter:
     def __init__(self):
         self.lock = threading.Lock()
         self.failures = {}
-        self.total = []
+        self.ip_hits = {}
 
-    def check(self, key):
+    def check(self, key, ip=None):
         stamp = time.monotonic()
+        ip_key = ip if ip is not None else key.split("|", 1)[0]
         with self.lock:
-            self.total = [x for x in self.total if x > stamp - 60]
-            if len(self.total) >= 60:
+            hits = [x for x in self.ip_hits.get(ip_key, []) if x > stamp - 60]
+            if len(hits) >= 30:
+                self.ip_hits[ip_key] = hits
                 raise APIError(429, "登录请求过于频繁，请一分钟后重试")
-            self.total.append(stamp)
+            hits.append(stamp)
+            self.ip_hits[ip_key] = hits
+            if len(self.ip_hits) > 5000:
+                self.ip_hits = {k: [v for v in times if v > stamp - 60] for k, times in self.ip_hits.items() if any(v > stamp - 60 for v in times)}
             values = [x for x in self.failures.get(key, []) if x > stamp - 900]
             self.failures[key] = values
             if len(values) >= 8:
                 raise APIError(429, "登录失败次数过多，请 15 分钟后重试")
             if len(self.failures) > 5000:
-                self.failures = {k: [v for v in times if v > stamp-900] for k, times in self.failures.items() if any(v > stamp-900 for v in times)}
+                self.failures = {k: [v for v in times if v > stamp - 900] for k, times in self.failures.items() if any(v > stamp - 900 for v in times)}
 
     def fail(self, key):
         with self.lock:
@@ -1453,14 +1515,46 @@ class RateLimiter:
             self.failures.pop(key, None)
 
 
+def _is_disallowed_ip(addr):
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    return (
+        addr.is_private
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_multicast
+        or addr.is_reserved
+        or addr.is_unspecified
+    )
+
+
+def _check_update_dns(url, dev=False):
+    if dev:
+        return
+    parsed = urllib.parse.urlsplit(url)
+    host = parsed.hostname
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise ValueError("更新地址域名解析失败") from exc
+    if not infos:
+        raise ValueError("更新地址域名解析失败")
+    for _, _, _, _, sockaddr in infos:
+        addr = ipaddress.ip_address(sockaddr[0].split("%", 1)[0])
+        if _is_disallowed_ip(addr):
+            raise ValueError("生产环境更新地址不能指向内网或本机地址")
+
+
 class SafeHTTPSRedirect(urllib.request.HTTPRedirectHandler):
     def __init__(self, dev=False):
         super().__init__()
         self.dev = dev
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        normalize_update_url(newurl, self.dev)
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+        target = normalize_update_url(newurl, self.dev)
+        _check_update_dns(target, self.dev)
+        return super().redirect_request(req, fp, code, msg, headers, target)
 
 
 def normalize_update_url(value, dev=False):
@@ -1476,6 +1570,16 @@ def normalize_update_url(value, dev=False):
     if parsed.scheme != "https":
         if not dev or parsed.scheme != "http" or parsed.hostname not in ("127.0.0.1", "localhost", "::1"):
             raise ValueError("生产环境更新地址必须使用 HTTPS")
+    if not dev:
+        host = parsed.hostname.rstrip(".")
+        if host.lower() == "localhost":
+            raise ValueError("生产环境更新地址不能指向内网或本机地址")
+        try:
+            addr = ipaddress.ip_address(host.split("%", 1)[0])
+        except ValueError:
+            addr = None
+        if addr is not None and _is_disallowed_ip(addr):
+            raise ValueError("生产环境更新地址不能指向内网或本机地址")
     return value.strip()
 
 
@@ -1498,6 +1602,8 @@ class Updater:
         )
         req = urllib.request.Request(self.url, headers={"User-Agent": "ysq-center/" + VERSION, "Cache-Control": "no-cache"})
         try:
+            target = normalize_update_url(self.url, self.dev)
+            _check_update_dns(target, self.dev)
             with opener.open(req, timeout=15) as resp:
                 raw = resp.read(MAX_UPDATE_BYTES + 1)
         except urllib.error.HTTPError as exc:
@@ -1567,18 +1673,26 @@ class Updater:
                 os.fsync(stream.fileno())
             with contextlib.suppress(OSError):
                 os.chmod(temp_path, mode)
-            check_cmd = [sys.executable, str(temp_path), "--check", "--data-dir", str(store.directory)]
-            if self.dev:
-                check_cmd.extend(["--dev", "--origin", "http://127.0.0.1"])
-            try:
-                proc = subprocess.run(
-                    check_cmd,
-                    capture_output=True, text=True, timeout=20, close_fds=True,
-                )
-            except (OSError, subprocess.TimeoutExpired):
-                raise APIError(502, "新版中控自检超时或无法启动，已放弃更新，当前服务不受影响")
-            if proc.returncode != 0:
-                raise APIError(502, "新版中控数据库与启动自检未通过，已放弃更新，当前服务不受影响")
+            with tempfile.TemporaryDirectory(prefix="ysq-center-check-") as check_dir:
+                check_path = Path(check_dir)
+                with contextlib.suppress(OSError):
+                    os.chmod(check_path, 0o700)
+                with store.backup() as snapshot_path:
+                    shutil.copy2(snapshot_path, check_path / "center.db")
+                with contextlib.suppress(OSError):
+                    os.chmod(check_path / "center.db", 0o600)
+                check_cmd = [sys.executable, str(temp_path), "--check", "--data-dir", str(check_path)]
+                if self.dev:
+                    check_cmd.extend(["--dev", "--origin", "http://127.0.0.1"])
+                try:
+                    proc = subprocess.run(
+                        check_cmd,
+                        capture_output=True, text=True, timeout=20, close_fds=True,
+                    )
+                except (OSError, subprocess.TimeoutExpired):
+                    raise APIError(502, "新版中控自检超时或无法启动，已放弃更新，当前服务不受影响")
+                if proc.returncode != 0:
+                    raise APIError(502, "新版中控数据库与启动自检未通过，已放弃更新，当前服务不受影响")
             backup_path = self.script_path.with_name(self.script_path.name + ".bak")
             if self.script_path.exists():
                 shutil.copy2(self.script_path, backup_path)
@@ -1712,6 +1826,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         break
                     self.wfile.write(chunk)
 
+    @staticmethod
+    def _local_health_host(host_header):
+        value = host_header.strip()
+        if not value or any(c.isspace() for c in value):
+            return False
+        try:
+            parsed = urllib.parse.urlsplit("http://" + value)
+            port = parsed.port
+        except ValueError:
+            return False
+        host = (parsed.hostname or "").lower()
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            return False
+        if parsed.username or parsed.password or parsed.path or parsed.query or parsed.fragment:
+            return False
+        if port is not None and not 1 <= port <= 65535:
+            return False
+        expected = f"[{host}]" if ":" in host else host
+        if port is not None:
+            expected += f":{port}"
+        return value.lower() == expected
+
     def validate_request(self):
         if len(self.path) > 2048 or sum(len(k) + len(v) for k, v in self.headers.items()) > 16384:
             raise APIError(431, "请求头过大")
@@ -1719,7 +1855,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raise APIError(400, "Host 请求头不合法")
         if self.headers.get("Host", "").lower() != self.server.public.netloc.lower():
             # Health probe is intentionally allowed locally without the public Host header.
-            if not (self.path == "/healthz" and self.headers.get("Host", "").split(":")[0] in ("127.0.0.1", "localhost")):
+            if not (self.path == "/healthz" and self._local_health_host(self.headers.get("Host", ""))):
                 raise APIError(400, "域名不匹配，请使用已配置的中控域名访问")
         parsed = urllib.parse.urlsplit(self.path)
         if parsed.scheme or parsed.netloc or "\\" in parsed.path or "%2f" in parsed.path.lower() or "%5c" in parsed.path.lower():
@@ -1780,7 +1916,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             value += "; Secure"
         return value
 
-    def client_key(self, username):
+    def client_ip(self):
         # Only the trusted, same-host reverse proxy may supply X-Real-IP.
         address = self.client_address[0]
         if ipaddress.ip_address(address).is_loopback:
@@ -1789,7 +1925,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 address = str(ipaddress.ip_address(forwarded))
             except ValueError:
                 pass
-        return address + "|" + username.lower()
+        return address
+
+    def client_key(self, username):
+        return self.client_ip() + "|" + username.lower()
 
     def do_GET(self):
         self.dispatch("GET")
@@ -1875,8 +2014,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 password = data.get("password")
                 if not isinstance(password, str) or not 1 <= len(password) <= 256:
                     raise APIError(400, "请输入有效密码")
-                key = self.client_key(username)
-                self.server.login_limiter.check(key)
+                ip = self.client_ip()
+                key = ip + "|" + username.lower()
+                self.server.login_limiter.check(key, ip)
                 if not self.server.password_slots.acquire(blocking=False):
                     raise APIError(429, "正在处理其他登录请求，请稍后重试")
                 try:
@@ -4739,7 +4879,7 @@ function subscriptionRows(rows=filteredSubscriptions()){
 function renderSubscriptions(listOnly=false){
   const rows=filteredSubscriptions();
   if(listOnly){$('subscription-list').innerHTML=subscriptionRows(rows);$('subscription-count').textContent=rows.length+' 个';return;}
-  $('content').innerHTML=`<section class="card table-card"><div class="table-heading"><h3>用户订阅</h3><span id="subscription-count">${rows.length} 个</span></div><div id="subscription-list">${subscriptionRows(rows)}</div></section><details class="card subscription-templates"><summary>订阅模板</summary><form id="subscription-template-form" class="form-grid"><label>节点名称模板<input name="node_name_template" value="${esc(state.settings.node_name_template||'{{server}} · {{inbound}}')}" maxlength="300" required></label><p class="form-help">{{server}} 服务器 · {{inbound}} 入口 · {{username}} 用户 · {{index}} 序号</p><label>Clash / Mihomo 模板<textarea name="clash_template" rows="9" required spellcheck="false">${esc(state.settings.clash_template||'')}</textarea></label><p class="form-help">{{proxies}} 节点列表 · {{proxy_names}} 节点名称 · {{subscription_name}} 订阅名称 · {{group_name}} 策略组名 · {{proxy_groups}} 策略组 · {{rules}} 规则</p><div class="form-footer"><button type="submit" class="primary">保存模板</button></div></form></details>`;
+  $('content').innerHTML=`<section class="card table-card"><div class="table-heading"><h3>用户订阅</h3><span id="subscription-count">${rows.length} 个</span></div><div id="subscription-list">${subscriptionRows(rows)}</div></section><details class="card subscription-templates"><summary>订阅模板</summary><form id="subscription-template-form" class="form-grid"><label>节点名称模板<input name="node_name_template" value="${esc(state.settings.node_name_template||'{{server}} · {{inbound}}')}" maxlength="160" required></label><p class="form-help">{{server}} 服务器 · {{inbound}} 入口 · {{username}} 用户 · {{index}} 序号</p><label>Clash / Mihomo 模板<textarea name="clash_template" rows="9" required spellcheck="false">${esc(state.settings.clash_template||'')}</textarea></label><p class="form-help">{{proxies}} 节点列表 · {{proxy_names}} 节点名称 · {{subscription_name}} 订阅名称 · {{group_name}} 策略组名 · {{proxy_groups}} 策略组 · {{rules}} 规则</p><div class="form-footer"><button type="submit" class="primary">保存模板</button></div></form></details>`;
 }
 function activityPath(){return 'activity?'+Object.entries(state.activityFilter).map(([key,value])=>encodeURIComponent(key)+'='+encodeURIComponent(value)).join('&');}
 function activityBars(data){
@@ -5126,6 +5266,7 @@ def main(argv=None):
             raise ValueError("尚未创建管理员。请先执行 --init-admin admin；不会开放匿名初始化页面。")
         server = CenterServer((args.host, args.port), store, origin, args.dev, update_url=update_url)
         def stop_server(signum, frame):
+            server.restart_requested = False
             threading.Thread(target=server.shutdown, daemon=True).start()
         signal.signal(signal.SIGTERM, stop_server)
         signal.signal(signal.SIGINT, stop_server)

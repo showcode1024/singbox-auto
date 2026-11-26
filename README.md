@@ -28,14 +28,15 @@ curl -Ls -o install-singbox-ysq.sh https://raw.githubusercontent.com/showcode102
 
 ## ✨ 核心特性
 
-基于自编译 `sing-box`（内置 `with_quic` / `with_utls` / `with_clash_api` / `with_v2ray_api`）的轻量单文件部署与管理脚本，支持单机独立运行，也支持按需接入 [center-panel.py](center-panel.py) 网页中控。
+基于自编译 `sing-box`（内置 `with_quic` / `with_utls` / `with_clash_api` / `with_v2ray_api`）与单文件 Go 辅助工具 `singbox-plus` 的轻量部署与管理脚本，支持单机独立运行，也支持按需接入 [center-panel.py](center-panel.py) 网页中控。
 
 - **入站协议**：VLESS Reality (TCP) + TUIC v5 (UDP)，支持同端口 TCP/UDP 复用，支持多用户独立 UUID / TUIC 密码。
-- **独立落地节点池**：支持 **VLESS Reality**、**TUIC v5**、**SOCKS5**（免密 / 账密认证）、**Shadowsocks**（AEAD / SS-2022），支持手动配置或直接粘贴分享链接（`vless://`、`tuic://`、`socks5://`、`socks://`、`ss://`）自动识别解析。
-- **主备落地自动切换**：中转节点可配置主落地 + 备用落地，通过独立守护进程 `ysq-failover` 持续探测，主落地故障自动切备，恢复后自动回切。
-- **分流与流量统计**：支持域名直连 / 屏蔽及 sing-box Rule Set（JSON / SRS）；内置本机 V2Ray API 实时按用户、按节点查看流量。
+- **独立落地节点池**：支持 **VLESS Reality**、**TUIC v5**、**SOCKS5**（免密 / 账密认证）、**Shadowsocks**（AEAD / SS-2022），支持手动配置或直接粘贴分享链接（`vless://`、`tuic://`、`socks5://`、`socks://`、`ss://`）由 `singbox-plus parse-landing` 自动识别解析。
+- **主备落地自动切换**：中转节点可配置主落地 + 备用落地，通过独立守护服务 `ysq-failover`（`singbox-plus failover`）持续探测，主落地故障自动切备，恢复后自动回切。
+- **分流与流量统计**：支持域名直连 / 屏蔽及 sing-box Rule Set（JSON / SRS）；由 `singbox-plus stats` 直连本机 V2Ray API 实时按用户、按节点查看流量，无需额外安装 `grpcurl`。
 - **可选网页中控**：通过单文件 [center-panel.py](center-panel.py)（纯 Python 标准库 + SQLite）提供多节点统一用户管理、配额控制、订阅导出与行为日志审计。
-- **安全与轻量**：所有配置均先经 `sing-box check` 校验再原子替换，失败自动回滚；支持 `info` 级别日志排查并自动限容裁剪（9 MiB 保留最近 2 MiB，每 5 分钟定时兜底，与中控采集器通过共享 `flock` 锁协同防竞态）。
+- **安全与轻量**：所有配置均先经 `sing-box check` 校验再原子替换，失败自动回滚；`sing-box` 日志输出统一由 `singbox-plus wrap` 托管并执行不可变分片轮转（单片 4 MiB，保留 2 个历史分片 + 1 个当前文件，上限约 12 MiB），无 `copytruncate` 竞态，也无需定时裁剪任务。
+- **全节点零 Python 依赖**：无论是单机模式还是中控托管模式，节点端均不依赖 Python 与 `grpcurl`——日志轮转、落地链接解析、主备切换、流量统计与中控 Agent（内置 `bbolt` 账本）全部由单一静态 Go 二进制 `/usr/local/libexec/singbox-plus` 原生提供，原生兼容 CentOS 7+、Debian 10+、Ubuntu 20.04+、Rocky/AlmaLinux、Alpine 3.16+ 与 Docker/LXC（Python 3.9+ 仅部署在独立管理机的 `center-panel.py` 端需要）。
 
 ---
 
@@ -120,13 +121,13 @@ python3 center-panel.py --data-dir /var/lib/ysq-center --origin https://panel.ex
 | 路径 | 说明 |
 | :--- | :--- |
 | `/usr/local/bin/ysq` | 管理面板快捷入口命令 |
-| `/etc/sing-box/config.json` | sing-box 服务端核心运行配置 |
+| `/usr/local/libexec/singbox-plus` | 单文件静态 Go 辅助工具（日志轮转 `wrap`、流量统计 `stats`、落地链接解析 `parse-landing`、主备切换 `failover`、可选中控 `agent`） |
+| `/etc/sing-box/config.json` | sing-box 服务端核心运行配置（日志输出至 stdout，由 `singbox-plus wrap` 托管） |
 | `/etc/sing-box/ysq-state.db` | 节点、落地池、用户及分流状态持久化存储库（JSON 格式，权限 `600`） |
 | `/etc/sing-box/cert/` | TUIC v5 自签证书存放目录（基于 EC `prime256v1`） |
-| `/var/log/sing-box/sing-box.log` | sing-box 运行日志（`info` 级别，自动裁剪限容） |
-| `/usr/local/libexec/ysq-singbox-log-trim` | 日志限容兜底裁剪脚本（每 5 分钟检查，与 Agent 共用 `/run/ysq-log-trim.lock`） |
-| `/usr/local/libexec/ysq-failover.py` | 主备落地故障切换独立守护进程（仅在配置备用落地时启用） |
-| `/usr/local/libexec/ysq-agent.py` | 可选中控 Agent 守护进程（仅在接入中控时安装启用） |
+| `/var/log/sing-box/` | sing-box 不可变分片日志目录（`sing-box.log` 及历史分片 `sing-box.<时间戳>-<序号>.log`，默认 4 MiB × 保留 2 个历史分片） |
+| `/var/lib/ysq-failover/status.json` | 主备落地故障切换状态文件（仅在配置备用落地时由 `singbox-plus failover` 更新） |
+| `/var/lib/ysq-agent/` | 可选中控 Agent 本地 `bbolt` 流量账本与行为缓存目录（仅在接入中控时创建） |
 | `/root/singbox-node-info.txt` | 节点直链及参数信息汇总 |
 | `/root/singbox-nodes.yaml` | 预生成的 Clash YAML 代理配置文件 |
 
@@ -147,4 +148,4 @@ python3 center-panel.py --data-dir /var/lib/ysq-center --origin https://panel.ex
 
 1. **防火墙放行**：如果服务器开启了防火墙（如 `ufw`、`firewalld` 或云厂商安全组），请务必在控制台放行对应的 TCP / UDP 端口。
 2. **端口预留**：本机回环端口 `127.0.0.1:41453`（V2Ray API）和 `127.0.0.1:41452`（主备切换 Clash API）仅监听回环地址，不对外开放。
-3. **最低配置**：最低内存要求 128 MB（使用中控 Agent 或添加落地链接解析时需 Python 3.9+，脚本会按需自动检测/安装）。
+3. **最低配置**：最低内存要求 128 MB。节点端（无论是单机模式还是中控托管模式）均无需安装 Python 与 `grpcurl`；Python 3.9+ 仅独立管理机部署 [center-panel.py](center-panel.py) 时需要。
