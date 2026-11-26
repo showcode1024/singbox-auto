@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -757,7 +758,9 @@ func TestWaitChangesStaleRevisionAndRunBackoff(t *testing.T) {
 	waitCalls.Store(0)
 	syncCalls.Store(0)
 	var firstWaitDone atomic.Bool
+	stopWait := make(chan struct{})
 	instantSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/api/agent/wait":
@@ -771,8 +774,12 @@ func TestWaitChangesStaleRevisionAndRunBackoff(t *testing.T) {
 				_, _ = w.Write(raw)
 				return
 			}
-			// Subsequent poll blocks until request context is cancelled.
-			<-r.Context().Done()
+			// Subsequent poll blocks until request context is cancelled or server cleanup.
+			select {
+			case <-r.Context().Done():
+			case <-stopWait:
+			case <-time.After(5 * time.Second):
+			}
 		case "/api/agent/sync":
 			syncCalls.Add(1)
 			raw, _ := store.CanonicalJSON(map[string]any{
@@ -789,6 +796,7 @@ func TestWaitChangesStaleRevisionAndRunBackoff(t *testing.T) {
 		}
 	}))
 	defer instantSrv.Close()
+	defer close(stopWait)
 
 	cfgMap["center_url"] = instantSrv.URL
 	if err := AtomicJSON(cfgPath, cfgMap); err != nil {
