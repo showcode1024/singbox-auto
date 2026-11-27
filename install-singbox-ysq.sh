@@ -27,7 +27,7 @@ set -euo pipefail
 #   - 统一由 singbox-plus wrap 托管日志输出与不可变分片轮转（4 MiB × 保留 2 个历史分片），无需定时裁剪
 # ============================================================
 
-YSQ_VERSION="2026.11.26.2"
+YSQ_VERSION="2026.11.27"
 INSTALLER_NAME="install-singbox-ysq.sh"
 DEFAULT_SCRIPT_URL="https://raw.githubusercontent.com/showcode1024/singbox-auto/main/install-singbox-ysq.sh"
 
@@ -35,7 +35,7 @@ DEFAULT_SCRIPT_URL="https://raw.githubusercontent.com/showcode1024/singbox-auto/
 SINGBOX_REPO="${SINGBOX_REPO:-showcode1024/singbox-auto}"
 SINGBOX_FALLBACK_VERSION="${SINGBOX_FALLBACK_VERSION:-1.14.3}"
 SINGBOX_PLUS_REPO="${SINGBOX_PLUS_REPO:-$SINGBOX_REPO}"
-SINGBOX_PLUS_FALLBACK_VERSION="${SINGBOX_PLUS_FALLBACK_VERSION:-0.1.0}"
+SINGBOX_PLUS_FALLBACK_VERSION="${SINGBOX_PLUS_FALLBACK_VERSION:-0.1.1}"
 
 # -------------------------
 # 默认端口
