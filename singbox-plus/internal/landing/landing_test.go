@@ -40,6 +40,22 @@ func TestParseVLESSReality3xUI(t *testing.T) {
 	if string(raw) != want {
 		t.Fatalf("JSON =\n%s\nwant =\n%s", string(raw), want)
 	}
+
+	// Xray/3x-ui type=raw, empty fp default, and allowInsecure=0 should also parse cleanly.
+	rawLink := "vless://550e8400-e29b-41d4-a716-446655440000@203.0.113.10:443" +
+		"?type=raw&encryption=&security=reality&pbk=" + pbk +
+		"&fp=&sni=www.example.com&sid=aabb1122&flow=xtls-rprx-vision&allowInsecure=0"
+	cfg2, err := ParseLink(rawLink)
+	if err != nil {
+		t.Fatalf("ParseLink(type=raw): %v", err)
+	}
+	raw2, err := cfg2.MarshalCanonicalJSON()
+	if err != nil {
+		t.Fatalf("MarshalCanonicalJSON(type=raw): %v", err)
+	}
+	if string(raw2) != want {
+		t.Fatalf("JSON(type=raw) =\n%s\nwant =\n%s", string(raw2), want)
+	}
 }
 
 func TestParseVLESSValidationErrors(t *testing.T) {
@@ -61,6 +77,7 @@ func TestParseVLESSValidationErrors(t *testing.T) {
 		{"bad-fp", base + "&fp=ie6"},
 		{"bad-packet-encoding", base + "&packet_encoding=packetaddr"},
 		{"bad-header-type", base + "&headerType=http"},
+		{"bad-allow-insecure", base + "&allowInsecure=1"},
 		{"spx-too-long", base + "&spx=" + strings.Repeat("a", 257)},
 	}
 
@@ -119,11 +136,24 @@ func TestParseTUICv5(t *testing.T) {
 		}
 	})
 
+	t.Run("camel-case-params-and-slash-in-password", func(t *testing.T) {
+		link := "tuic://550e8400-e29b-41d4-a716-446655440000:pa/ss@tuic.example.com:8443/" +
+			"?congestionControl=BBR&alpn=&udpRelayMode=QUIC&disableSni=0&reduce_rtt=0&udpOverStream=0"
+		cfg, err := ParseLink(link)
+		if err != nil {
+			t.Fatalf("ParseLink: %v", err)
+		}
+		if cfg.Password != "pa/ss" || cfg.CongestionControl != "bbr" || cfg.UDPRelayMode != "quic" || len(cfg.ALPN) != 1 || cfg.ALPN[0] != "h3" {
+			t.Fatalf("unexpected cfg: %+v", cfg)
+		}
+	})
+
 	t.Run("rejects-mutually-exclusive-and-unsupported", func(t *testing.T) {
 		badLinks := []string{
 			"tuic://550e8400-e29b-41d4-a716-446655440000:pw@tuic.example.com:8443?udp_over_stream=1&udp_relay_mode=native",
 			"tuic://550e8400-e29b-41d4-a716-446655440000:pw@tuic.example.com:8443?disable_sni=1",
 			"tuic://550e8400-e29b-41d4-a716-446655440000:pw@tuic.example.com:8443?zero_rtt_handshake=1",
+			"tuic://550e8400-e29b-41d4-a716-446655440000:pw@tuic.example.com:8443?reduce_rtt=1",
 			"tuic://550e8400-e29b-41d4-a716-446655440000:pw@tuic.example.com:8443?alpn=h3,%20h2",
 			"tuic://550e8400-e29b-41d4-a716-446655440000:pw@tuic.example.com:8443?version=4",
 		}
@@ -173,12 +203,40 @@ func TestParseSOCKS(t *testing.T) {
 		}
 	})
 
-	t.Run("rejects-query-and-pass-without-user", func(t *testing.T) {
-		if _, err := ParseLink("socks5://198.51.100.2:1080?foo=bar"); err == nil {
-			t.Error("expected error for query params on socks5")
+	t.Run("socks-default-query-and-slash-in-b64", func(t *testing.T) {
+		// "ab?:" has '?' (0x3f) at index 2 so standard Base64 contains '/'.
+		cred := base64.StdEncoding.EncodeToString([]byte("ab?:secret"))
+		if !strings.Contains(cred, "/") {
+			t.Fatalf("expected base64 cred to contain '/', got %q", cred)
 		}
-		if _, err := ParseLink("socks5://:onlypass@198.51.100.2:1080"); err == nil {
-			t.Error("expected error for password without username")
+		cfg, err := ParseLink("socks://" + cred + "@198.51.100.2:1080/?type=tcp&security=none&headerType=none#s5")
+		if err != nil {
+			t.Fatalf("ParseLink: %v", err)
+		}
+		if cfg.Username != "ab?" || cfg.Password != "secret" {
+			t.Fatalf("got user=%q pass=%q", cfg.Username, cfg.Password)
+		}
+		cfg2, err := ParseLink("socks5://user:p/w@198.51.100.2:1080?type=raw")
+		if err != nil {
+			t.Fatalf("ParseLink(socks5): %v", err)
+		}
+		if cfg2.Username != "user" || cfg2.Password != "p/w" {
+			t.Fatalf("got user=%q pass=%q", cfg2.Username, cfg2.Password)
+		}
+	})
+
+	t.Run("rejects-query-and-pass-without-user", func(t *testing.T) {
+		for _, bad := range []string{
+			"socks5://198.51.100.2:1080?foo=bar",
+			"socks5://198.51.100.2:1080?type=ws",
+			"socks5://198.51.100.2:1080?security=tls",
+			"socks5://198.51.100.2:1080?headerType=http",
+			"socks5://198.51.100.2:1080/ws",
+			"socks5://:onlypass@198.51.100.2:1080",
+		} {
+			if _, err := ParseLink(bad); err == nil {
+				t.Errorf("expected error for %s", bad)
+			}
 		}
 	})
 }
@@ -219,13 +277,74 @@ func TestParseShadowsocks(t *testing.T) {
 		}
 	})
 
+	t.Run("ss2022-3xui-query-and-percent-encoded-keys", func(t *testing.T) {
+		// 0xff bytes produce '/' and '=' in standard Base64 so both %2F and %3D are exercised.
+		k1 := testSS2022Key(32, 0x11)
+		k2 := testSS2022Key(32, 0xff)
+		if !strings.Contains(k2, "/") || !strings.Contains(k2, "=") {
+			t.Fatalf("expected test key to contain '/' and '=', got %q", k2)
+		}
+		enc := strings.NewReplacer("/", "%2F", "=", "%3D", "+", "%2B")
+		link := "ss://2022-blake3-aes-256-gcm:" + enc.Replace(k1) + ":" + enc.Replace(k2) + "@198.51.100.5:33005?type=tcp#%E6%B5%8B%E8%AF%95%E8%8A%82%E7%82%B9"
+		cfg, err := ParseLink(link)
+		if err != nil {
+			t.Fatalf("ParseLink: %v", err)
+		}
+		if cfg.Server != "198.51.100.5" || cfg.Port != 33005 || cfg.Method != "2022-blake3-aes-256-gcm" || cfg.Password != k1+":"+k2 {
+			t.Fatalf("unexpected cfg: %+v", cfg)
+		}
+
+		// Also accept unescaped '/' in SS-2022 key, trailing '/', raw/none defaults, and %3A-encoded method separator.
+		okLinks := []string{
+			"ss://2022-blake3-aes-256-gcm:" + k1 + ":" + k2 + "@198.51.100.5:33005/?type=raw&security=none&headerType=none&uot=0#node",
+			"ss://2022-blake3-aes-256-gcm%3A" + enc.Replace(k1) + "%3A" + enc.Replace(k2) + "@198.51.100.5:33005?type=tcp&plugin=",
+		}
+		for _, l := range okLinks {
+			got, err := ParseLink(l)
+			if err != nil {
+				t.Fatalf("ParseLink(%q): %v", l, err)
+			}
+			if got.Method != "2022-blake3-aes-256-gcm" || got.Password != k1+":"+k2 || got.Port != 33005 {
+				t.Fatalf("unexpected cfg for %q: %+v", l, got)
+			}
+		}
+	})
+
+	t.Run("legacy-base64-containing-slash", func(t *testing.T) {
+		// "aes-256-gcm:" is 12 bytes; '?' (0x3f) at byte index 14 emits '/' in standard Base64.
+		payload := base64.StdEncoding.EncodeToString([]byte("aes-256-gcm:ab?pw@198.51.100.5:8388"))
+		if !strings.Contains(payload, "/") {
+			t.Fatalf("expected standard base64 payload to contain '/', got %q", payload)
+		}
+		cfg, err := ParseLink("ss://" + payload + "?type=tcp#legacy")
+		if err != nil {
+			t.Fatalf("ParseLink: %v", err)
+		}
+		if cfg.Server != "198.51.100.5" || cfg.Port != 8388 || cfg.Method != "aes-256-gcm" || cfg.Password != "ab?pw" {
+			t.Fatalf("unexpected cfg: %+v", cfg)
+		}
+	})
+
 	t.Run("ss2022-wrong-key-length-and-query", func(t *testing.T) {
 		badKey := testSS2022Key(16, 0xaa) // 16 bytes for aes-256 (needs 32)
 		if _, err := ParseLink("ss://2022-blake3-aes-256-gcm:" + badKey + "@198.51.100.5:8388"); err == nil {
 			t.Error("expected error for mismatched SS-2022 key length")
 		}
-		if _, err := ParseLink("ss://aes-128-gcm:pw@198.51.100.5:8388?plugin=obfs"); err == nil {
-			t.Error("expected error for ss query plugin")
+		badLinks := []string{
+			"ss://aes-128-gcm:pw@198.51.100.5:8388?plugin=obfs",
+			"ss://aes-128-gcm:pw@198.51.100.5:8388?type=ws",
+			"ss://aes-128-gcm:pw@198.51.100.5:8388?type=grpc",
+			"ss://aes-128-gcm:pw@198.51.100.5:8388?type=tcp&security=tls",
+			"ss://aes-128-gcm:pw@198.51.100.5:8388?type=tcp&headerType=http",
+			"ss://aes-128-gcm:pw@198.51.100.5:8388?uot=1",
+			"ss://aes-128-gcm:pw@198.51.100.5:8388?foo=bar",
+			"ss://aes-128-gcm:pw@198.51.100.5:8388?type=tcp&transport=tcp",
+			"ss://aes-128-gcm:pw@198.51.100.5:8388/ws",
+		}
+		for _, bad := range badLinks {
+			if _, err := ParseLink(bad); err == nil {
+				t.Errorf("expected error for %s", bad)
+			}
 		}
 	})
 }

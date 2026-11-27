@@ -72,8 +72,9 @@ DEFAULT_PUBLIC_KEY="pyrWuKuPUx-bt6NOFvugQEszO8XR2qYeKZhVw_dysCM"
 DEFAULT_SHORT_ID="884158a048b01725"
 DEFAULT_TUIC_PASS="884158a048b01725"
 
-REALITY_SNI="www.nvidia.com"
-TUIC_SNI="www.nvidia.com"
+DEFAULT_SNI="www.python.org"
+REALITY_SNI="$DEFAULT_SNI"
+TUIC_SNI="$DEFAULT_SNI"
 
 CONFIG_DIR="${YSQ_TEST_ROOT}/etc/sing-box"
 CONFIG_FILE="${YSQ_TEST_ROOT}/etc/sing-box/config.json"
@@ -1599,6 +1600,21 @@ flag_from_code() {
   jq -nr --arg c "$code" '[ $c | ascii_upcase | explode[] | . - 65 + 127462 ] | implode' 2>/dev/null || printf '🌐'
 }
 
+# 按两位国家码选择默认 SNI（Reality 与 TUIC 共用）
+default_sni_for_country() {
+  local code
+  code="$(printf '%s' "${1:-}" | tr '[:lower:]' '[:upper:]')"
+  case "$code" in
+    JP) echo "www.sony.jp" ;;
+    SG) echo "www.grab.com" ;;
+    KR) echo "www.naver.com" ;;
+    HK) echo "www.hku.hk" ;;
+    US) echo "www.airbnb.com" ;;
+    TW) echo "www.gskill.com" ;;
+    *)  echo "${DEFAULT_SNI:-www.python.org}" ;;
+  esac
+}
+
 # -------------------------
 # IP 校验 / 检测
 # -------------------------
@@ -2219,6 +2235,7 @@ EOF
 create_state_file() {
   local uuid private_key public_key short_id tuic_pass server_ip
   local country_code flag loc ip_version key_choice ipv_choice keypair tmp
+  local default_sni reality_sni tuic_sni
 
   step "基础参数设置"
 
@@ -2300,9 +2317,13 @@ create_state_file() {
 
   step "检测公网 IP 和所在地"
   IFS='|' read -r country_code flag loc <<<"$(detect_location "$server_ip" self "本机")"
+  default_sni="$(default_sni_for_country "$country_code")"
+  reality_sni="$default_sni"
+  tuic_sni="$default_sni"
 
   ok "公网 IP (${ip_version})：${server_ip}"
   ok "自动命名地区：${flag}${loc}"
+  ok "默认 SNI：${default_sni}"
 
   state_write_guard || return $?
   mkdir -p "$CONFIG_DIR" || return 1
@@ -2313,8 +2334,8 @@ create_state_file() {
     --arg public_key "$public_key" \
     --arg short_id "$short_id" \
     --arg tuic_pass "$tuic_pass" \
-    --arg reality_sni "$REALITY_SNI" \
-    --arg tuic_sni "$TUIC_SNI" \
+    --arg reality_sni "$reality_sni" \
+    --arg tuic_sni "$tuic_sni" \
     --arg server_ip "$server_ip" \
     --arg ip_version "$ip_version" \
     --arg country_code "$country_code" \

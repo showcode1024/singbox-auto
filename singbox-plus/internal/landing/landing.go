@@ -783,9 +783,28 @@ func splitURI(raw string) (splitParts, error) {
 	rest, query, _ := strings.Cut(rest, "?")
 	netloc := rest
 	path := ""
-	if slash := strings.IndexByte(rest, '/'); slash >= 0 {
-		netloc = rest[:slash]
-		path = rest[slash:]
+	switch scheme {
+	case "ss", "socks", "socks5", "socks5h", "tuic":
+		// Credentials in userinfo (standard Base64 or raw passwords) may contain literal '/'.
+		// Only split path from '/' appearing after '@' (i.e. after host:port).
+		if at := strings.LastIndexByte(rest, '@'); at >= 0 {
+			if slash := strings.IndexByte(rest[at+1:], '/'); slash >= 0 {
+				netloc = rest[:at+1+slash]
+				path = rest[at+1+slash:]
+			}
+		} else if scheme != "ss" {
+			// Legacy full-base64 ss://<b64> has no '@' and may contain '/' in Base64;
+			// other schemes without '@' have only hostport and optional path.
+			if slash := strings.IndexByte(rest, '/'); slash >= 0 {
+				netloc = rest[:slash]
+				path = rest[slash:]
+			}
+		}
+	default:
+		if slash := strings.IndexByte(rest, '/'); slash >= 0 {
+			netloc = rest[:slash]
+			path = rest[slash:]
+		}
 	}
 	return splitParts{
 		scheme: scheme,
@@ -895,17 +914,73 @@ func ParseLink(raw string) (Config, error) {
 		if sel == nil {
 			return safeErr("分享链接的 " + names[0] + " 不受支持")
 		}
+		lo := strings.ToLower(*sel)
 		for _, s := range supported {
-			if *sel == s {
+			if lo == s {
 				return nil
 			}
 		}
 		return safeErr("分享链接的 " + names[0] + " 不受支持")
 	}
 
+	strPtr := func(s string) *string { return &s }
+
 	if parts.scheme == "ss" {
 		if len(values) > 0 {
-			return Config{}, safeErr("暂不支持 Shadowsocks 插件或附加查询参数")
+			typeOpt, err := option([]string{"type", "transport"}, strPtr("tcp"))
+			if err != nil {
+				return Config{}, err
+			}
+			switch strings.ToLower(*typeOpt) {
+			case "", "tcp", "raw":
+			default:
+				return Config{}, safeErr("暂不支持 Shadowsocks 插件或附加查询参数")
+			}
+
+			secOpt, err := option([]string{"security"}, strPtr("none"))
+			if err != nil {
+				return Config{}, err
+			}
+			switch strings.ToLower(*secOpt) {
+			case "", "none":
+			default:
+				return Config{}, safeErr("暂不支持 Shadowsocks 插件或附加查询参数")
+			}
+
+			headerOpt, err := option([]string{"headerType"}, strPtr("none"))
+			if err != nil {
+				return Config{}, err
+			}
+			switch strings.ToLower(*headerOpt) {
+			case "", "none":
+			default:
+				return Config{}, safeErr("暂不支持 Shadowsocks 插件或附加查询参数")
+			}
+
+			pluginOpt, err := option([]string{"plugin"}, strPtr(""))
+			if err != nil {
+				return Config{}, err
+			}
+			if *pluginOpt != "" {
+				return Config{}, safeErr("暂不支持 Shadowsocks 插件或附加查询参数")
+			}
+
+			uotOpt, err := option([]string{"uot"}, strPtr("0"))
+			if err != nil {
+				return Config{}, err
+			}
+			if *uotOpt != "" {
+				uot, err := parseBoolean(*uotOpt, "uot")
+				if err != nil || uot {
+					return Config{}, safeErr("暂不支持 Shadowsocks 插件或附加查询参数")
+				}
+			}
+
+			for k := range values {
+				if !used[k] {
+					return Config{}, safeErr("暂不支持 Shadowsocks 插件或附加查询参数")
+				}
+			}
 		}
 		var server, method, password string
 		var port int
@@ -915,6 +990,13 @@ func ParseLink(raw string) (Config, error) {
 				return Config{}, err
 			}
 			decoded, err := b64DecodeText(unqNetloc, "Shadowsocks 链接")
+			if err != nil && strings.HasSuffix(parts.netloc, "/") {
+				if unqTrimmed, uErr := unquoteStrict(strings.TrimSuffix(parts.netloc, "/")); uErr == nil {
+					if d, dErr := b64DecodeText(unqTrimmed, "Shadowsocks 链接"); dErr == nil {
+						decoded, err = d, nil
+					}
+				}
+			}
 			if err != nil {
 				return Config{}, err
 			}
@@ -928,14 +1010,14 @@ func ParseLink(raw string) (Config, error) {
 				return Config{}, safeErr("Shadowsocks 链接缺少加密方式或密码")
 			}
 			method, password = m, p
-			hpParts, err := splitURI("ss://" + hostport)
-			if err != nil {
+			if strings.ContainsAny(hostport, "@?#") {
 				return Config{}, safeErr("Shadowsocks 地址或端口无效")
 			}
-			if strings.Contains(hpParts.netloc, "@") || (hpParts.path != "" && hpParts.path != "/") || hpParts.query != "" {
+			cleanHP := strings.TrimSuffix(hostport, "/")
+			if strings.Contains(cleanHP, "/") {
 				return Config{}, safeErr("Shadowsocks 地址或端口无效")
 			}
-			h, pNum, hasPort, err := parseHostPort(hpParts.netloc)
+			h, pNum, hasPort, err := parseHostPort(cleanHP)
 			if err != nil || h == "" || !hasPort {
 				return Config{}, safeErr("Shadowsocks 地址或端口无效")
 			}
@@ -968,15 +1050,19 @@ func ParseLink(raw string) (Config, error) {
 				if err != nil {
 					return Config{}, err
 				}
-				decoded, err := b64DecodeText(unqUserinfo, "Shadowsocks 认证信息")
-				if err != nil {
-					return Config{}, err
+				if m, p, ok := strings.Cut(unqUserinfo, ":"); ok {
+					method, password = m, p
+				} else {
+					decoded, err := b64DecodeText(unqUserinfo, "Shadowsocks 认证信息")
+					if err != nil {
+						return Config{}, err
+					}
+					m, p, ok := strings.Cut(decoded, ":")
+					if !ok {
+						return Config{}, safeErr("Shadowsocks 认证信息格式无效")
+					}
+					method, password = m, p
 				}
-				m, p, ok := strings.Cut(decoded, ":")
-				if !ok {
-					return Config{}, safeErr("Shadowsocks 认证信息格式无效")
-				}
-				method, password = m, p
 			}
 		}
 		return normalizeMap(map[string]any{
@@ -1018,7 +1104,41 @@ func ParseLink(raw string) (Config, error) {
 
 	if parts.scheme == "socks" || parts.scheme == "socks5" || parts.scheme == "socks5h" {
 		if len(values) > 0 {
-			return Config{}, safeErr("SOCKS5 分享链接包含不支持的参数")
+			typeOpt, err := option([]string{"type", "transport"}, strPtr("tcp"))
+			if err != nil {
+				return Config{}, err
+			}
+			switch strings.ToLower(*typeOpt) {
+			case "", "tcp", "raw":
+			default:
+				return Config{}, safeErr("SOCKS5 分享链接包含不支持的参数")
+			}
+
+			secOpt, err := option([]string{"security"}, strPtr("none"))
+			if err != nil {
+				return Config{}, err
+			}
+			switch strings.ToLower(*secOpt) {
+			case "", "none":
+			default:
+				return Config{}, safeErr("SOCKS5 分享链接包含不支持的参数")
+			}
+
+			headerOpt, err := option([]string{"headerType"}, strPtr("none"))
+			if err != nil {
+				return Config{}, err
+			}
+			switch strings.ToLower(*headerOpt) {
+			case "", "none":
+			default:
+				return Config{}, safeErr("SOCKS5 分享链接包含不支持的参数")
+			}
+
+			for k := range values {
+				if !used[k] {
+					return Config{}, safeErr("SOCKS5 分享链接包含不支持的参数")
+				}
+			}
 		}
 		username, password := "", ""
 		if hasPass && rawUser == "" {
@@ -1084,8 +1204,6 @@ func ParseLink(raw string) (Config, error) {
 		"sni":    *sniOpt,
 	}
 
-	strPtr := func(s string) *string { return &s }
-
 	if parts.scheme == "vless" {
 		if hasPass {
 			return Config{}, safeErr("VLESS 分享链接认证格式无效")
@@ -1093,13 +1211,13 @@ func ParseLink(raw string) (Config, error) {
 		if err := requireOption([]string{"security"}, []string{"reality"}, nil); err != nil {
 			return Config{}, err
 		}
-		if err := requireOption([]string{"type", "transport"}, []string{"tcp"}, strPtr("tcp")); err != nil {
+		if err := requireOption([]string{"type", "transport"}, []string{"tcp", "raw", ""}, strPtr("tcp")); err != nil {
 			return Config{}, err
 		}
 		if err := requireOption([]string{"flow"}, []string{"xtls-rprx-vision"}, nil); err != nil {
 			return Config{}, err
 		}
-		if err := requireOption([]string{"encryption"}, []string{"none"}, strPtr("none")); err != nil {
+		if err := requireOption([]string{"encryption"}, []string{"none", ""}, strPtr("none")); err != nil {
 			return Config{}, err
 		}
 		if err := requireOption([]string{"headerType"}, []string{"none", ""}, strPtr("none")); err != nil {
@@ -1107,6 +1225,16 @@ func ParseLink(raw string) (Config, error) {
 		}
 		if err := requireOption([]string{"packetEncoding", "packet_encoding"}, []string{"xudp", ""}, strPtr("xudp")); err != nil {
 			return Config{}, err
+		}
+		insecureOpt, err := option([]string{"allow_insecure", "allowInsecure", "insecure"}, strPtr("0"))
+		if err != nil {
+			return Config{}, err
+		}
+		if *insecureOpt != "" {
+			insecure, err := parseBoolean(*insecureOpt, "allowInsecure")
+			if err != nil || insecure {
+				return Config{}, safeErr("分享链接的 allowInsecure 不受支持")
+			}
 		}
 		spxOpt, err := option([]string{"spx", "spiderX"}, strPtr(""))
 		if err != nil {
@@ -1127,11 +1255,15 @@ func ParseLink(raw string) (Config, error) {
 		if err != nil {
 			return Config{}, err
 		}
+		fp := strings.ToLower(*fpOpt)
+		if fp == "" {
+			fp = "chrome"
+		}
 		if pbkOpt != nil {
 			result["public_key"] = *pbkOpt
 		}
 		result["short_id"] = *sidOpt
-		result["fingerprint"] = *fpOpt
+		result["fingerprint"] = fp
 	} else {
 		// tuic
 		tuicPass := ""
@@ -1142,62 +1274,86 @@ func ParseLink(raw string) (Config, error) {
 			}
 		}
 		result["password"] = tuicPass
-		if err := requireOption([]string{"version", "v"}, []string{"5"}, strPtr("5")); err != nil {
+		if err := requireOption([]string{"version", "v"}, []string{"5", ""}, strPtr("5")); err != nil {
 			return Config{}, err
 		}
-		ccOpt, err := option([]string{"congestion_control", "congestion-controller", "congestion-control"}, strPtr("bbr"))
+		ccOpt, err := option([]string{"congestion_control", "congestion-controller", "congestion-control", "congestionControl"}, strPtr("bbr"))
 		if err != nil {
 			return Config{}, err
+		}
+		cc := strings.ToLower(*ccOpt)
+		if cc == "" {
+			cc = "bbr"
 		}
 		insecureOpt, err := option([]string{"allow_insecure", "allowInsecure", "insecure", "skip-cert-verify", "skip_cert_verify"}, strPtr("0"))
 		if err != nil {
 			return Config{}, err
 		}
+		insecureVal := *insecureOpt
+		if insecureVal == "" {
+			insecureVal = "0"
+		}
 		alpnOpt, err := option([]string{"alpn"}, strPtr("h3"))
 		if err != nil {
 			return Config{}, err
 		}
-		disableSNIOpt, err := option([]string{"disable_sni", "disable-sni"}, strPtr("0"))
+		alpnVal := *alpnOpt
+		if alpnVal == "" {
+			alpnVal = "h3"
+		}
+		disableSNIOpt, err := option([]string{"disable_sni", "disable-sni", "disableSni", "disableSNI"}, strPtr("0"))
 		if err != nil {
 			return Config{}, err
 		}
-		disableSNI, err := parseBoolean(*disableSNIOpt, "disable_sni")
+		disableSNIVal := *disableSNIOpt
+		if disableSNIVal == "" {
+			disableSNIVal = "0"
+		}
+		disableSNI, err := parseBoolean(disableSNIVal, "disable_sni")
 		if err != nil {
 			return Config{}, err
 		}
 		if disableSNI {
 			return Config{}, safeErr("不支持 disable_sni=1，请使用 SNI")
 		}
-		zeroRTTOpt, err := option([]string{"zero_rtt_handshake", "zero-rtt-handshake"}, strPtr("0"))
+		zeroRTTOpt, err := option([]string{"zero_rtt_handshake", "zero-rtt-handshake", "zeroRttHandshake", "zeroRTTHandshake", "reduce_rtt", "reduce-rtt", "reduceRtt"}, strPtr("0"))
 		if err != nil {
 			return Config{}, err
 		}
-		zeroRTT, err := parseBoolean(*zeroRTTOpt, "zero_rtt_handshake")
+		zeroRTTVal := *zeroRTTOpt
+		if zeroRTTVal == "" {
+			zeroRTTVal = "0"
+		}
+		zeroRTT, err := parseBoolean(zeroRTTVal, "zero_rtt_handshake")
 		if err != nil {
 			return Config{}, err
 		}
 		if zeroRTT {
 			return Config{}, safeErr("不支持启用 0-RTT")
 		}
-		streamOpt, err := option([]string{"udp_over_stream", "udp-over-stream"}, strPtr("0"))
+		streamOpt, err := option([]string{"udp_over_stream", "udp-over-stream", "udpOverStream"}, strPtr("0"))
 		if err != nil {
 			return Config{}, err
 		}
-		stream, err := parseBoolean(*streamOpt, "udp_over_stream")
+		streamVal := *streamOpt
+		if streamVal == "" {
+			streamVal = "0"
+		}
+		stream, err := parseBoolean(streamVal, "udp_over_stream")
 		if err != nil {
 			return Config{}, err
 		}
-		modeOpt, err := option([]string{"udp_relay_mode", "udp-relay-mode"}, nil)
+		modeOpt, err := option([]string{"udp_relay_mode", "udp-relay-mode", "udpRelayMode"}, nil)
 		if err != nil {
 			return Config{}, err
 		}
 
-		result["congestion_control"] = *ccOpt
-		result["insecure"] = *insecureOpt
-		result["alpn"] = strings.Split(*alpnOpt, ",")
+		result["congestion_control"] = cc
+		result["insecure"] = insecureVal
+		result["alpn"] = strings.Split(alpnVal, ",")
 		result["udp_over_stream"] = stream
-		if modeOpt != nil {
-			result["udp_relay_mode"] = *modeOpt
+		if modeOpt != nil && *modeOpt != "" {
+			result["udp_relay_mode"] = strings.ToLower(*modeOpt)
 		}
 	}
 
